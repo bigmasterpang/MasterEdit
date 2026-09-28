@@ -179,7 +179,9 @@ fn find_whole_word(line: &str, symbol: &str) -> Option<usize> {
         if prev_ok && next_ok {
             return Some(idx);
         }
-        start = idx + 1;
+        // 按字符边界前进：symbol 含多字节字符（如中文）时 idx + 1 会落在字符中间，
+        // 下一轮 line[start..] 直接 panic
+        start = idx + line[idx..].chars().next().map_or(1, char::len_utf8);
     }
     None
 }

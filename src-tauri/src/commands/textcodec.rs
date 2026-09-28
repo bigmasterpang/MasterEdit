@@ -72,8 +72,11 @@ pub fn decode_with(bytes: &[u8], encoding: &str) -> String {
     }
 }
 
-/// 按指定编码编码（UTF-8 可补 BOM；UTF-16 手工写入 BOM）
-pub fn encode_with(text: &str, encoding: &str) -> Vec<u8> {
+/// 按指定编码编码（UTF-8 可补 BOM；UTF-16 手工写入 BOM）。
+///
+/// 目标编码无法表示某些字符时 encoding_rs 不会失败，而是把它们替换成 `&#NNNN;` 数字实体，
+/// 于是「保存成功」的代价是正文被悄悄改写。这里把该情况作为错误返回，由调用方提示用户改用 UTF-8。
+pub fn encode_with(text: &str, encoding: &str) -> Result<Vec<u8>, String> {
     match encoding {
         "utf-16le" | "utf-16be" => {
             let little = encoding == "utf-16le";
@@ -87,17 +90,22 @@ pub fn encode_with(text: &str, encoding: &str) -> Vec<u8> {
                 };
                 out.extend_from_slice(&bytes);
             }
-            out
+            Ok(out)
         }
         _ => {
-            let (bytes, _, _) = encoding_by_id(encoding).encode(text);
+            let (bytes, _, had_errors) = encoding_by_id(encoding).encode(text);
+            if had_errors {
+                return Err(format!(
+                    "文档含有 {encoding} 无法表示的字符，直接保存会破坏内容；请改用 UTF-8 编码另存。"
+                ));
+            }
             let mut out = bytes.into_owned();
             if encoding == "utf-8-bom" && !out.starts_with(&[0xEF, 0xBB, 0xBF]) {
                 let mut with_bom = vec![0xEF, 0xBB, 0xBF];
                 with_bom.extend_from_slice(&out);
                 out = with_bom;
             }
-            out
+            Ok(out)
         }
     }
 }
@@ -138,10 +146,19 @@ mod tests {
     #[test]
     fn roundtrip_with_bom() {
         for enc in ["utf-8-bom", "utf-16le", "utf-16be", "gb18030"] {
-            let encoded = encode_with("标题\n正文 line 2\n", enc);
+            let encoded = encode_with("标题\n正文 line 2\n", enc).expect("这些编码都应能表示该文本");
             assert_eq!(decode_with(&encoded, enc), "标题\n正文 line 2\n", "编码 {enc}");
             assert_eq!(detect_encoding(&encoded), enc, "检测 {enc}");
         }
+    }
+
+    /// 目标编码无法表示正文时必须报错，而不是把字符悄悄替换成数字实体
+    #[test]
+    fn rejects_unmappable_characters() {
+        let err = encode_with("emoji 😀 无法用 Big5 表示", "big5").expect_err("应拒绝编码");
+        assert!(err.contains("big5"), "错误信息应包含编码名: {err}");
+        // UTF-8 永远可以表示
+        assert!(encode_with("emoji 😀", "utf-8").is_ok());
     }
 
     #[test]

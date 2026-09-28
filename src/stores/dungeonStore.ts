@@ -6,8 +6,11 @@ import {
   newRun,
   type DungeonState,
 } from "../easter-egg/dungeon";
+import { readMigratedItem, writeItem } from "../utils/storage";
 
-const STORAGE_KEY = "mastermd.dungeon.v1";
+const STORAGE_KEY = "masteredit.dungeon.v1";
+/** 改名前的键名，读取时兼容迁移 */
+const LEGACY_STORAGE_KEY = "mastermd.dungeon.v1";
 
 interface DungeonMeta {
   runs: number;
@@ -17,7 +20,7 @@ interface DungeonMeta {
 
 function loadMeta(): DungeonMeta {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = readMigratedItem(STORAGE_KEY, LEGACY_STORAGE_KEY);
     if (!raw) return { runs: 0, cleared: false, bestFloor: 0 };
     const parsed = JSON.parse(raw) as Partial<DungeonMeta>;
     return {
@@ -31,11 +34,7 @@ function loadMeta(): DungeonMeta {
 }
 
 function saveMeta(meta: DungeonMeta): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(meta));
-  } catch {
-    /* 忽略存储失败 */
-  }
+  writeItem(STORAGE_KEY, JSON.stringify(meta));
 }
 
 interface DungeonStore {

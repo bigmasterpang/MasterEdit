@@ -40,9 +40,15 @@ export function DocView({ docId, pane, isDark, previewRef }: DocViewProps) {
   const [snapshot, setSnapshot] = useState<MarkdownResult | null>(null);
   const effective: MarkdownResult = livePreview && !snapshot ? rendered : snapshot ?? rendered;
 
-  // 拖动标签放置区状态
+  // 切换文档时丢弃上一份手动刷新快照：DocView 不随 docId 重建，
+  // 否则大文档刷新后切到别的文档会一直显示（并被导出）上一份文档的预览
+  useEffect(() => {
+    setSnapshot(null);
+  }, [docId]);
+
+  // 拖动标签放置区：拖拽本身由 TabBar 的指针事件驱动（窗口开启了 dragDropEnabled，
+  // Windows 上 HTML5 drag/drop 事件不会派发，因此这里只负责渲染放置提示）
   const viewRef = useRef<HTMLDivElement>(null);
-  const [dropZone, setDropZone] = useState<"left" | "right" | null>(null);
 
   // 分栏内文档独立滚轮缩放（仅缩放鼠标所在分栏的当前文档，不影响另一栏）
   useEffect(() => {
@@ -78,50 +84,9 @@ export function DocView({ docId, pane, isDark, previewRef }: DocViewProps) {
     });
   };
 
-  const handleDragOver = (e: React.DragEvent) => {
-    if (!e.dataTransfer.types.includes("application/mastermd-tab")) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
-
-    if (layout.split) {
-      // 双栏开启时，拖入当前栏即代表移动到当前栏
-      setDropZone(pane === 0 ? "left" : "right");
-    } else {
-      // 单栏模式：拖到右半屏触发分栏
-      const node = viewRef.current;
-      if (!node) return;
-      const rect = node.getBoundingClientRect();
-      const relX = e.clientX - rect.left;
-      if (relX > rect.width * 0.5) {
-        setDropZone("right");
-      } else {
-        setDropZone(null);
-      }
-    }
-  };
-
-  const handleDragLeave = (e: React.DragEvent) => {
-    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-    setDropZone(null);
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    const zone = dropZone;
-    setDropZone(null);
-    e.preventDefault();
-    const raw = e.dataTransfer.getData("application/mastermd-tab");
-    if (!raw) return;
-    try {
-      const data = JSON.parse(raw) as { docId: string; fromPane: 0 | 1 };
-      const targetPane = layout.split ? pane : (zone === "right" ? 1 : 0);
-      useAppStore.getState().moveDocToPane(data.docId, targetPane);
-    } catch {
-      /* ignore */
-    }
-  };
-
   const previewNode = (
     <MarkdownPreview
+      docId={docId}
       html={effective.html}
       hasMath={effective.hasMath}
       hasMermaid={effective.hasMermaid}
@@ -135,9 +100,6 @@ export function DocView({ docId, pane, isDark, previewRef }: DocViewProps) {
       ref={viewRef}
       data-pane-viewport={pane}
       style={{ "--editor-size": `${effectiveFontSize}px` } as React.CSSProperties}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
       onClick={() => {
         if (activePane !== pane) {
           useAppStore.getState().setActivePane(pane);
@@ -213,7 +175,7 @@ export function DocView({ docId, pane, isDark, previewRef }: DocViewProps) {
       </div>
 
       {/* 拖动标签分栏提示区 */}
-      {(dropZone || (dragStore.isDragging && dragStore.targetPane === pane && dragStore.fromPane !== pane)) ? (
+      {(dragStore.isDragging && dragStore.targetPane === pane && dragStore.fromPane !== pane) ? (
         <div
           className="pointer-events-none absolute bottom-0 top-0 inset-0 z-50 flex items-center justify-center border-2 border-dashed border-accent bg-accent/15 backdrop-blur-[1px] transition-all"
         >

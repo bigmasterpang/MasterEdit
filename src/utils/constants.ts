@@ -3,7 +3,7 @@ export const APP_NAME = "MasterEdit";
 export const AUTHOR_NAME = "Master Wang";
 export const AUTHOR_NAME_CN = "王大师";
 export const AUTHOR_TITLE = "Master Wang（王大师）";
-export const PROJECT_URL = "https://github.com/bigmasterpang/MasterMD";
+export const PROJECT_URL = "https://github.com/bigmasterpang/MasterEdit";
 
 /** 可打开为 Markdown 的扩展名 */
 export const MARKDOWN_EXTENSIONS = ["md", "markdown", "mdown", "mkd", "mkdn"];

@@ -2,7 +2,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
-export const GITHUB_REPO = "bigmasterpang/MasterMD";
+export const GITHUB_REPO = "bigmasterpang/MasterEdit";
 export const RELEASES_URL = `https://github.com/${GITHUB_REPO}/releases`;
 export const PORTAL_URL = "https://master.dapang.wang";
 

@@ -809,9 +809,10 @@ function insertInlineSnippet(snippet: string): void {
 }
 
 /** 切换预览中某一行的任务勾选状态（预览区复选框交互） */
-export function toggleTaskOnLine(lineIndex: number): void {
+export function toggleTaskOnLine(lineIndex: number, docId?: string): void {
   const state = useAppStore.getState();
-  const doc = state.docs.find((d) => d.id === state.activeId);
+  const targetId = docId ?? state.activeId;
+  const doc = state.docs.find((d) => d.id === targetId);
   if (!doc) return;
   const lines = doc.content.split("\n");
   if (lineIndex < 0 || lineIndex >= lines.length) return;
@@ -820,7 +821,8 @@ export function toggleTaskOnLine(lineIndex: number): void {
   if (!match) return;
   const next = `${match[1]}${match[2] === " " ? "x" : " "}${match[3]}${text.slice(match[0].length)}`;
 
-  const view = getEditorView();
+  // 取「预览所属文档」的编辑器：非激活分栏的预览勾选不能写到激活文档上
+  const view = getEditorView(doc.id === state.activeId ? undefined : doc.id);
   if (view && state.viewMode !== "preview") {
     // 源码编辑时走 CodeMirror 事务，保留撤销历史
     const line = view.state.doc.line(lineIndex + 1);
@@ -830,7 +832,13 @@ export function toggleTaskOnLine(lineIndex: number): void {
     return;
   }
   lines[lineIndex] = next;
-  useAppStore.getState().setContent(lines.join("\n"));
+  const content = lines.join("\n");
+  if (doc.id === state.activeId) {
+    useAppStore.getState().setContent(content);
+  } else {
+    // setContent 只会写激活文档，非激活分栏必须按文档 ID 写回
+    useAppStore.getState().patchDoc(doc.id, { content });
+  }
 }
 
 /** 选中并滚动到指定偏移区间 */

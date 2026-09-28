@@ -85,8 +85,12 @@ function buildExtensions(
     createCodeNavigationExtensions(docId),
     langCompartment.of(isMd ? markdownSupport() : []),
     EditorState.allowMultipleSelections.of(true),
-    indentUnit.of(" ".repeat(settings.tabSize)),
-    tabCompartment.of(EditorState.tabSize.of(settings.tabSize)),
+    tabCompartment.of([
+      // indentUnit 必须和 tabSize 放在同一个 compartment：装在顶层时会以更高优先级
+      // 参与 facet 合并，改设置后缩进仍按旧值插入空格
+      indentUnit.of(" ".repeat(settings.tabSize)),
+      EditorState.tabSize.of(settings.tabSize),
+    ]),
     wrapCompartment.of(settings.wordWrap ? EditorView.lineWrapping : []),
     readOnlyCompartment.of(EditorState.readOnly.of(Boolean(doc?.readOnly))),
     placeholder(isMd ? "在此输入 Markdown 内容……" : "在此输入内容……"),
@@ -170,31 +174,6 @@ export function CodeMirrorEditor({ docId, isDark }: Props) {
             }
             if (viewRef.current) {
               registerEditor(viewRef.current, docId);
-            }
-            return false;
-          },
-          dragover: (event) => {
-            if (event.dataTransfer?.types.includes("application/mastermd-tab")) {
-              event.preventDefault();
-              return false;
-            }
-            return false;
-          },
-          drop: (event) => {
-            if (event.dataTransfer?.types.includes("application/mastermd-tab")) {
-              const raw = event.dataTransfer.getData("application/mastermd-tab");
-              if (raw) {
-                try {
-                  const data = JSON.parse(raw) as { docId: string; fromPane: 0 | 1 };
-                  const currentDoc = getDocById(docId);
-                  const targetPane = currentDoc?.pane ?? 0;
-                  useAppStore.getState().moveDocToPane(data.docId, targetPane);
-                  event.preventDefault();
-                  return true;
-                } catch {
-                  /* ignore */
-                }
-              }
             }
             return false;
           },
@@ -302,16 +281,19 @@ export function CodeMirrorEditor({ docId, isDark }: Props) {
   const searchMatches = useSearchStore((s) => s.matches);
   const searchCurrent = useSearchStore((s) => s.current);
   const searchVisible = useSearchStore((s) => s.visible);
+  // 搜索匹配偏移量属于「当前激活文档」，非激活分栏的编辑器不能套用，
+  // 否则双栏时另一栏会在相同偏移处画出莫名其妙的高亮
+  const isSearchOwner = useAppStore((s) => s.activeId === docId);
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
     view.dispatch({
       effects: setSearchHighlight.of({
-        ranges: searchVisible ? searchMatches : [],
+        ranges: searchVisible && isSearchOwner ? searchMatches : [],
         current: searchCurrent,
       }),
     });
-  }, [searchMatches, searchCurrent, searchVisible]);
+  }, [searchMatches, searchCurrent, searchVisible, isSearchOwner]);
 
   /* ------------------------------ 设置联动 ------------------------------ */
   useEffect(() => {

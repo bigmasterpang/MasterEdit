@@ -38,7 +38,7 @@ export function SplitView({
   const draggingRef = useRef(false);
   const syncScroll = useAppStore((s) => s.syncScroll);
 
-  useScrollSync(editorRef, previewRef, syncScroll, lineCount);
+  useScrollSync(editorRef, previewRef, syncScroll, lineCount, docId);
 
   const onMouseMove = useCallback((event: MouseEvent) => {
     if (!draggingRef.current) return;
@@ -91,6 +91,7 @@ export function SplitView({
       <div className="print-plain relative min-w-0 flex-1">
         {livePreview ? (
           <MarkdownPreview
+            docId={docId}
             html={html}
             hasMath={hasMath}
             hasMermaid={hasMermaid}

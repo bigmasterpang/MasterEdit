@@ -131,7 +131,7 @@ export function useKeyboardShortcuts(): void {
         if (event.defaultPrevented) event.stopPropagation();
       } catch (error) {
         // 单个快捷键异常不应影响其它功能
-        console.error("[mastermd] 快捷键处理失败", event.key, error);
+        console.error("[MasterEdit] 快捷键处理失败", event.key, error);
       }
     };
 
@@ -140,6 +140,14 @@ export function useKeyboardShortcuts(): void {
       const key = event.key.toLowerCase();
       const code = event.code;
       const target = event.target as HTMLElement | null;
+
+      // 快捷键录制面板打开时，除 Esc/F1 外一律不派发全局快捷键：
+      // 面板里的录制输入框无法阻止窗口捕获阶段的监听器，
+      // 否则「重新绑定 Ctrl+W」会在录制的同时真的把当前标签页关掉
+      if (useDialogStore.getState().shortcutsVisible && key !== "escape" && event.key !== "F1") {
+        return;
+      }
+
       // 注意：CodeMirror 编辑区也是 contenteditable，不能当作"输入框"排除，
       // 否则在编辑器中按 Ctrl+B/I/K 会被直接吞掉。
       const inCodeMirror = Boolean(target?.closest?.(".cm-editor"));

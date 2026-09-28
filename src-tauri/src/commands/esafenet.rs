@@ -54,13 +54,28 @@ fn key_bytes() -> [u8; KEY_LEN] {
     key
 }
 
-/// 判断是否为 Esafenet 加密文档：头部含标准标识，或以特征字节开头。
+/// 判断是否为 Esafenet 加密文档。
+///
+/// 只认**结构**特征，绝不认「文件里出现过 Esafenet 字样」：
+/// 旧实现用 `header.windows(8).any(|w| w == b"Esafenet")` 做兜底，导致任何在前 4096 字节里
+/// 提到过该词的普通文本（例如本仓库自己的 `esafenet.rs`、`file.rs`）都会被误判成加密文档 ——
+/// 打开时显示乱码，保存时按「加密文档」回写，真实内容被彻底破坏。
+///
+/// 真实加密文件的结构（已用样本 `负荷辨识加密.md`、`台区拓扑识别实验方案加密版.md` 验证）：
+/// 前 4 字节固定为 `E0 A8 91 E7`，偏移 12..16 为头长度（0x1000），偏移 16..20 为标称明文长度。
 pub fn is_esafenet_encrypted(data: &[u8]) -> bool {
     if data.len() < 4096 {
         return false;
     }
-    let header = &data[..4096];
-    header.starts_with(&[0xE0, 0xA8, 0x91, 0xE7]) || header.windows(8).any(|w| w == b"Esafenet")
+    if !data.starts_with(&[0xE0, 0xA8, 0x91, 0xE7]) {
+        return false;
+    }
+    let header_size = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+    if header_size != 4096 && header_size > data.len() {
+        return false;
+    }
+    let orig_size = u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize;
+    orig_size == 0 || orig_size <= data.len()
 }
 
 /// 解密 Esafenet 加密文档；不是加密文件时返回 None。
@@ -134,6 +149,27 @@ mod tests {
         assert!(!is_esafenet_encrypted(b"short"));
     }
 
+    /// 回归：前 4096 字节里出现 "Esafenet" 字样的普通长文本不得被误判。
+    /// 旧实现用 `windows(8).any(|w| w == b"Esafenet")` 兜底，导致本仓库的 esafenet.rs / file.rs
+    /// 这类源码在应用里被当成加密文档打开（乱码），保存时更会把正文彻底改写。
+    #[test]
+    fn ignores_plain_text_mentioning_esafenet() {
+        let mut data = b"//! Esafenet transparent encryption helper\n".to_vec();
+        data.resize(9000, b'a');
+        assert!(!is_esafenet_encrypted(&data));
+        assert!(decrypt_esafenet(&data).is_none());
+    }
+
+    /// 头部特征字节正确但结构字段不成立时也不认（防止极端巧合）
+    #[test]
+    fn rejects_broken_header_structure() {
+        let mut data = vec![0u8; 9000];
+        data[0..4].copy_from_slice(&[0xE0, 0xA8, 0x91, 0xE7]);
+        data[12..16].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // 头长度超出文件
+        data[16..20].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // 标称明文长度超出文件
+        assert!(!is_esafenet_encrypted(&data));
+    }
+
     /// 重新加密后可再次解密（保存加密文档的核心保障）
     #[test]
     fn encrypt_then_decrypt_roundtrip() {
@@ -167,7 +203,7 @@ mod tests {
         let encrypted = encrypt_esafenet(&raw[..4096], modified.as_bytes());
 
         // 走一次真实文件系统写入，确认落盘内容仍可解密
-        let temp = std::env::temp_dir().join("mastermd-esafenet-roundtrip.md");
+        let temp = std::env::temp_dir().join("masteredit-esafenet-roundtrip.md");
         std::fs::write(&temp, &encrypted).expect("写入临时文件");
         let read_back = std::fs::read(&temp).expect("读回临时文件");
         let back = decrypt_esafenet(&read_back).expect("落盘后应仍能解密");

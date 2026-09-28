@@ -1,20 +1,33 @@
 mod commands;
 
 use commands::{file, image, recent, watch};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, WindowEvent};
 
-/// 当前文档是否存在未保存变更（由前端同步）。
-/// 用于关闭窗口时判断是否需要询问前端，避免无变更时的多余往返。
-pub struct DirtyFlag(pub AtomicBool);
+/// 各窗口中是否存在未保存变更（由各窗口前端同步自己的状态）。
+///
+/// 必须**按窗口**记录：旧实现用一个全局 AtomicBool，打开第二个窗口时新窗口挂载即写入
+/// `set_dirty(false)`，把主窗口的「有未保存内容」标记清掉，
+/// 于是主窗口点关闭时不再拦截、不再弹确认框，内存中的编辑直接丢失。
+pub struct DirtyWindows(pub Mutex<std::collections::HashSet<String>>);
 
 /// 通过文件关联双击启动时，命令行传入的待打开文件。
 pub struct StartupFile(pub Mutex<Option<String>>);
 
 #[tauri::command]
-fn set_dirty(state: tauri::State<'_, DirtyFlag>, dirty: bool) {
-    state.0.store(dirty, Ordering::Relaxed);
+fn set_dirty(
+    window: tauri::Window,
+    state: tauri::State<'_, DirtyWindows>,
+    dirty: bool,
+) {
+    let label = window.label().to_string();
+    if let Ok(mut set) = state.0.lock() {
+        if dirty {
+            set.insert(label);
+        } else {
+            set.remove(&label);
+        }
+    }
 }
 
 #[tauri::command]
@@ -79,11 +92,13 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(DirtyFlag(AtomicBool::new(false)))
+        .manage(DirtyWindows(Mutex::new(std::collections::HashSet::new())))
         .setup(|app| {
             let handle = app.handle().clone();
             app.manage(recent::load(&handle));
             app.manage(watch::WatchState::default());
+            // 改名兼容：把旧品牌 MasterMD 的存储文件迁移到新文件名（保留 PDF 批注等数据）
+            commands::legacy::migrate_legacy_store(&handle);
 
             // 文件关联：Windows 会把文件路径作为首个非选项参数传入
             let startup = std::env::args()
@@ -100,15 +115,28 @@ pub fn run() {
             let _ = &handle;
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                let dirty = window.state::<DirtyFlag>().0.load(Ordering::Relaxed);
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
+                // 只看当前窗口自己的未保存标记
+                let dirty = window
+                    .state::<DirtyWindows>()
+                    .0
+                    .lock()
+                    .map(|set| set.contains(window.label()))
+                    .unwrap_or(false);
                 if dirty {
                     // 有未保存内容：拦截关闭，交由前端弹窗确认
                     api.prevent_close();
                     let _ = window.emit("close-requested", ());
                 }
             }
+            WindowEvent::Destroyed => {
+                // 窗口已销毁，清掉它的标记，避免残留
+                if let Ok(mut set) = window.state::<DirtyWindows>().0.lock() {
+                    set.remove(window.label());
+                }
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             set_dirty,

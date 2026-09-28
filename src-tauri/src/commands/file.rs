@@ -113,7 +113,7 @@ pub async fn write_markdown_file(
 
     let enc = encoding.filter(|s| !s.is_empty()).unwrap_or_else(|| "utf-8".to_string());
     let normalized = textcodec::normalize_eol(&content, eol.as_deref().unwrap_or("lf"));
-    let plain = textcodec::encode_with(&normalized, &enc);
+    let plain = textcodec::encode_with(&normalized, &enc)?;
 
     let bytes = match header {
         Some(head) => esafenet::encrypt_esafenet(&head, &plain),

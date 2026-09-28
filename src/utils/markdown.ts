@@ -1,4 +1,4 @@
-﻿import MarkdownIt from "markdown-it";
+import MarkdownIt from "markdown-it";
 import type {
   Env,
   MarkdownIt as MarkdownItType,
@@ -686,20 +686,27 @@ export function loadKatex(): Promise<KatexModule> {
 
 type MermaidInstance = (typeof import("mermaid"))["default"];
 let mermaidPromise: Promise<MermaidInstance> | null = null;
+/** 当前已初始化的主题，避免重复 initialize */
+let mermaidTheme: "dark" | "default" | null = null;
 export function loadMermaid(dark: boolean): Promise<MermaidInstance> {
+  const want = dark ? "dark" : "default";
   if (!mermaidPromise) {
-    mermaidPromise = import("mermaid").then((mod) => {
-      const mermaid = mod.default;
+    mermaidPromise = import("mermaid").then((mod) => mod.default);
+  }
+  return mermaidPromise.then((mermaid) => {
+    // 主题必须跟着界面走：只缓存 import，每次调用都按当前主题重新 initialize，
+    // 否则切换深浅色后重新渲染的图表仍是旧主题
+    if (mermaidTheme !== want) {
       mermaid.initialize({
         startOnLoad: false,
         securityLevel: "strict",
-        theme: dark ? "dark" : "default",
+        theme: want,
         fontFamily: "var(--font-ui)",
       });
-      return mermaid;
-    });
-  }
-  return mermaidPromise;
+      mermaidTheme = want;
+    }
+    return mermaid;
+  });
 }
 
 export { hljs, escapeHtml, slugify, uniqueSlug };

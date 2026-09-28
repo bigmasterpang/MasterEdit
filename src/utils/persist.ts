@@ -28,7 +28,12 @@ interface UiState {
   activePane?: 0 | 1;
 }
 
-const STORE_FILE = "mastermd-store.json";
+/**
+ * 插件存储文件名（位于 `%APPDATA%\com.masterpang.mastermd`）。
+ * 改名后由 Rust 端 `commands/legacy.rs` 在启动时把旧的 `mastermd-store.json`
+ * 一次性复制过来，因此这里可以直接使用新名字而不会让老用户丢设置与 PDF 批注。
+ */
+const STORE_FILE = "masteredit-store.json";
 let file: LazyStore | null = null;
 let uiCache: UiState = {
   viewMode: "split",
@@ -195,7 +200,7 @@ interface SessionPayload {
   /** 已保存文档的路径及窗格（用于恢复标签页，兼容旧版 string 数组） */
   paths: Array<string | { path: string; pane?: 0 | 1 }>;
   /** 未保存 / 未命名文档的内容及窗格 */
-  unsaved: Array<{ path: string | null; content: string; pane?: 0 | 1 }>;
+  unsaved: Array<{ path: string | null; content: string; pane?: 0 | 1; docType?: string }>;
 }
 
 const SESSION_TAB_LIMIT = 8;
@@ -209,21 +214,47 @@ async function writeSession(): Promise<void> {
   if (!file) return;
   try {
     const { docs } = useAppStore.getState();
+    /** 内容过大（或已是 PDF）的文档不能靠「按路径恢复」找回未保存内容 */
+    const oversized = (doc: (typeof docs)[number]) => doc.content.length > SESSION_CONTENT_LIMIT;
+
+    const unsaved = docs
+      .filter((doc) => doc.isDirty || !doc.filePath)
+      .filter((doc) => doc.docType !== "pdf" && !isPdfPath(doc.filePath))
+      .filter((doc) => !oversized(doc))
+      .slice(0, SESSION_TAB_LIMIT)
+      .map((doc) => ({
+        path: doc.filePath,
+        content: doc.content,
+        pane: doc.pane ?? 0,
+        // 不记 docType 的话，未命名的纯文本文档恢复后会变成 Markdown
+        docType: doc.docType,
+      }));
+
+    const unsavedPaths = new Set(
+      unsaved
+        .map((entry) => entry.path?.toLowerCase())
+        .filter((path): path is string => Boolean(path)),
+    );
+
     const payload: SessionPayload = {
       paths: docs
         .filter((doc) => doc.filePath)
+        // 超大文档被挡在 unsaved 之外，若仍出现在 paths 里，恢复时会从磁盘重读，
+        // 未保存的编辑会被磁盘版本静默覆盖 —— 必须一起排除
+        .filter((doc) => !oversized(doc))
+        // 同上：有未保存内容但被 unsaved 截断掉的文档也不能走路径恢复
+        .filter(
+          (doc) =>
+            !(
+              doc.isDirty &&
+              doc.docType !== "pdf" &&
+              !isPdfPath(doc.filePath) &&
+              !unsavedPaths.has((doc.filePath as string).toLowerCase())
+            ),
+        )
         .map((doc) => ({ path: doc.filePath as string, pane: doc.pane ?? 0 }))
         .slice(0, SESSION_TAB_LIMIT),
-      unsaved: docs
-        .filter((doc) => doc.isDirty || !doc.filePath)
-        .filter((doc) => doc.docType !== "pdf" && !isPdfPath(doc.filePath))
-        .filter((doc) => doc.content.length <= SESSION_CONTENT_LIMIT)
-        .slice(0, SESSION_TAB_LIMIT)
-        .map((doc) => ({
-          path: doc.filePath,
-          content: doc.content,
-          pane: doc.pane ?? 0,
-        })),
+      unsaved,
     };
     await file.set("session", payload);
   } catch (error) {
@@ -254,6 +285,13 @@ export async function restoreSession(): Promise<void> {
         savedContent: entry.path ? "" : entry.content,
         isDirty: Boolean(entry.path),
         pane: entry.pane ?? 0,
+        // 旧会话没有 docType：有路径时按路径推断，没路径的旧数据按 Markdown 处理
+        docType:
+          entry.docType === "blank" || entry.docType === "pdf"
+            ? entry.docType
+            : entry.path
+              ? undefined
+              : "markdown",
       });
       if (entry.path) {
         try {
@@ -263,6 +301,8 @@ export async function restoreSession(): Promise<void> {
           doc.size = disk.size;
           doc.isDirty = disk.content !== entry.content;
           opened.add(entry.path.toLowerCase());
+          // 恢复的标签页同样要监听外部变更，否则下一次保存会覆盖别人的改动
+          void invoke("watch_file", { path: entry.path }).catch(() => undefined);
         } catch {
           // 文件已不存在：保留内容，等待用户另存为
           doc.isDirty = true;
@@ -299,6 +339,8 @@ export async function restoreSession(): Promise<void> {
           });
           state.addDoc(restoredDoc);
           opened.add(path.toLowerCase());
+          // PDF 标签页同样需要监听（批注侧车 + 外部改动检测）
+          void invoke("watch_file", { path }).catch(() => undefined);
           continue;
         }
 
@@ -308,6 +350,9 @@ export async function restoreSession(): Promise<void> {
         restoredDoc.pane = pane;
         state.addDoc(restoredDoc);
         opened.add(path.toLowerCase());
+        // 会话恢复出来的标签页必须重新注册文件监听：openPath 只在「打开」时注册，
+        // 漏掉这里会导致外部修改无提示、下次保存直接覆盖
+        void invoke("watch_file", { path }).catch(() => undefined);
       } catch {
         /* 打不开的文件跳过 */
       }

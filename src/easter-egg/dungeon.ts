@@ -664,7 +664,7 @@ export function finishRun(state: DungeonState): DungeonState {
       "> 「把复杂留给自己，把简单留给用户。」",
       "> —— **Master Wang（王大师）**",
       "",
-      "感谢你把 MasterMD 玩到这里。它还有很多细节可以打磨，欢迎到软件中心反馈。",
+      "感谢你把 MasterEdit 玩到这里。它还有很多细节可以打磨，欢迎到软件中心反馈。",
     ].join("\n"),
   };
 }

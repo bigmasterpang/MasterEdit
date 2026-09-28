@@ -253,7 +253,7 @@ export function SettingsModal() {
             </button>
           </Row>
           <div className="text-[11px] text-faint">
-            版本来源：软件中心 · github.com/bigmasterpang/MasterMD
+            版本来源：软件中心 · github.com/bigmasterpang/MasterEdit
             {updateState.info?.hasUpdate
               ? ` · 发现新版本 ${updateState.info.latest}`
               : updateState.info

@@ -6,8 +6,8 @@
 
 Markdown 读写导出 · PDF 深度批注 · 代码智能导览 · 双栏独立对照 · 色弱无障碍友好
 
-[![Release](https://img.shields.io/github/v/release/bigmasterpang/MasterMD?style=flat-square&label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC)](https://github.com/bigmasterpang/MasterMD/releases)
-[![Downloads](https://img.shields.io/github/downloads/bigmasterpang/MasterMD/total?style=flat-square&label=%E4%B8%8B%E8%BD%BD%E9%87%8F)](https://master.dapang.wang)
+[![Release](https://img.shields.io/github/v/release/bigmasterpang/MasterEdit?style=flat-square&label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC)](https://github.com/bigmasterpang/MasterEdit/releases)
+[![Downloads](https://img.shields.io/github/downloads/bigmasterpang/MasterEdit/total?style=flat-square&label=%E4%B8%8B%E8%BD%BD%E9%87%8F)](https://master.dapang.wang)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4?style=flat-square)](https://master.dapang.wang)
 [![Size](https://img.shields.io/badge/%E5%AE%89%E8%A3%85%E5%8C%85-5.0%20MB-2ea44f?style=flat-square)](https://master.dapang.wang)
 [![License](https://img.shields.io/badge/license-Freeware-lightgrey?style=flat-square)](#授权与致谢)
@@ -167,7 +167,7 @@ src-tauri/src/
 ## 授权与致谢
 
 - 作者：**Master Wang（王大师）** · Master 系列软件
-- 问题反馈：<https://github.com/bigmasterpang/MasterMD/issues>
+- 问题反馈：<https://github.com/bigmasterpang/MasterEdit/issues>
 - 软件中心：<https://master.dapang.wang>
 
 <div align="center">

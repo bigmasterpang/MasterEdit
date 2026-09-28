@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-REPO = "bigmasterpang/MasterMD"
+REPO = "bigmasterpang/MasterEdit"
 VERSION = "0.14.1"
 TAG_NAME = f"v{VERSION}"
 

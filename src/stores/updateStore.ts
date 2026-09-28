@@ -110,7 +110,7 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
 
     try {
       const dir = await tempDir();
-      const filename = info.filename || `mastermd-${info.latest}-setup.exe`;
+      const filename = info.filename || `MasterEdit_${info.latest}_x64-setup.exe`;
       const dest = await join(dir, filename);
 
       const result = await invoke<DownloadResult>("download_update", {

@@ -90,6 +90,15 @@ export function PdfViewer({ docId, pane, isDark }: PdfViewerProps) {
   const [scale, setScale] = useState<number>(1.2);
   const [fitMode, setFitMode] = useState<"custom" | "width" | "page">("width");
 
+  // pdfjs 文档与加载任务必须持有引用：不释放的话每次重载都会残留一个 Web Worker
+  // 与整份已解析文档（旋转 / 删除 / 撤销 / 重排都会触发重载）
+  const loadingTaskRef = useRef<pdfjsLib.PDFDocumentLoadingTask | null>(null);
+  const pdfProxyRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
+  /** 加载代次：切换文档或卸载后，被取代的那次加载不得再注册文档 */
+  const loadRunRef = useRef(0);
+  /** 密码弹窗里输入的密码：等加载成功后再落库 */
+  const pendingPasswordRef = useRef<string | null>(null);
+
   // 展开的批注/便签状态
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeCommentHlId, setActiveCommentHlId] = useState<string | null>(null);
@@ -173,6 +182,8 @@ export function PdfViewer({ docId, pane, isDark }: PdfViewerProps) {
       if (loadedBase64Ref.current === pdfBase64 && pdfProxy) {
         return;
       }
+      // 本次加载的代次：被新的加载取代或组件卸载后用它判定是否还该继续
+      const runId = ++loadRunRef.current;
       setLoading(true);
       setError(null);
 
@@ -205,7 +216,9 @@ export function PdfViewer({ docId, pane, isDark }: PdfViewerProps) {
           const pw = await askPdfPassword(docName, errMsg);
           if (pw !== null) {
             updatePassword(pw);
-            useAppStore.getState().patchDoc(docId, { pdfPassword: pw });
+            // 只暂存，不 patchDoc：pdfPassword 是 loadPdf 的依赖，
+            // 在这里写库会立刻重启一次加载，并让上一次的密码弹窗等待一个永不结算的 Promise
+            pendingPasswordRef.current = pw;
           } else {
             setError("需要密码才能查看此 PDF 文档。");
             setLoading(false);
@@ -213,6 +226,23 @@ export function PdfViewer({ docId, pane, isDark }: PdfViewerProps) {
         };
 
         const proxy = await loadingTask.promise;
+
+        // 本次加载是否已被更新的加载/卸载取代：是则释放资源后直接退出，
+        // 否则会注册一个没有人负责回收的文档代理
+        if (loadRunRef.current !== runId) {
+          void proxy.destroy().catch(() => undefined);
+          return;
+        }
+
+        // 释放上一份解析结果（留出渲染切换时间，避免正在绘制的旧页面引用失效）
+        const previousProxy = pdfProxyRef.current;
+        if (previousProxy && previousProxy !== proxy) {
+          window.setTimeout(() => {
+            void previousProxy.destroy().catch(() => undefined);
+          }, 500);
+        }
+        pdfProxyRef.current = proxy;
+        loadingTaskRef.current = loadingTask;
         setPdfProxy(proxy);
         setNumPages(proxy.numPages);
         loadedBase64Ref.current = effectiveBase64;
@@ -224,6 +254,13 @@ export function PdfViewer({ docId, pane, isDark }: PdfViewerProps) {
         const safePage = Math.min(proxy.numPages, Math.max(1, keepPage));
         setCurrentPage(safePage);
         targetPageAfterReload.current = safePage;
+
+        // 密码加载成功后再落库，供本会话内的后续重载直接使用
+        if (pendingPasswordRef.current) {
+          const pw = pendingPasswordRef.current;
+          pendingPasswordRef.current = null;
+          useAppStore.getState().patchDoc(docId, { pdfPassword: pw });
+        }
 
         useAppStore.getState().patchDoc(docId, {
           pdfTotalPages: proxy.numPages,
@@ -300,8 +337,16 @@ export function PdfViewer({ docId, pane, isDark }: PdfViewerProps) {
   useEffect(() => {
     void loadPdf();
     return () => {
+      // 使正在进行的加载失效，并释放文档代理（含 Web Worker）
+      loadRunRef.current += 1;
       unregisterPdfDocument(docId);
       loadedBase64Ref.current = "";
+      const proxy = pdfProxyRef.current;
+      pdfProxyRef.current = null;
+      loadingTaskRef.current = null;
+      if (proxy) {
+        void proxy.destroy().catch(() => undefined);
+      }
     };
   }, [loadPdf, docId]);
 
@@ -377,13 +422,17 @@ export function PdfViewer({ docId, pane, isDark }: PdfViewerProps) {
     }
   }, [pdfProxy, currentPage, docId]);
 
+  // 依赖里必须包含 pdfProxy：文档加载完成前 updateFitWidth 会直接 return，
+  // 旧实现只在 fitMode 变化时触发，导致首屏永远停在默认 120%，
+  // 明明工具栏高亮着「页宽」却要用户再点一次才生效
   useEffect(() => {
+    if (!pdfProxy) return;
     if (fitMode === "width") {
       void updateFitWidth();
     } else if (fitMode === "page") {
       void updateFitPage();
     }
-  }, [fitMode]);
+  }, [pdfProxy, fitMode]);
 
   // 视口滚动监听以追踪当前页码
   const handleScroll = () => {

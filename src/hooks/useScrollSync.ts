@@ -10,6 +10,9 @@ export function useScrollSync(
   previewRef: React.RefObject<HTMLElement | null>,
   enabled: boolean,
   lineCount: number,
+  /** 当前文档 ID：切换文档时编辑器会整体重建（SplitView 用 key={docId}），
+   *  必须把它作为依赖，否则监听器仍绑在已卸载的 .cm-scroller 上，滚动同步静默失效 */
+  docId: string,
 ): void {
   const lockRef = useRef(false);
   const timerRef = useRef<number | null>(null);
@@ -68,5 +71,5 @@ export function useScrollSync(
       timerRef.current = null;
       lockRef.current = false;
     };
-  }, [editorRef, previewRef, enabled]);
+  }, [editorRef, previewRef, enabled, lineCount, docId]);
 }

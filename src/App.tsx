@@ -62,13 +62,20 @@ export default function App() {
   const isMarkdown = isMarkdownDoc(doc);
   const rendered = useMarkdown(isMarkdown ? content : "", viewMode);
 
-  const previewRef = useRef<HTMLDivElement>(null);
+  const previewRef0 = useRef<HTMLDivElement>(null);
+  const previewRef1 = useRef<HTMLDivElement>(null);
   const [dragOver, setDragOver] = useState(false);
 
   const layout = useAppStore((s) => s.layout);
   const activeIds = useAppStore((s) => s.activeIds);
   const activeId = useAppStore((s) => s.activeId);
   const splitContainerRef = useRef<HTMLDivElement>(null);
+  /**
+   * 预览区 ref 必须按分栏分别持有：Toolbar / 大纲侧栏 / 导出使用当前焦点分栏的预览元素，
+   * DocView 使用自己分栏的。若两栏共用一个 ref，后挂载的右栏会覆盖它，
+   * 于是左栏的滚动同步、右键菜单与导出（HTML / PNG）实际都作用在右栏的预览上。
+   */
+  const previewRef = layout.split && layout.activePane === 1 ? previewRef1 : previewRef0;
 
   const handleSplitResize = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -133,6 +140,8 @@ export default function App() {
           const urlParams = new URLSearchParams(window.location.search);
           const openParam = urlParams.get("open");
           if (openParam) {
+            // 新窗口（open_in_new_window）：不接管会话记录，
+            // 否则两个窗口会往同一个会话文件里互相覆盖
             await openPath(openParam);
           } else {
             const startup = await invoke<string | null>("get_startup_file");
@@ -142,6 +151,8 @@ export default function App() {
               // 无启动文件时恢复上次会话（防止意外重载丢失内容）
               await restoreSession();
             }
+            // 必须放在分支外：文件关联双击启动（Explorer 打开 .md）同样需要会话记录，
+            // 否则应用内更新重启后未保存内容无法恢复
             startSessionTracking();
           }
         } catch (error) {
@@ -220,7 +231,7 @@ export default function App() {
           ) : layout.split ? (
             <div ref={splitContainerRef} className="flex h-full min-w-0 flex-1 overflow-hidden">
               <div style={{ width: `${Math.round(layout.ratio * 100)}%` }} className="h-full min-w-0 overflow-hidden">
-                <DocView docId={activeIds[0]} pane={0} isDark={isDark} previewRef={previewRef} />
+                <DocView docId={activeIds[0]} pane={0} isDark={isDark} previewRef={previewRef0} />
               </div>
               <div
                 onMouseDown={handleSplitResize}
@@ -229,11 +240,11 @@ export default function App() {
                 <div className="h-8 w-0.5 rounded-full bg-line group-hover:bg-accent" />
               </div>
               <div style={{ width: `${100 - Math.round(layout.ratio * 100)}%` }} className="h-full min-w-0 overflow-hidden">
-                <DocView docId={activeIds[1]} pane={1} isDark={isDark} previewRef={previewRef} />
+                <DocView docId={activeIds[1]} pane={1} isDark={isDark} previewRef={previewRef1} />
               </div>
             </div>
           ) : (
-            <DocView docId={activeIds[0] ?? activeId} pane={0} isDark={isDark} previewRef={previewRef} />
+            <DocView docId={activeIds[0] ?? activeId} pane={0} isDark={isDark} previewRef={previewRef0} />
           )}
         </div>
       </div>

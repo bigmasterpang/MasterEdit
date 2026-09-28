@@ -65,7 +65,7 @@ export function UpdateDialog() {
   ) : downloadedPath ? (
     <>
       <Button
-        onClick={() => void openReleasesPage("https://github.com/bigmasterpang/MasterMD/releases")}
+        onClick={() => void openReleasesPage("https://github.com/bigmasterpang/MasterEdit/releases")}
       >
         打开发布页面
       </Button>

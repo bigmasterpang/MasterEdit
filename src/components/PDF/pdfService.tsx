@@ -313,6 +313,14 @@ export function addPdfHighlight(
 export function updatePdfHighlight(docId: string, highlightId: string, patch: Partial<PdfHighlight>) {
   const doc = useAppStore.getState().docs.find((d) => d.id === docId);
   if (!doc || !doc.pdfHighlights) return;
+  const target = doc.pdfHighlights.find((h) => h.id === highlightId);
+  if (!target) return;
+  // 无实际变化必须提前返回：编辑框失焦会调用这里，若无条件压栈，
+  // 仅仅点一下批注框就会产生垃圾快照并清空重做栈（Ctrl+Z 要按两次才见效）
+  const changed = Object.entries(patch).some(
+    ([key, value]) => (target as unknown as Record<string, unknown>)[key] !== value,
+  );
+  if (!changed) return;
   recordPdfSnapshot(docId);
   useAppStore.getState().patchDoc(docId, {
     pdfHighlights: doc.pdfHighlights.map((h) => (h.id === highlightId ? { ...h, ...patch } : h)),
@@ -380,8 +388,10 @@ export async function clearPageHighlights(docId: string, pageNum: number) {
       cleanedBase64 = res.cleanedBase64;
     }
   }
+  // 清洗期间用户可能又加了新标注：必须基于最新状态过滤，否则那一笔会被这次 patch 吞掉
+  const latest = useAppStore.getState().docs.find((d) => d.id === docId);
   useAppStore.getState().patchDoc(docId, {
-    pdfHighlights: (doc.pdfHighlights ?? []).filter((h) => h.page !== pageNum),
+    pdfHighlights: (latest?.pdfHighlights ?? []).filter((h) => h.page !== pageNum),
     ...(cleanedBase64 && cleanedBase64 !== doc.pdfBase64
       ? { pdfBase64: cleanedBase64, cleanPdfBase64: cleanedBase64 }
       : {}),
@@ -444,6 +454,13 @@ export function addPdfNote(
 export function updatePdfNote(docId: string, noteId: string, patch: Partial<PdfNote>) {
   const doc = useAppStore.getState().docs.find((d) => d.id === docId);
   if (!doc || !doc.pdfNotes) return;
+  const target = doc.pdfNotes.find((n) => n.id === noteId);
+  if (!target) return;
+  // 与 updatePdfHighlight 同理：无变化不压栈，避免失焦即污染撤销/重做栈
+  const changed = Object.entries(patch).some(
+    ([key, value]) => (target as unknown as Record<string, unknown>)[key] !== value,
+  );
+  if (!changed) return;
   recordPdfSnapshot(docId);
   useAppStore.getState().patchDoc(docId, {
     pdfNotes: doc.pdfNotes.map((n) => (n.id === noteId ? { ...n, ...patch } : n)),
@@ -535,12 +552,26 @@ export function recordAutoCleanedCount(docId: string, count: number) {
 }
 
 /**
+ * 释放某个文档的 PDF 内部状态（撤销栈、自动清洗计数）。
+ * 撤销栈里每个快照都持有整份 base64 PDF，关闭标签页后不释放会长期占用大量内存。
+ */
+export function disposePdfDocState(docId: string) {
+  docHistories.delete(docId);
+  autoCleanedCountMap.delete(docId);
+}
+
+/**
  * 修复与清洗历史版本被 burnHighlightsToPdf 写入的永久物理高亮涂层
  * 采用 pdf-lib 内置 decodePDFRawStream 与 PDFArray.remove 原地剥离，彻底规避打包混淆导致的类型失效与浅拷贝失效
+ *
+ * `stripNativeAnnotations` 默认 false：应用无法区分「自己早期写入的注释对象」与
+ * 「用户在 Acrobat / Edge / Chrome 里添加的原生高亮」，打开文档时顺手删掉后者
+ * 等于静默销毁用户数据（且不进撤销栈）。只有用户显式点击「修复受污染文档」时才连带清除。
  */
 export async function cleanBurnedHighlightsFromPdf(
   base64Data: string,
   targetPageNum?: number,
+  stripNativeAnnotations = false,
 ): Promise<{ cleanedBase64: string; removedCount: number }> {
   try {
     const rawBytes = base64ToBytes(base64Data);
@@ -611,8 +642,8 @@ export async function cleanBurnedHighlightsFromPdf(
         }
       }
 
-      // 2. 剥离页面可能存在的 PDF 原生 Highlight 注释对象
-      const annots = page.node.Annots();
+      // 2. 剥离页面可能存在的 PDF 原生 Highlight 注释对象（仅显式修复时执行，见函数注释）
+      const annots = stripNativeAnnotations ? page.node.Annots() : undefined;
       if (
         annots &&
         (annots instanceof PDFArray ||
@@ -649,7 +680,11 @@ export async function repairBurnedPdfDocument(docId: string): Promise<boolean> {
   const doc = useAppStore.getState().docs.find((d) => d.id === docId);
   if (!doc?.pdfBase64) return false;
 
-  const { cleanedBase64, removedCount } = await cleanBurnedHighlightsFromPdf(doc.pdfBase64);
+  const { cleanedBase64, removedCount } = await cleanBurnedHighlightsFromPdf(
+    doc.pdfBase64,
+    undefined,
+    true,
+  );
   const prevAutoCleaned = autoCleanedCountMap.get(docId) ?? 0;
 
   if (removedCount === 0 && prevAutoCleaned === 0) {
@@ -758,15 +793,20 @@ export async function deletePdfPage(docId: string, pageNum: number) {
     const newBytes = await pdfDoc.save();
     const newBase64 = bytesToBase64(newBytes);
 
-    // 重新映射受影响的高亮标注页码
+    // 重新映射受影响的高亮与便签页码：便签同样按页存放，
+    // 只改高亮会让删除页之后的便签整体前移一页（并被写进侧车持久化）
     const updatedHighlights = (doc.pdfHighlights ?? [])
       .filter((h) => h.page !== pageNum)
       .map((h) => (h.page > pageNum ? { ...h, page: h.page - 1 } : h));
+    const updatedNotes = (doc.pdfNotes ?? [])
+      .filter((n) => n.page !== pageNum)
+      .map((n) => (n.page > pageNum ? { ...n, page: n.page - 1 } : n));
 
     useAppStore.getState().patchDoc(docId, {
       pdfBase64: newBase64,
       cleanPdfBase64: newBase64,
       pdfHighlights: updatedHighlights,
+      pdfNotes: updatedNotes,
       isDirty: true,
       pdfTotalPages: numPages - 1,
       pdfCurrentPage: Math.min(doc.pdfCurrentPage ?? 1, numPages - 1),
@@ -831,9 +871,19 @@ export async function reorderPdfPages(docId: string, fromIndex: number, toIndex:
 
     const newBytes = await newDoc.save();
     const newBase64 = bytesToBase64(newBytes);
+
+    // 重排改变的是页码而不是页面内容：高亮与便签必须一起重映射，
+    // 否则批注会渲染到无关页面并被写进侧车，形成不可逆的错位
+    const pageMap = new Map<number, number>();
+    order.forEach((oldIndex, newIndex) => pageMap.set(oldIndex + 1, newIndex + 1));
+    const remapPage = <T extends { page: number }>(items: T[] | undefined): T[] =>
+      (items ?? []).map((item) => ({ ...item, page: pageMap.get(item.page) ?? item.page }));
+
     useAppStore.getState().patchDoc(docId, {
       pdfBase64: newBase64,
       cleanPdfBase64: newBase64,
+      pdfHighlights: remapPage(doc.pdfHighlights),
+      pdfNotes: remapPage(doc.pdfNotes),
       isDirty: true,
     });
   } catch (err: any) {

@@ -106,6 +106,12 @@ pub async fn unwatch_file(state: State<'_, WatchState>, path: String) -> Result<
         .map(|p| normalize(&p))
         .unwrap_or_else(|_| PathBuf::from(&path));
     let key = key_of(&target);
-    state.0.lock().map_err(|e| e.to_string())?.remove(&key);
+    let mut map = state.0.lock().map_err(|e| e.to_string())?;
+    if map.remove(&key).is_some() {
+        return Ok(());
+    }
+    // 文件已被删除或改名时 canonicalize 会失败，key 与注册时不一致；
+    // 用原始路径再试一次，避免监听器永久残留在表里
+    map.remove(&key_of(std::path::Path::new(&path)));
     Ok(())
 }

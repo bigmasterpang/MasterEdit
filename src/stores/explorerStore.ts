@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { normalizeSlashes, samePath } from "../utils/filePath";
 import { debounce } from "../utils/timing";
+import { readMigratedItem } from "../utils/storage";
 import type { DocState } from "../types";
 import { getActiveDoc } from "./appStore";
 
@@ -43,8 +44,9 @@ interface ExplorerState {
   setRatio: (r: number) => void;
 }
 
-/** localStorage 持久化 key */
-const STORAGE_KEY = "mastermd.explorer";
+/** localStorage 持久化 key（旧键 mastermd.explorer 由 readMigratedItem 兼容读取） */
+const STORAGE_KEY = "masteredit.explorer";
+const LEGACY_STORAGE_KEY = "mastermd.explorer";
 /** expanded 最多持久化的条数，超出截断 */
 const EXPANDED_LIMIT = 200;
 /** 上下两栏比例范围与默认值 */
@@ -113,7 +115,7 @@ function isUnder(child: string, ancestor: string): boolean {
 /** 读取持久化数据；任何异常都静默回退默认值 */
 function loadPersisted(): Partial<PersistedExplorer> {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = readMigratedItem(STORAGE_KEY, LEGACY_STORAGE_KEY);
     if (!raw) return {};
     const data = JSON.parse(raw) as Partial<PersistedExplorer>;
     const out: Partial<PersistedExplorer> = {};

@@ -1,7 +1,7 @@
 {
-  "name": "mastermd",
+  "name": "masteredit",
   "private": true,
-  "version": "0.16.2",
+  "version": "0.17.1",
   "type": "module",
   "packageManager": "pnpm@9.15.9",
   "scripts": {

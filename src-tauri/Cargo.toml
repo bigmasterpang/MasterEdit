@@ -1,6 +1,8 @@
 [package]
-name = "mastermd"
-version = "0.16.2"
+# 包名即最终可执行文件名（cargo 输出 MasterEdit.exe），与 productName 保持一致，
+# 避免安装目录里再出现旧的 mastermd.exe。库名单独用 [lib] 指定为合法标识符。
+name = "MasterEdit"
+version = "0.17.1"
 description = "MasterEdit — Windows Markdown, PDF & Code Viewer/Editor"
 authors = ["bigmasterpang"]
 edition = "2021"
@@ -11,7 +13,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "mastermd_lib"
+name = "masteredit_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

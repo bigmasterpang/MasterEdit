@@ -12,8 +12,11 @@ import {
   PROJECT_URL,
 } from "../../utils/constants";
 import { getVersion } from "@tauri-apps/api/app";
+import { readMigratedItem, writeItem } from "../../utils/storage";
 
-const EGG_STORAGE_KEY = "mastermd.easter-egg";
+const EGG_STORAGE_KEY = "masteredit.easter-egg";
+/** 改名前的键名，读取时兼容迁移 */
+const EGG_LEGACY_STORAGE_KEY = "mastermd.easter-egg";
 const EGG_CLICKS = 7;
 
 interface ConfettiPiece {
@@ -50,7 +53,7 @@ function makeConfetti(count = 42): ConfettiPiece[] {
   }));
 }
 
-/** 关于 MasterMD：版本、作者、软件中心与隐藏彩蛋 */
+/** 关于 MasterEdit：版本、作者、软件中心与隐藏彩蛋 */
 export function AboutDialog() {
   const open = useDialogStore((s) => s.aboutVisible);
   const close = () => useDialogStore.getState().setAboutVisible(false);
@@ -60,7 +63,7 @@ export function AboutDialog() {
   const [exePath, setExePath] = useState("");
   const [clicks, setClicks] = useState(0);
   const [eggUnlocked, setEggUnlocked] = useState(
-    () => typeof localStorage !== "undefined" && localStorage.getItem(EGG_STORAGE_KEY) === "1",
+    () => readMigratedItem(EGG_STORAGE_KEY, EGG_LEGACY_STORAGE_KEY) === "1",
   );
   const [confetti, setConfetti] = useState<ConfettiPiece[]>([]);
   const dungeonMeta = useDungeonStore((s) => s.meta);
@@ -96,11 +99,7 @@ export function AboutDialog() {
     const next = clicks + 1;
     setClicks(next);
     if (next >= EGG_CLICKS) {
-      try {
-        localStorage.setItem(EGG_STORAGE_KEY, "1");
-      } catch {
-        /* 忽略存储失败 */
-      }
+      writeItem(EGG_STORAGE_KEY, "1");
       setEggUnlocked(true);
       setConfetti(makeConfetti(60));
     }

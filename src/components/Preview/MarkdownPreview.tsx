@@ -11,6 +11,8 @@ import { buildRegex, type SearchOptions } from "../../utils/searchEngine";
 import { ContextMenu } from "../common/ContextMenu";
 
 interface Props {
+  /** 本预览所属文档：解析相对图片/链接必须用它，不能用全局激活文档 */
+  docId?: string | null;
   html: string;
   hasMath: boolean;
   hasMermaid: boolean;
@@ -25,6 +27,7 @@ let mermaidSeq = 0;
  * 顺序：清理 HTML -> 注入 DOM -> 修正图片路径/链接 -> 延迟渲染 KaTeX / Mermaid。
  */
 export function MarkdownPreview({
+  docId,
   html,
   hasMath,
   hasMermaid,
@@ -49,7 +52,11 @@ export function MarkdownPreview({
     const safe = sanitizeHtml(html);
     root.innerHTML = safe;
 
-    const doc = useAppStore.getState().docs.find((d) => d.id === useAppStore.getState().activeId);
+    // 必须按「本预览所属文档」解析相对路径：用全局 activeId 的话，
+    // 双栏打开两个不同目录的文档时，非激活栏的图片会按另一篇文档的目录去解析
+    const doc = docId
+      ? useAppStore.getState().docs.find((d) => d.id === docId) ?? null
+      : null;
     const docPath = doc?.filePath ?? null;
 
     /* ---------------- 图片路径修正 ---------------- */
@@ -114,7 +121,7 @@ export function MarkdownPreview({
       box.removeAttribute("disabled");
       box.addEventListener("change", () => {
         const line = Number(box.getAttribute("data-line"));
-        if (Number.isFinite(line)) toggleTaskOnLine(line);
+        if (Number.isFinite(line)) toggleTaskOnLine(line, docId ?? undefined);
         else box.checked = !box.checked;
       });
     });
@@ -155,7 +162,7 @@ export function MarkdownPreview({
           const target = document.createElement("div");
           target.className = "mermaid-block";
           try {
-            const id = `mastermd-mermaid-${++mermaidSeq}`;
+            const id = `masteredit-mermaid-${++mermaidSeq}`;
             const { svg } = await mermaid.render(id, graph);
             target.innerHTML = svg;
           } catch (error) {
@@ -166,7 +173,7 @@ export function MarkdownPreview({
         }
       });
     }
-  }, [html, hasMath, hasMermaid, isDark]);
+  }, [docId, html, hasMath, hasMermaid, isDark]);
 
   /* ---------------- 搜索高亮（作用于渲染后的文本） ---------------- */
   useEffect(() => {

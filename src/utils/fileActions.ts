@@ -322,9 +322,13 @@ export async function saveDoc(id: string): Promise<boolean> {
       eol: doc.eol,
     });
     markSelfWrite();
+    // 写入期间用户可能继续输入：只有内容与写入时完全一致才能标记为已保存，
+    // 否则会把「还没落盘的按键」当成已保存，自动保存与关闭确认都不再提示
+    const latest = getDocById(id);
+    const stillSame = (latest?.content ?? doc.content) === doc.content;
     useAppStore.getState().patchDoc(id, {
       savedContent: doc.content,
-      isDirty: false,
+      isDirty: stillSame ? false : true,
       modifiedAt,
       // 加密文档落盘后会多出 4096 字节文件头
       size: (doc.encrypted ? 4096 : 0) + utf8Size(doc.content),
@@ -429,8 +433,46 @@ export async function closeDocWithConfirm(id: string): Promise<boolean> {
   const doc = getDocById(id);
   if (!doc) return true;
   if (!(await ensureNoDirty(doc))) return false;
-  if (doc.filePath) void unwatchFile(doc.filePath);
+  if (doc.filePath) {
+    // 同一路径可能还开在另一栏（分屏同文档对照）：只有无人引用时才解除监听，
+    // 否则剩下的那个标签页再也收不到外部变更通知
+    const stillReferenced = useAppStore
+      .getState()
+      .docs.some((other) => other.id !== id && samePath(other.filePath, doc.filePath));
+    if (!stillReferenced) void unwatchFile(doc.filePath);
+  }
+  // 释放该文档的 PDF 撤销栈与自动清洗计数（每个快照都持有一份 base64 副本）。
+  // 用动态 import 保持 pdf-lib 留在按需加载的分包里，不拖累首屏体积
+  if (doc.docType === "pdf" || isPdfPath(doc.filePath)) {
+    void import("../components/PDF/pdfService")
+      .then((mod) => mod.disposePdfDocState(id))
+      .catch(() => undefined);
+  }
   useAppStore.getState().closeDoc(id);
+  return true;
+}
+
+/** 关闭除 keepId 之外的全部标签页（逐个走未保存确认，任何一步取消即中止） */
+export async function closeOtherDocsWithConfirm(keepId: string): Promise<boolean> {
+  const others = useAppStore.getState().docs.filter((doc) => doc.id !== keepId);
+  for (const doc of others) {
+    if (!(await closeDocWithConfirm(doc.id))) return false;
+  }
+  return true;
+}
+
+/** 关闭 keepId 右侧的标签页（同栏内按显示顺序，逐个确认） */
+export async function closeRightDocsWithConfirm(keepId: string): Promise<boolean> {
+  const state = useAppStore.getState();
+  const keep = state.docs.find((doc) => doc.id === keepId);
+  if (!keep) return true;
+  const pane = keep.pane ?? 0;
+  const paneDocs = state.docs.filter((doc) => (doc.pane ?? 0) === pane);
+  const keepIndex = paneDocs.findIndex((doc) => doc.id === keepId);
+  if (keepIndex < 0) return true;
+  for (const doc of paneDocs.slice(keepIndex + 1)) {
+    if (!(await closeDocWithConfirm(doc.id))) return false;
+  }
   return true;
 }
 

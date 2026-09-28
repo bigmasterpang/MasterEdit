@@ -78,11 +78,15 @@ if (-not $ReleaseNotes) {
     if (-not $ReleaseNotes) { $ReleaseNotes = "MasterEdit $Version released" }
 }
 
-# 5. Publish to both portal nodes
+# 5. Publish to the overseas VM portal (single upload).
+#    The domestic Aliyun node mirrors the VM automatically via cron
+#    (/etc/cron.d/portal-sync -> /opt/app-portal/sync-from-vm.sh), so no second upload.
+#    -SkipNotify: WeChat cards are sent by the DeepSeek Harness plugin, not by this script.
 & (Join-Path $projectRoot "..\tools\publish-release.ps1") `
     -App "masteredit" `
     -Platform "windows" `
     -FilePath $FilePath `
     -Version $Version `
     -ReleaseNotes $ReleaseNotes `
-    -Variant $Mode
+    -Variant $Mode `
+    -SkipNotify

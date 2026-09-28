@@ -117,7 +117,7 @@ where
 {
     let (secure, host, port, path) = parse_url(url)?;
 
-    let agent = wide("mastermd-updater/1.0");
+    let agent = wide("MasterEdit-Updater/1.0");
     let access_type = match proxy {
         ProxyMode::System => WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         ProxyMode::Direct => WINHTTP_ACCESS_TYPE_NO_PROXY,
@@ -167,19 +167,13 @@ where
         "WinHttpOpenRequest",
     )?;
 
+    // 证书校验交给 WinHTTP 默认行为处理：旧实现曾用 WinHttpSetOption 打开
+    // SECURITY_FLAG_IGNORE_* 一味跳过校验（未知 CA / 证书过期 / 域名不匹配全放过），
+    // 而更新元数据（版本号 + SHA-256）与安装包都来自同一响应，
+    // 关掉校验等于让中间人同时伪造两者，静默安装任意程序。
+    // 当前软件中心证书链正常，保持严格校验。
     if secure {
-        let sec_flags: u32 = SECURITY_FLAG_IGNORE_UNKNOWN_CA
-            | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
-            | SECURITY_FLAG_IGNORE_CERT_CN_INVALID
-            | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-        unsafe {
-            let bytes = sec_flags.to_ne_bytes();
-            let _ = WinHttpSetOption(
-                Some(request.0),
-                WINHTTP_OPTION_SECURITY_FLAGS,
-                Some(&bytes),
-            );
-        }
+        let _ = &request;
     }
 
     unsafe {
@@ -216,7 +210,11 @@ where
                 &mut read,
             )
         };
-        if ok.is_err() || read == 0 {
+        if let Err(error) = ok {
+            // 读取失败不能当成正常结束：否则半截安装包会被当作下载成功并被执行
+            return Err(format!("读取响应数据失败: {error}"));
+        }
+        if read == 0 {
             break;
         }
         let chunk = &buffer[..read as usize];
@@ -487,7 +485,7 @@ fn fetch_latest(current: &str, variant: &str) -> Result<PortalRelease, String> {
                     });
                 }
                 Ok(response) if response.status == 404 => {
-                    last_error = "软件中心暂无 mastermd 的发布版本".to_string();
+                    last_error = "软件中心暂无 MasterEdit 的发布版本".to_string();
                 }
                 Ok(response) => {
                     last_error = format!("服务器返回状态码 {}", response.status);
@@ -556,9 +554,12 @@ pub async fn download_update(
 
         let mut total = total_hint;
         let mut last_emit = std::time::Instant::now();
+        // 写盘失败必须冒泡：否则会留下半截文件却报告下载成功
+        let mut write_error: Option<String> = None;
 
         let response = http_get(&url, 8000, ProxyMode::System, false, |chunk| {
-            if file.write_all(chunk).is_err() {
+            if let Err(error) = file.write_all(chunk) {
+                write_error = Some(error.to_string());
                 return false;
             }
             hasher.update(chunk);
@@ -580,6 +581,11 @@ pub async fn download_update(
             true
         })?;
 
+        if let Some(error) = write_error {
+            let _ = std::fs::remove_file(&dest_for_task);
+            return Err(format!("写入安装包失败: {error}"));
+        }
+
         if response.status != 200 {
             let _ = std::fs::remove_file(&dest_for_task);
             return Err(format!("下载失败，服务器返回状态码 {}", response.status));
@@ -594,6 +600,14 @@ pub async fn download_update(
                 total: if total > 0 { total } else { size },
             },
         );
+
+        // 大小不符说明传输被截断（校验值缺失时这是唯一的完整性兜底）
+        if total_hint > 0 && size != total_hint {
+            let _ = std::fs::remove_file(&dest_for_task);
+            return Err(format!(
+                "安装包不完整（期望 {total_hint} 字节，实际 {size} 字节），请重试"
+            ));
+        }
 
         if !expected.is_empty() && expected != sha256 {
             let _ = std::fs::remove_file(&dest_for_task);
@@ -648,7 +662,7 @@ pub async fn apply_update(path: String) -> Result<(), String> {
         current
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "MasterMD.exe".to_string())
+            .unwrap_or_else(|| "MasterEdit.exe".to_string())
     ));
 
     // 清理上一次更新留下的备份
@@ -676,7 +690,7 @@ pub fn cleanup_old_binary() {
     let name = current
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "MasterMD.exe".to_string());
+        .unwrap_or_else(|| "MasterEdit.exe".to_string());
     if let Some(dir) = current.parent() {
         let _ = std::fs::remove_file(dir.join(format!("{name}.old")));
     }
@@ -686,6 +700,12 @@ pub fn cleanup_old_binary() {
 /// 安装版静默升级：
 /// 生成一个临时脚本，等待当前进程退出 → 静默运行安装包（/S）→ 启动新版 → 自删。
 /// 由前端在下载完成后调用，随后立即退出应用。
+///
+/// 两个必须注意的点：
+/// 1. 安装路径只能通过命令行参数传入脚本，**不能**拼进脚本文本：
+///    路径里出现单引号（如 `C:\Users\O'Brien\...`）会让脚本语法错误甚至被注入；
+/// 2. 静默安装会先卸载旧版本，可执行文件名也可能随版本变化（MasterMD.exe → MasterEdit.exe），
+///    因此重启时按候选名逐个探测，找不到就放弃重启（由用户手动启动）。
 #[cfg(windows)]
 #[tauri::command]
 pub async fn apply_installer_update(path: String) -> Result<(), String> {
@@ -695,18 +715,20 @@ pub async fn apply_installer_update(path: String) -> Result<(), String> {
     }
     let current = std::env::current_exe().map_err(|e| format!("无法定位当前程序: {e}"))?;
     let pid = std::process::id();
-    let script = std::env::temp_dir().join(format!("mastermd-update-{pid}.ps1"));
+    let script = std::env::temp_dir().join(format!("masteredit-update-{pid}.ps1"));
     let body = format!(
         "$ErrorActionPreference = 'SilentlyContinue'\r\n\
+         $setup = $args[0]\r\n\
+         $exe = $args[1]\r\n\
          while (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 700 }}\r\n\
          Start-Sleep -Milliseconds 400\r\n\
-         Start-Process -FilePath '{setup}' -ArgumentList '/S' -Wait\r\n\
+         Start-Process -FilePath $setup -ArgumentList '/S' -Wait\r\n\
          Start-Sleep -Milliseconds 600\r\n\
-         Start-Process -FilePath '{exe}'\r\n\
+         $dir = Split-Path -Parent $exe\r\n\
+         $candidates = @($exe, (Join-Path $dir 'MasterEdit.exe'), (Join-Path $dir 'masteredit.exe'), (Join-Path $dir 'MasterMD.exe'), (Join-Path $dir 'mastermd.exe'))\r\n\
+         foreach ($candidate in $candidates) {{ if (Test-Path -LiteralPath $candidate) {{ Start-Process -FilePath $candidate; break }} }}\r\n\
          Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force\r\n",
-        pid = pid,
-        setup = setup.display(),
-        exe = current.display()
+        pid = pid
     );
     std::fs::write(&script, body).map_err(|e| format!("无法写入升级脚本: {e}"))?;
 
@@ -722,6 +744,8 @@ pub async fn apply_installer_update(path: String) -> Result<(), String> {
             "-File",
         ])
         .arg(&script)
+        .arg(&setup)
+        .arg(&current)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| format!("启动升级脚本失败: {e}"))?;

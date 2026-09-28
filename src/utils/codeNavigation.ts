@@ -170,7 +170,7 @@ const LANGUAGE_KEYWORDS = new Set([
   "new", "delete", "typeof", "instanceof", "sizeof", "in", "of", "is", "not", "and", "or",
   "true", "false", "null", "undefined", "void", "None", "True", "False", "nil",
   "this", "self", "super", "crate", "pass", "with", "lambda", "virtual", "override",
-  "abstract", "extends", "implements", " number", "string", "boolean", "any", "never",
+  "abstract", "extends", "implements", "number", "string", "boolean", "any", "never",
   "int", "float", "double", "char", "bool", "usize", "isize", "u8", "u16", "u32", "u64",
   "i8", "i16", "i32", "i64", "f32", "f64", "str", "String", "Vec", "Option", "Result",
 ]);

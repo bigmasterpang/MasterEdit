@@ -6,7 +6,10 @@ import { ContextMenu, type ContextMenuItem } from "../common/ContextMenu";
 import { useAppStore } from "../../stores/appStore";
 import { useTabDragStore } from "../../stores/tabDragStore";
 import {
+  closeAllDocsWithConfirm,
   closeDocWithConfirm,
+  closeOtherDocsWithConfirm,
+  closeRightDocsWithConfirm,
   newDocument,
   openFileDialog,
   reloadDocFromDisk,
@@ -90,23 +93,18 @@ export function TabBar({ pane = 0 }: Props) {
         {
           label: "关闭其他标签页",
           disabled: paneDocs.length <= 1,
-          onClick: () => useAppStore.getState().closeOtherDocs(doc.id),
+          // 必须走带确认的关闭流程：直接调用 store 的 closeOtherDocs 会丢弃
+          // 其它标签页里未保存的内容，且不可恢复
+          onClick: () => void closeOtherDocsWithConfirm(doc.id),
         },
         {
           label: "关闭右侧标签页",
           disabled: paneDocs[paneDocs.length - 1]?.id === doc.id,
-          onClick: () => useAppStore.getState().closeRightDocs(doc.id),
+          onClick: () => void closeRightDocsWithConfirm(doc.id),
         },
         {
           label: "关闭全部标签页",
-          onClick: () => {
-            const hasDirty = useAppStore.getState().docs.some((d) => d.isDirty);
-            if (hasDirty) {
-              void closeDocWithConfirm(doc.id);
-            } else {
-              useAppStore.getState().closeAllDocs();
-            }
-          },
+          onClick: () => void closeAllDocsWithConfirm(),
         },
       ],
       // 2. 磁盘与复制
@@ -249,9 +247,17 @@ export function TabBar({ pane = 0 }: Props) {
         }
       } else if (viewElem) {
         const p = Number(viewElem.getAttribute("data-pane-viewport")) as 0 | 1;
-        targetPane = p;
         const pDocs = useAppStore.getState().docs.filter((d) => (d.pane ?? 0) === p);
         targetIndex = pDocs.length;
+        if (p === 0 && !useAppStore.getState().layout.split) {
+          // 单栏模式：拖到视口右半边即视为放入新开的右栏（与「移到右栏 (双栏并排)」提示一致）。
+          // 窗口开启了 dragDropEnabled，Windows 上 HTML5 drag/drop 事件不会派发，
+          // 因此这里用指针坐标判断左右半边。
+          const rect = viewElem.getBoundingClientRect();
+          targetPane = moveEvt.clientX > rect.left + rect.width / 2 ? 1 : 0;
+        } else {
+          targetPane = p;
+        }
       }
 
       useTabDragStore.getState().updateHover(moveEvt.clientX, moveEvt.clientY, targetPane, targetIndex);

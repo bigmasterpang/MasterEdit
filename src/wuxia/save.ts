@@ -4,9 +4,12 @@
 
 import { createPlayer, emptyIdle } from "./engine";
 import { FIRST_MAIN_QUEST, MAP_BY_ID } from "./data";
+import { readMigratedItem, removeItem, writeItem } from "../utils/storage";
 import type { SaveGame } from "./types";
 
-const STORAGE_KEY = "mastermd.wuxia.save.v1";
+const STORAGE_KEY = "masteredit.wuxia.save.v1";
+/** 改名前的键名，读取时兼容迁移 */
+const LEGACY_STORAGE_KEY = "mastermd.wuxia.save.v1";
 export const SAVE_VERSION = 1;
 
 export function todayKey(): string {
@@ -37,7 +40,7 @@ export function newGame(playerName = "无名少侠"): SaveGame {
 
 export function loadGame(): SaveGame | null {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = readMigratedItem(STORAGE_KEY, LEGACY_STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<SaveGame>;
     if (!parsed || !parsed.player) return null;
@@ -50,18 +53,14 @@ export function loadGame(): SaveGame | null {
 
 export function saveGame(save: SaveGame): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...save, lastSeen: Date.now() }));
+    writeItem(STORAGE_KEY, JSON.stringify({ ...save, lastSeen: Date.now() }));
   } catch (error) {
     console.error("[江湖] 写入存档失败", error);
   }
 }
 
 export function clearSave(): void {
-  try {
-    localStorage.removeItem(STORAGE_KEY);
-  } catch {
-    /* 忽略 */
-  }
+  removeItem(STORAGE_KEY, LEGACY_STORAGE_KEY);
 }
 
 /** 版本迁移：字段缺失时补默认值，保证旧存档可用 */
