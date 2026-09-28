@@ -5,7 +5,7 @@ import { useUpdateStore } from "../../stores/updateStore";
 import { Icon } from "../common/Icon";
 import { countWords, formatBytes } from "../../utils/timing";
 import { APP_NAME, ENCODINGS, EOL_OPTIONS } from "../../utils/constants";
-import { docKindOf, extName, fileName, isPdfDoc } from "../../utils/filePath";
+import { docKindOf, extName, fileName, isPdfDoc, isSpreadsheetDoc } from "../../utils/filePath";
 import { setDocEncoding, setDocEol } from "../../utils/fileActions";
 import { extractFrontMatter } from "../../utils/frontMatter";
 
@@ -20,6 +20,8 @@ const KIND_LABEL = {
   text: "纯文本",
   code: "代码",
   pdf: "PDF",
+  delimited: "CSV 表格",
+  spreadsheet: "Excel 表格",
 } as const;
 
 /** 原始字数：源码中的字符数（不含空白），预览字数：渲染后可见字符数 */
@@ -67,6 +69,9 @@ export function StatusBar() {
     [doc?.content],
   );
 
+  /** 电子表格：只读查看，状态栏改为展示文件信息而非文本统计 */
+  const isSheet = isSpreadsheetDoc(doc);
+
   return (
     <div className="print-hide flex h-6 shrink-0 items-center gap-3 border-t border-line bg-panel px-3 text-[11px] text-muted">
       <span className="flex min-w-0 items-center gap-1">
@@ -99,6 +104,17 @@ export function StatusBar() {
             <span title="文件大小">{formatBytes(doc.size)}</span>
             <span title="文件类型">PDF 文档</span>
           </>
+        ) : isSheet ? (
+          <>
+            <span title="文件大小">{formatBytes(doc.size)}</span>
+            <span title="文件类型">
+              {KIND_LABEL[docKindOf(doc.filePath)]}
+              {extName(doc.filePath ?? "") ? ` · ${extName(doc.filePath ?? "")}` : ""}
+            </span>
+            <span className="text-warning" title="表格目前仅支持查看，不写回原文件">
+              只读查看
+            </span>
+          </>
         ) : (
           <>
             <span title="光标位置">
@@ -124,7 +140,7 @@ export function StatusBar() {
         <span>就绪</span>
       )}
 
-      {doc && !isPdfDoc(doc) ? (
+      {doc && !isPdfDoc(doc) && !isSheet ? (
         <>
           <button
             type="button"
@@ -178,7 +194,9 @@ export function StatusBar() {
         </span>
       ) : null}
       {doc?.readOnly ? <span className="text-warning">只读</span> : null}
-      <span title="当前视图模式">{isPdfDoc(doc) ? "PDF 查看器" : VIEW_LABEL[viewMode]}</span>
+      <span title="当前视图模式">
+        {isPdfDoc(doc) ? "PDF 查看器" : isSheet ? "表格查看器" : VIEW_LABEL[viewMode]}
+      </span>
     </div>
   );
 }

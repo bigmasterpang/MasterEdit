@@ -2,8 +2,8 @@
 # 包名即最终可执行文件名（cargo 输出 MasterEdit.exe），与 productName 保持一致，
 # 避免安装目录里再出现旧的 mastermd.exe。库名单独用 [lib] 指定为合法标识符。
 name = "MasterEdit"
-version = "0.17.1"
-description = "MasterEdit — Windows Markdown, PDF & Code Viewer/Editor"
+version = "0.18.0"
+description = "MasterEdit — Windows Markdown, Office Sheet, PDF & Code Viewer/Editor"
 authors = ["bigmasterpang"]
 edition = "2021"
 
@@ -28,6 +28,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-store = "2"
 notify = "8.2.0"
 encoding_rs = "0.8"
+calamine = "0.36.1"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
@@ -45,3 +46,6 @@ opt-level = "z"
 panic = "abort"
 strip = true
 incremental = false
+
+[dev-dependencies]
+rust_xlsxwriter = "0.99.1"

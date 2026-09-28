@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openPath as openWithSystem, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Icon, type IconName } from "../common/Icon";
 import { ContextMenu, type ContextMenuItem } from "../common/ContextMenu";
 import { useAppStore } from "../../stores/appStore";
@@ -133,6 +133,17 @@ export function TabBar({ pane = 0 }: Props) {
       ...(doc.filePath
         ? [
             [
+              {
+                label: "用系统默认程序打开",
+                icon: "external-link" as IconName,
+                // 表格只读、PDF 排版保真等场景下，交给系统里的 Office / WPS / 阅读器处理
+                onClick: () => {
+                  void openWithSystem(doc.filePath!).catch(async (error) => {
+                    const { showMessage } = await import("../../stores/dialogStore");
+                    await showMessage("无法打开", String(error));
+                  });
+                },
+              },
               {
                 label: "在文件资源管理器中显示",
                 icon: "folder-open" as IconName,

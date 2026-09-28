@@ -1,12 +1,14 @@
 import {
   CODE_EXTENSIONS,
+  DELIMITED_EXTENSIONS,
   MARKDOWN_EXTENSIONS,
   OPENABLE_EXTENSIONS,
+  SPREADSHEET_EXTENSIONS,
   TEXT_EXTENSIONS,
 } from "./constants";
 
-/** 文档类别：Markdown（预览/大纲/导出）/ 代码（语法高亮）/ 纯文本 / PDF 查看与编辑 */
-export type DocKind = "markdown" | "text" | "code" | "pdf";
+/** 文档类别：Markdown（预览/大纲/导出）/ 代码（语法高亮）/ 纯文本 / PDF / 表格（CSV、Excel） */
+export type DocKind = "markdown" | "text" | "code" | "pdf" | "delimited" | "spreadsheet";
 
 /** 统一使用反斜杠，便于 Windows 路径比较 */
 export function normalizeSlashes(p: string): string {
@@ -46,12 +48,42 @@ export function isPdfPath(p: string | null | undefined): boolean {
 
 /** 判断文档是否为 PDF 文档 */
 export function isPdfDoc(
-  doc: { filePath: string | null; docType?: "markdown" | "blank" | "pdf" } | null | undefined,
+  doc: { filePath: string | null; docType?: "markdown" | "blank" | "pdf" | "spreadsheet" } | null | undefined,
 ): boolean {
   if (!doc) return false;
   if (doc.docType === "pdf") return true;
   if (doc.filePath && isPdfPath(doc.filePath)) return true;
   return false;
+}
+
+/** 是否为电子表格文件（xlsx / xls / xlsb / ods，只读查看） */
+export function isSpreadsheetPath(p: string | null | undefined): boolean {
+  if (!p) return false;
+  return SPREADSHEET_EXTENSIONS.includes(extName(p));
+}
+
+/** 是否为分隔符文本表格（csv / tsv，走文本管线 + 表格视图） */
+export function isDelimitedPath(p: string | null | undefined): boolean {
+  if (!p) return false;
+  return DELIMITED_EXTENSIONS.includes(extName(p));
+}
+
+/** 判断文档是否为电子表格（只读，由 Rust 侧解析） */
+export function isSpreadsheetDoc(
+  doc: { filePath: string | null; docType?: "markdown" | "blank" | "pdf" | "spreadsheet" } | null | undefined,
+): boolean {
+  if (!doc) return false;
+  if (doc.docType === "spreadsheet") return true;
+  return isSpreadsheetPath(doc.filePath);
+}
+
+/** 判断文档是否为 CSV/TSV（表格视图 + 源码编辑） */
+export function isDelimitedDoc(
+  doc: { filePath: string | null; docType?: "markdown" | "blank" | "pdf" | "spreadsheet" } | null | undefined,
+): boolean {
+  if (!doc) return false;
+  if (doc.docType === "pdf" || doc.docType === "spreadsheet") return false;
+  return isDelimitedPath(doc.filePath);
 }
 
 /**
@@ -62,13 +94,14 @@ export function isPdfDoc(
  * - 其余未保存文档默认为 Markdown。
  */
 export function isMarkdownDoc(
-  doc: { filePath: string | null; docType?: "markdown" | "blank" | "pdf" } | null | undefined,
+  doc: { filePath: string | null; docType?: "markdown" | "blank" | "pdf" | "spreadsheet" } | null | undefined,
 ): boolean {
   if (!doc) return false;
   if (doc.docType === "blank" && !doc.filePath) return false;
-  if (doc.docType === "pdf") return false;
+  if (doc.docType === "pdf" || doc.docType === "spreadsheet") return false;
   if (doc.filePath) {
     if (isPdfPath(doc.filePath)) return false;
+    if (isSpreadsheetPath(doc.filePath)) return false;
     return isMarkdownPath(doc.filePath);
   }
   return doc.docType !== "blank";
@@ -76,7 +109,7 @@ export function isMarkdownDoc(
 
 /** 获取文档基础名称（不含同名编号） */
 export function getDocBaseName(
-  doc: { filePath: string | null; docType?: "markdown" | "blank" | "pdf" },
+  doc: { filePath: string | null; docType?: "markdown" | "blank" | "pdf" | "spreadsheet" },
 ): string {
   if (doc.filePath) return fileName(doc.filePath);
   if (doc.docType === "blank") return "未命名";
@@ -86,8 +119,8 @@ export function getDocBaseName(
 
 /** 获取文档展示标题。如果有多个同名文档，自动加上编号区分，如 README.md (1), README.md (2) */
 export function getDocTitle(
-  doc: { id: string; filePath: string | null; docType?: "markdown" | "blank" | "pdf" },
-  allDocs: Array<{ id: string; filePath: string | null; docType?: "markdown" | "blank" | "pdf" }>,
+  doc: { id: string; filePath: string | null; docType?: "markdown" | "blank" | "pdf" | "spreadsheet" },
+  allDocs: Array<{ id: string; filePath: string | null; docType?: "markdown" | "blank" | "pdf" | "spreadsheet" }>,
 ): string {
   const base = getDocBaseName(doc);
   const duplicates = allDocs.filter((d) => getDocBaseName(d) === base);
@@ -102,6 +135,8 @@ export function docKindOf(p: string | null | undefined): DocKind {
   if (!p) return "markdown";
   const ext = extName(p);
   if (ext === "pdf") return "pdf";
+  if (SPREADSHEET_EXTENSIONS.includes(ext)) return "spreadsheet";
+  if (DELIMITED_EXTENSIONS.includes(ext)) return "delimited";
   if (MARKDOWN_EXTENSIONS.includes(ext)) return "markdown";
   if (CODE_EXTENSIONS.includes(ext)) return "code";
   if (TEXT_EXTENSIONS.includes(ext)) return "text";

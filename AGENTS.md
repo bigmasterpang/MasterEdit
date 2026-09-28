@@ -58,6 +58,17 @@ Rust 侧：`cd src-tauri && cargo check --message-format=short`；单元测试�
   - `https://master.dapang.wang/api/apps/masteredit/windows/latest?variant=installer`
   - `http://106.14.225.57/api/apps/masteredit/windows/latest?variant=installer`
 
+## 办公表格模块（0.18.0 起）
+
+- **CSV / TSV**：走现有文本管线（内容存在 `doc.content`，可编辑、可撤销、按编码保存）；表格视图在 `src/components/Sheet/`（`SheetView` + `SheetGrid`）与 `src/utils/delimited.ts`。视图三态复用全局 `viewMode`：`preview` = 表格、`source` = 源码、`split` = 表格 + 源码。
+- **CSV 用惰性行索引**：`createDelimitedTable(text)` 单遍扫描只记录行首偏移（十几 MB / 十几万行约 30ms，偏移表约 1MB），行内容由 `table.rowAt(i)` 按需解析并缓存最近若干行 —— **没有行数上限**，也不为每个单元格建对象。`parseDelimited(text, {maxRows})` 保留给一次性取前 N 行的场景，两条路径结果必须一致（有等价性对拍测试）。
+- **xlsx / xls / xlsb / ods**：Rust 侧 `src-tauri/src/commands/office.rs`（calamine）按行窗口解析（`spreadsheet_info` / `spreadsheet_rows`），前端稀疏缓存 + 虚拟滚动；文档模型为 `docType: "spreadsheet"` + `readOnly: true`，`saveDoc` / `saveDocAs` / 自动保存都会拦截，外部改动只刷新基线并触发重新解析。
+- **企业透明加密（亿赛通等）**：工作簿在 `read_workbook_bytes` 中先 `esafenet::decrypt_esafenet` **内存解密**再交给 calamine（`open_workbook_auto_from_rs` + `Cursor`），**绝不写明文临时文件**；`SpreadsheetInfo.encrypted` 供界面显示「已解密」。直接读原始字节会得到 `Could not find EOCD` 这类误导性错误。
+- **解析缓存**：`SheetCache` 是按「最近使用」排序的 LRU，受 `CACHE_ENTRIES` 与 `CACHE_CELL_BUDGET`（总单元格预算）双重约束；**单张超大工作表会被保留**，否则百万行工作表每个滚动窗口都要重解析整表。
+- **打不开时的提示**：`describe_parse_failure` 按文件头区分「需要密码的 Office 文档 / 旧版 CFB 格式」「HTML 假 Excel」「损坏或被加密软件处理过」，给出可执行建议，而不是抛底层 zip 错误。
+- **约定**：**不要**把 Office 格式加进 `tauri.conf.json` 的 `fileAssociations`（避免抢占默认打开程序、放大版式保真预期差）；表格模块保持只读，写回能力属于后续阶段。
+- 相关测试：`cd src-tauri && cargo test --lib office`（Excel 序列日期、类型映射、窗口收敛、非 A1 区域坐标、公式提取）。
+
 ## 完成后通知
 
 - **不要在项目脚本里发微信通知**：微信通知统一由 DeepSeek Harness 的通知插件负责。共享脚本 `C:\opencode\tools\publish-release.ps1` 内的旧微信卡片已**默认关闭**（需要时传 `-Notify` 才发），`tools/publish.ps1` 另外固定传 `-SkipNotify`；`C:\opencode\tools\send-wechat.ps1` 仅保留作手动调用。

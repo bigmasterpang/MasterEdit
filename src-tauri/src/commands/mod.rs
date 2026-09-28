@@ -3,6 +3,7 @@ pub mod file;
 pub mod textcodec;
 pub mod image;
 pub mod legacy;
+pub mod office;
 #[cfg(windows)]
 pub mod pdf;
 pub mod recent;

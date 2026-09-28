@@ -97,6 +97,8 @@ pub fn run() {
             let handle = app.handle().clone();
             app.manage(recent::load(&handle));
             app.manage(watch::WatchState::default());
+            // 电子表格解析缓存（虚拟滚动时复用，避免重复解析）
+            app.manage(commands::office::SheetCache::default());
             // 改名兼容：把旧品牌 MasterMD 的存储文件迁移到新文件名（保留 PDF 批注等数据）
             commands::legacy::migrate_legacy_store(&handle);
 
@@ -153,6 +155,8 @@ pub fn run() {
             commands::fs::list_directory,
             commands::fs::parent_dir_of,
             commands::fs::search_workspace_symbols,
+            commands::office::spreadsheet_info,
+            commands::office::spreadsheet_rows,
             recent::get_recent_files,
             recent::add_recent_file,
             recent::remove_recent_file,

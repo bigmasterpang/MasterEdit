@@ -8,10 +8,13 @@ import { SearchBar } from "../SearchBar/SearchBar";
 import { Icon } from "../common/Icon";
 
 const PdfViewer = lazy(() => import("../PDF/PdfViewer").then((m) => ({ default: m.PdfViewer })));
+// 表格视图（CSV 表格 / Excel 只读）按需加载：不打开表格文档就不进入首屏包
+const SheetView = lazy(() => import("../Sheet/SheetView").then((m) => ({ default: m.SheetView })));
+const SheetSplit = lazy(() => import("./SheetSplit").then((m) => ({ default: m.SheetSplit })));
 import { useMarkdown, type MarkdownResult } from "../../hooks/useMarkdown";
 import { useAppStore, getDocById } from "../../stores/appStore";
 import { useSettingsStore } from "../../stores/settingsStore";
-import { isMarkdownDoc, isPdfDoc } from "../../utils/filePath";
+import { isDelimitedDoc, isMarkdownDoc, isPdfDoc, isSpreadsheetDoc } from "../../utils/filePath";
 import { REALTIME_PREVIEW_LIMIT } from "../../utils/constants";
 import { useTabDragStore } from "../../stores/tabDragStore";
 
@@ -33,6 +36,8 @@ export function DocView({ docId, pane, isDark, previewRef }: DocViewProps) {
 
   const content = doc?.content ?? "";
   const isMarkdown = isMarkdownDoc(doc);
+  const isSheet = isSpreadsheetDoc(doc);
+  const isDelimited = isDelimitedDoc(doc);
   const rendered = useMarkdown(isMarkdown ? content : "", viewMode);
   const lineCount = doc ? doc.content.split("\n").length : 0;
   const livePreview = content.length <= REALTIME_PREVIEW_LIMIT;
@@ -57,7 +62,8 @@ export function DocView({ docId, pane, isDark, previewRef }: DocViewProps) {
     const onWheel = (event: WheelEvent) => {
       if (!event.ctrlKey && !event.metaKey) return;
       const currentDoc = getDocById(docId);
-      if (!currentDoc || isPdfDoc(currentDoc)) return;
+      // PDF 与表格视图不参与字号缩放（表格用固定行高渲染）
+      if (!currentDoc || isPdfDoc(currentDoc) || isSpreadsheetDoc(currentDoc)) return;
       event.preventDefault();
       event.stopPropagation();
       const base = currentDoc.fontSize ?? useSettingsStore.getState().fontSize;
@@ -137,6 +143,42 @@ export function DocView({ docId, pane, isDark, previewRef }: DocViewProps) {
           >
             <PdfViewer key={doc.id} docId={doc.id} pane={pane} isDark={isDark} />
           </Suspense>
+        ) : isSheet ? (
+          <Suspense
+            fallback={
+              <div className="flex h-full flex-col items-center justify-center gap-2 text-muted">
+                <Icon name="loader" size={24} className="animate-spin text-accent" />
+                <div className="text-[12px]">加载表格模块…</div>
+              </div>
+            }
+          >
+            <SheetView key={doc.id} docId={doc.id} />
+          </Suspense>
+        ) : isDelimited ? (
+          /* CSV / TSV：表格（预览）、源码（编辑）、分屏（表格 + 源码） */
+          viewMode === "source" ? (
+            <CodeMirrorEditor key={doc.id} docId={doc.id} isDark={isDark} />
+          ) : viewMode === "split" ? (
+            <Suspense
+              fallback={
+                <div className="flex h-full items-center justify-center text-[12px] text-muted">
+                  加载表格模块…
+                </div>
+              }
+            >
+              <SheetSplit key={doc.id} docId={doc.id} isDark={isDark} />
+            </Suspense>
+          ) : (
+            <Suspense
+              fallback={
+                <div className="flex h-full items-center justify-center text-[12px] text-muted">
+                  加载表格模块…
+                </div>
+              }
+            >
+              <SheetView key={doc.id} docId={doc.id} />
+            </Suspense>
+          )
         ) : !isMarkdown ? (
           <CodeMirrorEditor key={doc.id} docId={doc.id} isDark={isDark} />
         ) : viewMode === "preview" ? (

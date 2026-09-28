@@ -52,6 +52,51 @@ export interface BinaryPayload {
   encryptedHeader?: string | null;
 }
 
+/* ------------------------------------------------------------------ */
+/* 办公文档（电子表格）：xlsx / xls / ods 由 Rust 侧 calamine 解析只读   */
+/* ------------------------------------------------------------------ */
+
+/** 单元格类型：用于对齐与样式（空 / 文本 / 数字 / 布尔 / 日期 / 错误） */
+export type SheetCellType = "empty" | "text" | "number" | "bool" | "date" | "error";
+
+/** 单个单元格（`v` 为可直接显示的文本；`f` 为公式，仅含公式的单元格才有） */
+export interface SheetCell {
+  v: string;
+  t: SheetCellType;
+  f?: string;
+}
+
+/** 工作表元信息（行列为 0 表示尚未加载：打开该表时才知道真实尺寸） */
+export interface SheetMeta {
+  name: string;
+}
+
+/** 后端 spreadsheet_info 返回：文件信息 + 工作表列表 */
+export interface SpreadsheetInfo {
+  path: string;
+  sheets: SheetMeta[];
+  modifiedAt: number;
+  size: number;
+  /** 是否为企业透明加密文档（已在内存中解密，不落明文副本） */
+  encrypted: boolean;
+}
+
+/** 后端 spreadsheet_rows 返回：按窗口读取的行数据（配合虚拟滚动） */
+export interface SpreadsheetWindow {
+  /** 工作表名 */
+  sheet: string;
+  /** 该表总行数（绝对行号 + 1，与 Excel 行号一致） */
+  rows: number;
+  /** 该表展示列数（已按上限截断） */
+  cols: number;
+  /** 本窗口起始行（0 起，绝对行号） */
+  start: number;
+  /** 本窗口行数据，长度 ≤ 请求的 count；单元格按绝对行列坐标排列 */
+  cells: SheetCell[][];
+  /** 是否存在因上限而截断的内容 */
+  truncated: boolean;
+}
+
 /** 单个文档（标签页）状态 */
 export interface DocState {
   id: string;
@@ -84,8 +129,8 @@ export interface DocState {
   pane: 0 | 1;
   /** 当前文档独立缩放字号（未设置时跟随全局默认字号，互不影响双栏） */
   fontSize?: number;
-  /** 新建文档类型：markdown 或 blank 或 pdf */
-  docType?: "markdown" | "blank" | "pdf";
+  /** 新建文档类型：markdown / blank / pdf / spreadsheet（xlsx、xls、ods 只读查看） */
+  docType?: "markdown" | "blank" | "pdf" | "spreadsheet";
   /** PDF 文件的二进制数据（Base64 编码，编辑如删页/旋转后会更新并置 isDirty） */
   pdfBase64?: string;
   /** PDF 原始/已保存的二进制数据（Base64），用于判断脏状态或恢复 */

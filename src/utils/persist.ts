@@ -9,9 +9,11 @@ import type {
   PdfHighlight,
   PdfNote,
   Settings,
+  SpreadsheetInfo,
   ViewMode,
 } from "../types";
-import { isPdfPath, normalizeSlashes } from "./filePath";
+import { LARGE_FILE_BYTES } from "./constants";
+import { isPdfPath, isSpreadsheetPath, normalizeSlashes } from "./filePath";
 import { debounce } from "./timing";
 
 /** 是否运行在 Tauri 环境中（纯浏览器打开 vite 页面时跳过持久化） */
@@ -140,6 +142,9 @@ export async function initPersistence(): Promise<void> {
 export async function flushUiState(): Promise<void> {
   if (!isTauri || !file) return;
   await captureUi();
+  // 会话是 1.2s 防抖写入的：关闭窗口时立即补写一次，
+  // 否则「刚打开的标签页」可能因为防抖还没触发而丢失
+  await writeSession();
   try {
     await file.save();
   } catch {
@@ -205,6 +210,8 @@ interface SessionPayload {
 
 const SESSION_TAB_LIMIT = 8;
 const SESSION_CONTENT_LIMIT = 512 * 1024;
+/** 会话恢复时单个文件的大小上限：超过则连标签一起放弃，避免启动时卡死 */
+const SESSION_RESTORE_MAX_BYTES = 32 * 1024 * 1024;
 
 const persistSession = debounce(() => {
   void writeSession();
@@ -239,9 +246,9 @@ async function writeSession(): Promise<void> {
     const payload: SessionPayload = {
       paths: docs
         .filter((doc) => doc.filePath)
-        // 超大文档被挡在 unsaved 之外，若仍出现在 paths 里，恢复时会从磁盘重读，
-        // 未保存的编辑会被磁盘版本静默覆盖 —— 必须一起排除
-        .filter((doc) => !oversized(doc))
+        // 只有「超大 **且** 有未保存修改」的文档不能按路径恢复：从磁盘重读会静默覆盖编辑。
+        // 干净的超大文档（例如大 CSV）按路径恢复是安全的 —— 否则每次重启都会丢标签。
+        .filter((doc) => !(oversized(doc) && doc.isDirty))
         // 同上：有未保存内容但被 unsaved 截断掉的文档也不能走路径恢复
         .filter(
           (doc) =>
@@ -317,6 +324,28 @@ export async function restoreSession(): Promise<void> {
       const pane = typeof item === "string" ? 0 : item.pane ?? 0;
       if (opened.has(path.toLowerCase())) continue;
       try {
+        // 电子表格（只读）：按路径恢复，内容由 Rust 侧按需解析
+        if (isSpreadsheetPath(path)) {
+          const info = await invoke<SpreadsheetInfo>("spreadsheet_info", { path });
+          state.addDoc(
+            createDoc({
+              filePath: info.path,
+              docType: "spreadsheet",
+              pane,
+              content: "",
+              savedContent: "",
+              isDirty: false,
+              readOnly: true,
+              encrypted: info.encrypted,
+              modifiedAt: info.modifiedAt,
+              size: info.size,
+            }),
+          );
+          opened.add(path.toLowerCase());
+          void invoke("watch_file", { path }).catch(() => undefined);
+          continue;
+        }
+
         if (isPdfPath(path)) {
           const payloadData = await invoke<BinaryPayload>("read_binary_file", { path });
           const anno = await loadPdfAnnotations(path);
@@ -345,9 +374,12 @@ export async function restoreSession(): Promise<void> {
         }
 
         const payloadData = await invoke<FilePayload>("read_markdown_file", { path });
-        if (payloadData.size > SESSION_CONTENT_LIMIT * 4) continue;
+        // 超大文件（如大 CSV / 日志）按只读恢复，而不是直接丢掉标签：
+        // 与手动打开大文件的行为一致，避免启动时误编辑超大文件
+        if (payloadData.size > SESSION_RESTORE_MAX_BYTES) continue;
         const restoredDoc = docFromPayload(payloadData);
         restoredDoc.pane = pane;
+        if (payloadData.size > LARGE_FILE_BYTES) restoredDoc.readOnly = true;
         state.addDoc(restoredDoc);
         opened.add(path.toLowerCase());
         // 会话恢复出来的标签页必须重新注册文件监听：openPath 只在「打开」时注册，

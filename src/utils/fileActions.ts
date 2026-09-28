@@ -3,14 +3,22 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { createDoc, docFromPayload, getActiveDoc, getDocById, useAppStore } from "../stores/appStore";
 import { askConfirm, askUnsaved, showMessage } from "../stores/dialogStore";
-import type { BinaryPayload, FilePayload } from "../types";
+import type { BinaryPayload, FilePayload, SpreadsheetInfo } from "../types";
 import { loadPdfAnnotations, savePdfAnnotations } from "./persist";
 import {
   EMPTY_DOC_PLACEHOLDER,
   LARGE_FILE_BYTES,
   OPEN_DIALOG_FILTERS,
 } from "./constants";
-import { fileName, isMarkdownPath, isOpenablePath, isPdfPath, samePath } from "./filePath";
+import {
+  fileName,
+  isDelimitedPath,
+  isMarkdownPath,
+  isOpenablePath,
+  isPdfPath,
+  isSpreadsheetPath,
+  samePath,
+} from "./filePath";
 import { formatBytes } from "./timing";
 
 /** 展示用名称 */
@@ -117,6 +125,29 @@ export async function openPath(path: string, targetPane?: 0 | 1): Promise<boolea
   }
 
   try {
+    // 电子表格（xlsx/xls/xlsb/ods）：交给 Rust 侧 calamine 解析，只读查看，不读文本内容
+    if (isSpreadsheetPath(path)) {
+      const info = await invoke<SpreadsheetInfo>("spreadsheet_info", { path });
+      const doc = createDoc({
+        filePath: info.path,
+        docType: "spreadsheet",
+        pane: effectivePane,
+        // 表格不进入文本管线：内容为空、只读、无脏状态
+        content: "",
+        savedContent: "",
+        isDirty: false,
+        readOnly: true,
+        // 企业透明加密文档：后端已在内存中解密，这里仅用于状态栏提示
+        encrypted: info.encrypted,
+        modifiedAt: info.modifiedAt,
+        size: info.size,
+      });
+      useAppStore.getState().addDoc(doc);
+      void addRecentFile(info.path);
+      void watchFile(info.path);
+      return true;
+    }
+
     if (isPdfPath(path)) {
       const payload = await invoke<BinaryPayload>("read_binary_file", { path });
       const anno = await loadPdfAnnotations(path);
@@ -156,8 +187,11 @@ export async function openPath(path: string, targetPane?: 0 | 1): Promise<boolea
     }
     const doc = docFromPayload(payload, effectivePane);
     useAppStore.getState().addDoc(doc);
-    // 非 Markdown 文件（代码/纯文本）固定以源码模式打开
-    if (!isMarkdownPath(payload.path)) {
+    if (isDelimitedPath(payload.path)) {
+      // CSV / TSV：默认直接给表格视图（更符合打开表格文件的预期），Ctrl+E 可切源码
+      useAppStore.getState().setViewMode("preview");
+    } else if (!isMarkdownPath(payload.path)) {
+      // 其它非 Markdown 文件（代码/纯文本）固定以源码模式打开
       useAppStore.getState().setViewMode("source");
     }
     void addRecentFile(payload.path);
@@ -263,6 +297,14 @@ export function setDocEol(id: string, eol: string): void {
 export async function saveDoc(id: string): Promise<boolean> {
   const doc = getDocById(id);
   if (!doc) return false;
+  // 电子表格当前为只读查看（阶段③才会支持写回），明确提示而不是静默失败
+  if (doc.docType === "spreadsheet" || isSpreadsheetPath(doc.filePath)) {
+    await showMessage(
+      "表格为只读查看",
+      "Excel / ODS 表格目前仅支持查看，修改请用 Excel 或 WPS 打开。\n\nCSV / TSV 可直接编辑并保存。",
+    );
+    return false;
+  }
   if (!doc.filePath) return saveDocAs(id);
   if (doc.readOnly) {
     await showMessage(
@@ -344,6 +386,14 @@ export async function saveDoc(id: string): Promise<boolean> {
 export async function saveDocAs(id: string): Promise<boolean> {
   const doc = getDocById(id);
   if (!doc) return false;
+  // 表格只读：另存为会写出空内容，必须拦住
+  if (doc.docType === "spreadsheet" || isSpreadsheetPath(doc.filePath)) {
+    await showMessage(
+      "表格为只读查看",
+      "Excel / ODS 表格目前仅支持查看，暂不支持另存为。\n\n如需转换格式，请用 Excel 或 WPS 打开后另存。",
+    );
+    return false;
+  }
   try {
     const isBlank = doc.docType === "blank" && !doc.filePath;
     const isPdf = doc.docType === "pdf" || isPdfPath(doc.filePath);
@@ -507,6 +557,17 @@ export async function reloadDocFromDisk(id: string): Promise<boolean> {
   const doc = getDocById(id);
   if (!doc?.filePath) return false;
   try {
+    // 电子表格：只刷新文件基线，表格视图依赖 modifiedAt 变化重新解析（绝不按文本读入）
+    if (doc.docType === "spreadsheet" || isSpreadsheetPath(doc.filePath)) {
+      const info = await invoke<SpreadsheetInfo>("spreadsheet_info", { path: doc.filePath });
+      useAppStore.getState().patchDoc(id, {
+        modifiedAt: info.modifiedAt,
+        size: info.size,
+        isDirty: false,
+      });
+      return true;
+    }
+
     if (doc.docType === "pdf" || isPdfPath(doc.filePath)) {
       const payload = await invoke<BinaryPayload>("read_binary_file", {
         path: doc.filePath,

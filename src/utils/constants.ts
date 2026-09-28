@@ -34,18 +34,30 @@ export const CODE_EXTENSIONS = [
 /** PDF 扩展名 */
 export const PDF_EXTENSIONS = ["pdf"];
 
+/**
+ * 电子表格扩展名：由 Rust 侧 calamine 解析，**只读**查看
+ * （xlsx / xls / xlsb / ods，不注册为系统默认打开程序，避免劫持 Office 关联）
+ */
+export const SPREADSHEET_EXTENSIONS = ["xlsx", "xls", "xlsb", "ods"];
+
+/** 分隔符文本表格扩展名：走现有文本管线（编码检测、保存、撤销都复用），额外提供表格视图 */
+export const DELIMITED_EXTENSIONS = ["csv", "tsv"];
+
 export const OPENABLE_EXTENSIONS = [
   ...MARKDOWN_EXTENSIONS,
   ...PDF_EXTENSIONS,
+  ...SPREADSHEET_EXTENSIONS,
   ...TEXT_EXTENSIONS,
   ...CODE_EXTENSIONS,
 ];
 
 /** 打开对话框过滤器（精简分类显示，避免单个选项因扩展名过多导致下拉列表超长） */
 export const OPEN_DIALOG_FILTERS = [
-  { name: "常用支持文件", extensions: ["md", "markdown", "pdf", "txt", "json", "js", "ts", "html", "py", "rs"] },
+  { name: "常用支持文件", extensions: ["md", "markdown", "pdf", "xlsx", "csv", "txt", "json", "js", "ts", "html", "py", "rs"] },
   { name: "Markdown 文档 (*.md)", extensions: ["md", "markdown", "mdown"] },
   { name: "PDF 文档 (*.pdf)", extensions: ["pdf"] },
+  { name: "Excel 表格 (*.xlsx, *.xls, *.ods)", extensions: ["xlsx", "xls", "xlsb", "ods"] },
+  { name: "CSV 表格 (*.csv, *.tsv)", extensions: ["csv", "tsv"] },
   { name: "纯文本文档 (*.txt)", extensions: ["txt", "log", "ini", "conf"] },
   {
     name: "常见代码与数据",

@@ -41,7 +41,7 @@ import {
   saveActive,
   saveActiveAs,
 } from "../../utils/fileActions";
-import { fileName, isMarkdownDoc, isPdfDoc } from "../../utils/filePath";
+import { fileName, isDelimitedDoc, isMarkdownDoc, isPdfDoc, isSpreadsheetDoc } from "../../utils/filePath";
 import { parseDoc } from "../../utils/markdown";
 
 interface ToolbarProps {
@@ -84,6 +84,13 @@ const VIEW_ITEMS: Array<{ mode: ViewMode; icon: IconName; label: string }> = [
   { mode: "split", icon: "columns", label: "分屏模式 (Ctrl+E)" },
 ];
 
+/** CSV / TSV：同样的三态，但「预览」实际是表格视图 */
+const DELIMITED_VIEW_ITEMS: Array<{ mode: ViewMode; icon: IconName; label: string }> = [
+  { mode: "preview", icon: "grid", label: "表格视图 (Ctrl+E)" },
+  { mode: "source", icon: "code", label: "源码模式 (Ctrl+E)" },
+  { mode: "split", icon: "columns", label: "表格 + 源码 (Ctrl+E)" },
+];
+
 const THEME_ORDER: ThemeMode[] = ["light", "dark", "system"];
 const THEME_META: Record<ThemeMode, { icon: IconName; label: string }> = {
   light: { icon: "sun", label: "浅色主题" },
@@ -106,6 +113,10 @@ export function Toolbar({ previewRef, isDark }: ToolbarProps) {
   /** 非 Markdown 文档（新建空白文档/代码/纯文本/PDF）屏蔽所有 Markdown 专属操作 */
   const isMarkdown = isMarkdownDoc(doc);
   const isPdf = isPdfDoc(doc);
+  /** 电子表格（xlsx/xls/ods）：只读查看，屏蔽查找替换与视图切换 */
+  const isSheet = isSpreadsheetDoc(doc);
+  /** CSV / TSV：可编辑文本 + 表格视图 */
+  const isDelimited = isDelimitedDoc(doc);
 
   const cycleTheme = () => {
     const idx = THEME_ORDER.indexOf(theme);
@@ -355,17 +366,36 @@ export function Toolbar({ previewRef, isDark }: ToolbarProps) {
         </>
       ) : null}
 
+      {/* CSV / TSV：表格 / 源码 / 分屏 三态切换（Markdown 分支之外单独提供） */}
+      {isDelimited ? (
+        <>
+          <div className="flex items-center gap-0.5 rounded-md bg-app p-0.5">
+            {DELIMITED_VIEW_ITEMS.map((item) => (
+              <ToolButton
+                key={item.mode}
+                icon={item.icon}
+                label={item.label}
+                active={viewMode === item.mode}
+                disabled={!hasDoc}
+                onClick={() => useAppStore.getState().setViewMode(item.mode)}
+              />
+            ))}
+          </div>
+          <Divider />
+        </>
+      ) : null}
+
       <ToolButton
         icon="search"
         label="查找 (Ctrl+F)"
-        disabled={!hasDoc}
+        disabled={!hasDoc || isSheet}
         active={searchVisible && !replaceVisible}
         onClick={() => useSearchStore.getState().open(false)}
       />
       <ToolButton
         icon="replace"
         label="替换 (Ctrl+H)"
-        disabled={!hasDoc || isPdf}
+        disabled={!hasDoc || isPdf || isSheet}
         active={searchVisible && replaceVisible}
         onClick={() => useSearchStore.getState().open(true)}
       />

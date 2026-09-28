@@ -16,8 +16,8 @@ fn normalize_ext(ext: &str) -> String {
     }
 }
 
-/// 将 Unix 秒拆成 UTC 的 (年, 月, 日, 时, 分, 秒)。
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+/// 将 Unix 天数拆成 UTC 的 (年, 月, 日)。office.rs 解析 Excel 序列日期时复用。
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     // Howard Hinnant 的 civil_from_days 算法
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
