@@ -62,11 +62,14 @@ Rust 侧：`cd src-tauri && cargo check --message-format=short`；单元测试�
 
 - **CSV / TSV**：走现有文本管线（内容存在 `doc.content`，可编辑、可撤销、按编码保存）；表格视图在 `src/components/Sheet/`（`SheetView` + `SheetGrid`）与 `src/utils/delimited.ts`。视图三态复用全局 `viewMode`：`preview` = 表格、`source` = 源码、`split` = 表格 + 源码。
 - **CSV 用惰性行索引**：`createDelimitedTable(text)` 单遍扫描只记录行首偏移（十几 MB / 十几万行约 30ms，偏移表约 1MB），行内容由 `table.rowAt(i)` 按需解析并缓存最近若干行 —— **没有行数上限**，也不为每个单元格建对象。`parseDelimited(text, {maxRows})` 保留给一次性取前 N 行的场景，两条路径结果必须一致（有等价性对拍测试）。
-- **xlsx / xls / xlsb / ods**：Rust 侧 `src-tauri/src/commands/office.rs`（calamine）按行窗口解析（`spreadsheet_info` / `spreadsheet_rows`），前端稀疏缓存 + 虚拟滚动；文档模型为 `docType: "spreadsheet"` + `readOnly: true`，`saveDoc` / `saveDocAs` / 自动保存都会拦截，外部改动只刷新基线并触发重新解析。
+- **xlsx / xls / xlsb / ods 读取**：Rust 侧 `src-tauri/src/commands/office.rs`（calamine）按行窗口解析（`spreadsheet_info` / `spreadsheet_rows`），前端稀疏缓存 + 虚拟滚动；文档模型为 `docType: "spreadsheet"`。写回能力见下一条：0.19.0 起只有 `.xlsx` 可编辑，其余格式与超大文件 `readOnly: true`；**自动保存对表格一律跳过**（整簿重写必须用户显式 Ctrl+S），外部改动只刷新基线并触发重新解析。
 - **企业透明加密（亿赛通等）**：工作簿在 `read_workbook_bytes` 中先 `esafenet::decrypt_esafenet` **内存解密**再交给 calamine（`open_workbook_auto_from_rs` + `Cursor`），**绝不写明文临时文件**；`SpreadsheetInfo.encrypted` 供界面显示「已解密」。直接读原始字节会得到 `Could not find EOCD` 这类误导性错误。
 - **解析缓存**：`SheetCache` 是按「最近使用」排序的 LRU，受 `CACHE_ENTRIES` 与 `CACHE_CELL_BUDGET`（总单元格预算）双重约束；**单张超大工作表会被保留**，否则百万行工作表每个滚动窗口都要重解析整表。
 - **打不开时的提示**：`describe_parse_failure` 按文件头区分「需要密码的 Office 文档 / 旧版 CFB 格式」「HTML 假 Excel」「损坏或被加密软件处理过」，给出可执行建议，而不是抛底层 zip 错误。
-- **约定**：**不要**把 Office 格式加进 `tauri.conf.json` 的 `fileAssociations`（避免抢占默认打开程序、放大版式保真预期差）；表格模块保持只读，写回能力属于后续阶段。
+- **xlsx 轻量编辑（0.19.0 起）**：写回在 `src-tauri/src/commands/office_write.rs`（umya-spreadsheet 3.1）。要点：**只有 `.xlsx` 可写回**（`SpreadsheetInfo.editable`；xlsm 含宏、xls/xlsb/ods 一律只读）；写回是**整簿重写**，因此保存前把原文件原始字节复制为 `<文件名>.bak`，且「临时文件 → 用 calamine 校验可读 → `fs::rename` 原子替换」；企业加密文件全程内存解密/加密，**不落明文临时文件**；公式不做重算（前端首次保存会确认提示）。前端待提交编辑存在 `DocState.sheetEdits`（唯一数据源，驱动脏标记、关闭确认、会话恢复），撤销历史见下一条，保存走 `fileActions.saveSpreadsheetDoc`。
+- **约定**：**不要**把 Office 格式加进 `tauri.conf.json` 的 `fileAssociations`（避免抢占默认打开程序、放大版式保真预期差）；CSV/TSV 走文本管线可自由编辑；xlsx 做「改值 + 行列结构 + 工作表增删改复制」级轻量编辑，**不做样式编辑（字体/颜色/对齐/格式刷）、公式计算引擎、图表/透视表/条件格式**。
+- **表格查找 / 统计 / 结构操作（0.20.0 起）**：`src-tauri/src/commands/office_ops.rs` 提供 `spreadsheet_find`（全表扫描，500 条命中封顶）、`spreadsheet_stats`（矩形区域的求和/平均/计数/最值，选区超出一屏时前端改用它）、`spreadsheet_structure`（插入/删除行列、新建/重命名/删除/复制工作表）。结构操作**整簿重写并立即写回**，复用 `office_write::save_pipeline`（先应用待提交编辑、再改结构，一次落盘）；**插入/删除位置超出已用范围按空操作成功返回**（不报错、不扩张尺寸），仍会报错的是 `count > 100000`、表不存在、重名或非法表名、删最后一张表、非 `.xlsx`；复制工作表是「新建表 + 逐格 `Cell::clone` + 列宽/行高/合并区域」，上限 20 万格。**公式引用不会随结构操作平移**，公式结果需用 Excel/WPS 打开后重算（首次结构操作会说明一次）。读取与解析（含企业加密内存解密、失败提示话术）直接复用 `office.rs` 的 `read_workbook_bytes` / `parse_workbook` / `describe_parse_failure`（`pub(crate)`），不另存一份实现。
+- **表格撤销历史（0.20.0 起）**：`src/utils/sheetHistory.ts` 按**文档 id** 保存在模块级 Map 中（不再用组件 ref），切标签、切视图、组件重建后仍可撤销；一个撤销步可含多格（清空选区、粘贴只占一步）。xlsx 的撤销步必须记录**文件里的真实原值**（`SheetEdit` 而非 null），否则保存后撤销会退化成「删掉待提交编辑」而界面毫无变化；文档关闭时用 `clearSheetHistory` 释放。
 - 相关测试：`cd src-tauri && cargo test --lib office`（Excel 序列日期、类型映射、窗口收敛、非 A1 区域坐标、公式提取）。
 
 ## 完成后通知

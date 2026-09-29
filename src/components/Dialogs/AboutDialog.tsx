@@ -169,7 +169,7 @@ export function AboutDialog() {
                   </span>
                 ) : null}
               </div>
-              <div className="text-[12px] text-muted">Windows 全能文档查看与编辑器（Markdown / PDF / 代码）</div>
+              <div className="text-[12px] text-muted">Windows 全能文档查看与编辑器（Markdown / PDF / 代码 / 表格）</div>
               <div className="mt-0.5 font-mono text-[11px] text-faint">
                 版本 {version || "…"}
                 {info?.hasUpdate ? ` · 有新版本 ${info.latest}` : ""}

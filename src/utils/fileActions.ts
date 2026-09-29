@@ -3,7 +3,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { createDoc, docFromPayload, getActiveDoc, getDocById, useAppStore } from "../stores/appStore";
 import { askConfirm, askUnsaved, showMessage } from "../stores/dialogStore";
-import type { BinaryPayload, FilePayload, SpreadsheetInfo } from "../types";
+import type { BinaryPayload, FilePayload, SheetSaveResult, SpreadsheetInfo } from "../types";
 import { loadPdfAnnotations, savePdfAnnotations } from "./persist";
 import {
   EMPTY_DOC_PLACEHOLDER,
@@ -18,8 +18,10 @@ import {
   isPdfPath,
   isSpreadsheetPath,
   samePath,
+  textReadOnlyLimit,
 } from "./filePath";
 import { formatBytes } from "./timing";
+import { clearSheetHistory } from "./sheetHistory";
 
 /** 展示用名称 */
 export function displayName(doc: { filePath: string | null }): string {
@@ -136,7 +138,8 @@ export async function openPath(path: string, targetPane?: 0 | 1): Promise<boolea
         content: "",
         savedContent: "",
         isDirty: false,
-        readOnly: true,
+        // xlsx 支持轻量编辑写回；xlsm（含宏）/xls/xlsb/ods 与超大文件保持只读
+        readOnly: !info.editable || info.size > LARGE_FILE_BYTES,
         // 企业透明加密文档：后端已在内存中解密，这里仅用于状态栏提示
         encrypted: info.encrypted,
         modifiedAt: info.modifiedAt,
@@ -175,7 +178,7 @@ export async function openPath(path: string, targetPane?: 0 | 1): Promise<boolea
     }
 
     const payload = await invoke<FilePayload>("read_markdown_file", { path });
-    if (!payload.encrypted && payload.size > LARGE_FILE_BYTES) {
+    if (!payload.encrypted && payload.size > textReadOnlyLimit(payload.path)) {
       const ok = await askConfirm({
         title: "文件较大",
         message: `「${fileName(payload.path)}」大小为 ${formatBytes(
@@ -297,13 +300,9 @@ export function setDocEol(id: string, eol: string): void {
 export async function saveDoc(id: string): Promise<boolean> {
   const doc = getDocById(id);
   if (!doc) return false;
-  // 电子表格当前为只读查看（阶段③才会支持写回），明确提示而不是静默失败
+  // 表格：xlsx 支持轻量编辑写回，其它格式只读
   if (doc.docType === "spreadsheet" || isSpreadsheetPath(doc.filePath)) {
-    await showMessage(
-      "表格为只读查看",
-      "Excel / ODS 表格目前仅支持查看，修改请用 Excel 或 WPS 打开。\n\nCSV / TSV 可直接编辑并保存。",
-    );
-    return false;
+    return saveSpreadsheetDoc(id);
   }
   if (!doc.filePath) return saveDocAs(id);
   if (doc.readOnly) {
@@ -383,16 +382,145 @@ export async function saveDoc(id: string): Promise<boolean> {
   }
 }
 
+/**
+ * 切换「只读 / 可编辑」。
+ *
+ * 超过阈值的大文件默认只读以保证流畅度，但必须给用户一个显式打开的入口：
+ * CSV / TSV 的表格视图是惰性解析，十几 MB 也能流畅编辑，不应该被永久锁成只读。
+ */
+export async function toggleDocReadOnly(id: string): Promise<boolean> {
+  const doc = getDocById(id);
+  if (!doc) return false;
+  const nextReadOnly = !doc.readOnly;
+  // 非 xlsx 的表格格式（xlsm 含宏、xls/xlsb/ods 结构不同）不支持写回，不能放开编辑
+  if (
+    !nextReadOnly &&
+    isSpreadsheetPath(doc.filePath) &&
+    !(doc.filePath ?? "").toLowerCase().endsWith(".xlsx")
+  ) {
+    await showMessage(
+      "该格式不支持编辑",
+      "只有 .xlsx 支持写回编辑（xlsm 含宏、xls/xlsb/ods 结构不同）。\n\n如需修改，请用 Excel / WPS 打开，或先另存为 .xlsx。",
+    );
+    return false;
+  }
+  if (!nextReadOnly && doc.size > textReadOnlyLimit(doc.filePath)) {
+    const ok = await askConfirm({
+      title: "切换为可编辑",
+      message:
+        `「${fileName(doc.filePath ?? "未命名")}」大小为 ${formatBytes(doc.size)}，超过自动只读阈值。\n\n` +
+        "切换后可以编辑与保存；源码视图与超大文件的编辑可能会卡顿。\n确定要切换吗？",
+      confirmText: "切换为可编辑",
+    });
+    if (!ok) return false;
+  }
+  useAppStore.getState().patchDoc(id, { readOnly: nextReadOnly });
+  return true;
+}
+
+/**
+ * 保存表格的单元格编辑（xlsx 轻量编辑）。
+ *
+ * 写回是**整簿重写**（umya-spreadsheet），因此：
+ * - 首次保存弹一次确认：会留 `.bak` 备份、公式不重算、图表等复杂元素可能丢失；
+ * - 只读文档（xlsm 含宏、xls/xlsb/ods、超大文件）明确提示不支持写回；
+ * - 保存成功后清空待提交编辑并刷新基线，文件监听不会把这次写入当成外部改动。
+ */
+export async function saveSpreadsheetDoc(id: string): Promise<boolean> {
+  const doc = getDocById(id);
+  if (!doc?.filePath) return false;
+  if (doc.readOnly) {
+    await showMessage(
+      "表格为只读查看",
+      "该格式不支持写回编辑（只有 .xlsx 支持），或文件过大以只读方式打开。\n\n如需修改，请用 Excel / WPS 打开。",
+    );
+    return false;
+  }
+  const edits = doc.sheetEdits ?? [];
+  const structurePending = doc.sheetStructurePending === true;
+  if (edits.length === 0 && !structurePending) {
+    // 没有任何待保存的改动：静默返回（用户明确要求：表格没变化时 Ctrl+S 不要弹「没有需要保存的修改」）
+    return true;
+  }
+  // 不再弹「重写工作簿」的确认框：结构改动随时可以 Ctrl+Z 撤销，备份也默认关闭
+  try {
+    // 先标记自写：Rust 侧写完会触发文件监听事件
+    markSelfWrite();
+    const result = await invoke<SheetSaveResult>("spreadsheet_save", {
+      path: doc.filePath,
+      target: null,
+      edits,
+      // 默认不生成 .bak（用户明确要求：直接在原文件上改，不要每次都留备份）。
+      // 写盘本身仍是「临时文件 → 校验 → 原子替换」，失败不会破坏原文件。
+      backup: false,
+    });
+    // 大工作簿写盘可能超过监听窗口，这里再刷一次时间戳，避免自己的写入被当成外部改动
+    markSelfWrite();
+    useAppStore.getState().patchDoc(id, {
+      sheetEdits: [],
+      isDirty: false,
+      // 结构改动存在内存影子里，保存成功后一并落盘
+      sheetStructurePending: false,
+      modifiedAt: result.modifiedAt,
+      size: result.size,
+    });
+    void addRecentFile(result.path);
+    return true;
+  } catch (error) {
+    await showMessage("保存失败", `无法写入表格：\n${String(error)}`);
+    return false;
+  }
+}
+
 export async function saveDocAs(id: string): Promise<boolean> {
   const doc = getDocById(id);
   if (!doc) return false;
-  // 表格只读：另存为会写出空内容，必须拦住
-  if (doc.docType === "spreadsheet" || isSpreadsheetPath(doc.filePath)) {
-    await showMessage(
-      "表格为只读查看",
-      "Excel / ODS 表格目前仅支持查看，暂不支持另存为。\n\n如需转换格式，请用 Excel 或 WPS 打开后另存。",
-    );
-    return false;
+  // 表格另存为：xlsx 走 spreadsheet_save 的 target 分支（内容由 Rust 侧整簿写出）
+  if (isSpreadsheetPath(doc.filePath)) {
+    if (doc.readOnly) {
+      await showMessage(
+        "表格为只读查看",
+        "该格式不支持另存为（只有 .xlsx 支持写回）。\n\n如需转换格式，请用 Excel / WPS 打开后另存。",
+      );
+      return false;
+    }
+    const target = await invoke<string | null>("save_file_dialog", {
+      defaultPath: doc.filePath ?? "未命名.xlsx",
+      filterAll: false,
+      filterPdf: false,
+    });
+    if (!target) return false;
+    try {
+      markSelfWrite();
+      const result = await invoke<SheetSaveResult>("spreadsheet_save", {
+        path: doc.filePath,
+        target,
+        edits: doc.sheetEdits ?? [],
+        backup: false,
+      });
+      markSelfWrite();
+      const oldPath = doc.filePath;
+      useAppStore.getState().patchDoc(id, {
+        filePath: result.path,
+        sheetEdits: [],
+        isDirty: false,
+        // 目标文件写的是影子内容，因此新路径没有未落盘改动；
+        // 原文件若还有未保存的结构改动，它的影子仍是脏的，这里主动丢弃避免悬挂
+        sheetStructurePending: false,
+        modifiedAt: result.modifiedAt,
+        size: result.size,
+      });
+      if (oldPath && !samePath(oldPath, result.path)) {
+        void unwatchFile(oldPath);
+        void invoke("spreadsheet_discard", { path: oldPath }).catch(() => undefined);
+      }
+      void watchFile(result.path);
+      void addRecentFile(result.path);
+      return true;
+    } catch (error) {
+      await showMessage("另存为失败", String(error));
+      return false;
+    }
   }
   try {
     const isBlank = doc.docType === "blank" && !doc.filePath;
@@ -491,6 +619,13 @@ export async function closeDocWithConfirm(id: string): Promise<boolean> {
       .docs.some((other) => other.id !== id && samePath(other.filePath, doc.filePath));
     if (!stillReferenced) void unwatchFile(doc.filePath);
   }
+  // 释放该文档的表格撤销历史（按文档 id 保存在模块级 Map 里）
+  clearSheetHistory(id);
+  // 关闭表格文档时丢弃内存里的影子工作簿（未落盘的结构改动随之作废，
+  // 需要保留时用户已在关闭确认里选择过保存）
+  if (doc.filePath && (isSpreadsheetPath(doc.filePath) || doc.sheetStructurePending)) {
+    void invoke("spreadsheet_discard", { path: doc.filePath }).catch(() => undefined);
+  }
   // 释放该文档的 PDF 撤销栈与自动清洗计数（每个快照都持有一份 base64 副本）。
   // 用动态 import 保持 pdf-lib 留在按需加载的分包里，不拖累首屏体积
   if (doc.docType === "pdf" || isPdfPath(doc.filePath)) {
@@ -559,11 +694,17 @@ export async function reloadDocFromDisk(id: string): Promise<boolean> {
   try {
     // 电子表格：只刷新文件基线，表格视图依赖 modifiedAt 变化重新解析（绝不按文本读入）
     if (doc.docType === "spreadsheet" || isSpreadsheetPath(doc.filePath)) {
+      // 外部改动 / 手动重新加载：丢弃内存影子，回到磁盘内容（否则未落盘的结构改动会与磁盘脱节）
+      if (doc.sheetStructurePending) {
+        await invoke("spreadsheet_discard", { path: doc.filePath }).catch(() => undefined);
+      }
       const info = await invoke<SpreadsheetInfo>("spreadsheet_info", { path: doc.filePath });
       useAppStore.getState().patchDoc(id, {
         modifiedAt: info.modifiedAt,
         size: info.size,
         isDirty: false,
+        sheetEdits: [],
+        sheetStructurePending: false,
       });
       return true;
     }
@@ -597,7 +738,7 @@ export async function reloadDocFromDisk(id: string): Promise<boolean> {
       encryptedHeader: payload.encryptedHeader ?? null,
       encoding: payload.encoding ?? doc.encoding,
       eol: payload.eol ?? doc.eol,
-      readOnly: payload.size > LARGE_FILE_BYTES,
+      readOnly: payload.size > textReadOnlyLimit(payload.path),
       modifiedAt: payload.modifiedAt,
       size: payload.size,
     });

@@ -15,6 +15,7 @@ import {
   reloadDocFromDisk,
   saveDoc,
   saveDocAs,
+  toggleDocReadOnly,
 } from "../../utils/fileActions";
 import { getDocBaseName, getDocTitle, isPdfDoc } from "../../utils/filePath";
 import type { DocState } from "../../types";
@@ -133,6 +134,11 @@ export function TabBar({ pane = 0 }: Props) {
       ...(doc.filePath
         ? [
             [
+              {
+                label: doc.readOnly ? "切换为可编辑" : "切换为只读",
+                icon: "lock" as IconName,
+                onClick: () => void toggleDocReadOnly(doc.id),
+              },
               {
                 label: "用系统默认程序打开",
                 icon: "external-link" as IconName,

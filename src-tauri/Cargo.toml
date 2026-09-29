@@ -2,7 +2,7 @@
 # 包名即最终可执行文件名（cargo 输出 MasterEdit.exe），与 productName 保持一致，
 # 避免安装目录里再出现旧的 mastermd.exe。库名单独用 [lib] 指定为合法标识符。
 name = "MasterEdit"
-version = "0.18.0"
+version = "0.20.0"
 description = "MasterEdit — Windows Markdown, Office Sheet, PDF & Code Viewer/Editor"
 authors = ["bigmasterpang"]
 edition = "2021"
@@ -29,12 +29,15 @@ tauri-plugin-store = "2"
 notify = "8.2.0"
 encoding_rs = "0.8"
 calamine = "0.36.1"
+umya-spreadsheet = "3.1.0"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Networking_WinHttp",
+    # GetLocalTime：公式 TODAY()/NOW() 必须按本地时间（UTC 在 UTC+8 会让凌晨差一天）
+    "Win32_System_SystemInformation",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
@@ -43,7 +46,10 @@ windows = { version = "0.61", features = [
 codegen-units = 1
 lto = true
 opt-level = "z"
-panic = "abort"
+# 必须是 unwind（而非 abort）：表格解析/写回依赖 umya-spreadsheet，其读取路径里有若干
+# unwrap()/panic!，遇到结构畸形但 zip 合法的 xlsx 会 panic。unwind 能让 spawn_blocking 的
+# JoinError 兜底把它转成一条错误提示，而不是整进程崩溃。
+panic = "unwind"
 strip = true
 incremental = false
 

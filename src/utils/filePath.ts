@@ -1,6 +1,8 @@
 import {
   CODE_EXTENSIONS,
+  DELIMITED_EDIT_LIMIT,
   DELIMITED_EXTENSIONS,
+  LARGE_FILE_BYTES,
   MARKDOWN_EXTENSIONS,
   OPENABLE_EXTENSIONS,
   SPREADSHEET_EXTENSIONS,
@@ -146,6 +148,15 @@ export function docKindOf(p: string | null | undefined): DocKind {
 
 export function isTextPath(p: string): boolean {
   return TEXT_EXTENSIONS.includes(extName(p));
+}
+
+/**
+ * 文本类文档「自动只读」的体积阈值。
+ * CSV / TSV 的表格视图是惰性解析，编辑成本与体积基本无关，因此阈值放宽（见 DELIMITED_EDIT_LIMIT）；
+ * 其它文本走 CodeMirror，仍按 10MB 处理。
+ */
+export function textReadOnlyLimit(p: string | null | undefined): number {
+  return isDelimitedPath(p) ? DELIMITED_EDIT_LIMIT : LARGE_FILE_BYTES;
 }
 
 export function isOpenablePath(p: string): boolean {

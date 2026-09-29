@@ -9,7 +9,7 @@ Markdown 读写导出 · PDF 深度批注 · 代码智能导览 · 双栏独立�
 [![Release](https://img.shields.io/github/v/release/bigmasterpang/MasterEdit?style=flat-square&label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC)](https://github.com/bigmasterpang/MasterEdit/releases)
 [![Downloads](https://img.shields.io/github/downloads/bigmasterpang/MasterEdit/total?style=flat-square&label=%E4%B8%8B%E8%BD%BD%E9%87%8F)](https://master.dapang.wang)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4?style=flat-square)](https://master.dapang.wang)
-[![Size](https://img.shields.io/badge/%E5%AE%89%E8%A3%85%E5%8C%85-5.1%20MB-2ea44f?style=flat-square)](https://master.dapang.wang)
+[![Size](https://img.shields.io/badge/%E5%AE%89%E8%A3%85%E5%8C%85-6.4%20MB-2ea44f?style=flat-square)](https://master.dapang.wang)
 [![License](https://img.shields.io/badge/license-Freeware-lightgrey?style=flat-square)](#授权与致谢)
 
 ![MasterEdit 分屏预览](docs/screenshots/main.png)
@@ -25,7 +25,7 @@ Markdown 读写导出 · PDF 深度批注 · 代码智能导览 · 双栏独立�
 
 | 维度 | MasterEdit | 常见 Electron 编辑器 / 重型阅读器 |
 | --- | --- | --- |
-| 安装包体积 | **约 5.1 MB** | 80 – 300 MB |
+| 安装包体积 | **约 6.4 MB** | 80 – 300 MB |
 | 冷启动速度 | **约 0.3 秒** | 2 – 6 秒 |
 | 空闲内存占用 | **约 30 MB** | 200 – 600 MB |
 | 多格式一体 | **Markdown + PDF 批注 + 代码导览** | 需分别安装多个软件 |
@@ -62,13 +62,13 @@ Markdown 读写导出 · PDF 深度批注 · 代码智能导览 · 双栏独立�
   - **PDF 高亮「色彩 + 底部线型」双重编码**：将三色高亮升级为高对比度的 **明黄（实线底边）/ 天青蓝（虚线底边）/ 洋红紫（双线底边）**，工具栏、右键菜单与侧栏同步显示无障碍色名与线型标识
   - **带中文色名的主题强调色**：设置面板强调色选择器采用「色点 + 中文色名胶囊按钮」，无需仅凭裸眼辨色
 
-### 📊 办公表格查看（CSV / TSV / Excel）
+### 📊 办公表格查看与轻量编辑（CSV / TSV / Excel）
 - **CSV / TSV 表格视图**：自动识别分隔符（逗号 / 分号 / 制表符），兼容引号字段、字段内换行与 BOM；`Ctrl+E` 在 **表格 / 源码 / 表格+源码** 之间切换，需要改数据时切到源码即可编辑保存
 - **Excel 只读查看**：内置 Rust 解析引擎（calamine），支持 `.xlsx / .xls / .xlsb / .ods`；多工作表标签、列标与行号和 Excel 完全对齐、单元格内容 / 公式栏、百万行级虚拟滚动不卡顿
+- **xlsx 轻量编辑**：双击单元格即可改（`F2` 或直接输入也行；中文输入法请先双击或按 `F2` 进入编辑再输入），`Enter` 下移、`Tab` 右移、`Esc` 取消，`Ctrl+Z` 撤销；保存时**先备份 `.bak`、再原子替换**，改坏了随时能找回
 - **大文件也流畅**：十几 MB、十几万行的 CSV 采用「只扫行偏移、按需解析行」的惰性索引，没有行数上限，滚动内存占用远低于一次性解析
-- **支持企业加密文档**：亿赛通等透明加密的 Excel / CSV 会在内存中解密后查看，不产生明文临时文件；打不开时会明确告知原因（需要密码、旧版格式、假 Excel 等）
-- **安全只读**：表格文档绝不写回原文件，避免格式被破坏；需要编辑时右键「用系统默认程序打开」交给 Excel / WPS
-- **不劫持文件关联**：安装时不会抢占 `.xlsx / .docx` 的默认打开程序，随时可以用回 Office / WPS
+- **支持企业加密文档**：亿赛通等透明加密的 Excel / CSV 会在内存中解密后查看与编辑，写回时重新加密，不产生明文临时文件；打不开时会明确告知原因（需要密码、旧版格式、假 Excel 等）
+- **不劫持文件关联**：安装时不会抢占 `.xlsx / .docx` 的默认打开程序，随时可以用回 Office / WPS；需要完整编辑能力时右键「用系统默认程序打开」即可
 
 ### 📖 Markdown 阅读与 ✍️ 顺手编辑
 - **GFM 与扩展语法全支持**：表格、任务列表、提示块 `> [!NOTE]`、高亮 `==文字==`、下划线 `++文字++`、上下标、YAML Front Matter 元数据卡片

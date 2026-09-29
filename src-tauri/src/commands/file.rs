@@ -177,11 +177,26 @@ pub async fn save_file_dialog(
             .as_deref()
             .map(|p| p.to_lowercase().ends_with(".pdf"))
             .unwrap_or(false);
+    // 表格另存为：按默认文件名后缀识别，无需新增参数
+    let is_sheet = default_path
+        .as_deref()
+        .map(|p| {
+            let lower = p.to_lowercase();
+            lower.ends_with(".xlsx")
+                || lower.ends_with(".xlsm")
+                || lower.ends_with(".xls")
+                || lower.ends_with(".ods")
+        })
+        .unwrap_or(false);
 
     let mut builder = app.dialog().file().set_title("另存为");
     if is_pdf {
         builder = builder
             .add_filter("PDF 文件", &["pdf"])
+            .add_filter("所有文件", &["*"]);
+    } else if is_sheet {
+        builder = builder
+            .add_filter("Excel 工作簿", &["xlsx", "xlsm"])
             .add_filter("所有文件", &["*"]);
     } else if filter_all.unwrap_or(false) {
         builder = builder

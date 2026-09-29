@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getActiveDoc, useAppStore } from "../stores/appStore";
-import { getDocTitle, isMarkdownDoc } from "../utils/filePath";
+import { getDocTitle, isMarkdownDoc, isSpreadsheetDoc } from "../utils/filePath";
 import { useDialogStore } from "../stores/dialogStore";
 import { useSearchStore } from "../stores/searchStore";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -88,9 +88,12 @@ export function useKeyboardShortcuts(): void {
           break;
         }
         case "search":
+          // 表格文档用自己的查找栏（数据在 Rust / 惰性索引里，CodeMirror 的查找用不上）
+          if (isSpreadsheetDoc(getActiveDoc())) break;
           useSearchStore.getState().open(false);
           break;
         case "replace":
+          if (isSpreadsheetDoc(getActiveDoc())) break;
           useSearchStore.getState().open(true);
           break;
         case "closeTab": {
@@ -206,6 +209,8 @@ export function useKeyboardShortcuts(): void {
         }
         // F3 / Shift+F3 查找下一个 / 上一个（Notepad++ 习惯）
         if (event.key === "F3") {
+          // 表格文档由自己的查找栏处理
+          if (isSpreadsheetDoc(getActiveDoc())) return;
           event.preventDefault();
           const search = useSearchStore.getState();
           if (!search.visible) search.open(false);

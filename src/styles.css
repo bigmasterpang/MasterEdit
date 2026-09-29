@@ -171,7 +171,14 @@ html.dark[data-accent="rose"] {
   background: var(--accent-soft);
 }
 
-*:focus-visible {
+/*
+ * 焦点可见框（可访问性）。
+ * 注意：这条规则**不在 @layer 里**，而 Tailwind v4 的工具类都在 @layer utilities 中，
+ * 按层叠规则未分层规则优先 —— 元素上写 `outline-none` 压不住它。
+ * 因此这里显式排除「主动声明不要轮廓」的元素（`outline-none`，例如表格网格滚动容器、
+ * 单元格编辑框：它们自己有 ring 或根本不需要焦点框，否则会多出一圈强调色边框）。
+ */
+*:focus-visible:not(.outline-none) {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }

@@ -5,8 +5,8 @@ import { useUpdateStore } from "../../stores/updateStore";
 import { Icon } from "../common/Icon";
 import { countWords, formatBytes } from "../../utils/timing";
 import { APP_NAME, ENCODINGS, EOL_OPTIONS } from "../../utils/constants";
-import { docKindOf, extName, fileName, isPdfDoc, isSpreadsheetDoc } from "../../utils/filePath";
-import { setDocEncoding, setDocEol } from "../../utils/fileActions";
+import { docKindOf, extName, fileName, isDelimitedDoc, isPdfDoc, isSpreadsheetDoc } from "../../utils/filePath";
+import { setDocEncoding, setDocEol, toggleDocReadOnly } from "../../utils/fileActions";
 import { extractFrontMatter } from "../../utils/frontMatter";
 
 const VIEW_LABEL = {
@@ -71,6 +71,8 @@ export function StatusBar() {
 
   /** 电子表格：只读查看，状态栏改为展示文件信息而非文本统计 */
   const isSheet = isSpreadsheetDoc(doc);
+  /** CSV / TSV：同样是表格，字数统计同样没有意义 */
+  const isDelimited = isDelimitedDoc(doc);
 
   return (
     <div className="print-hide flex h-6 shrink-0 items-center gap-3 border-t border-line bg-panel px-3 text-[11px] text-muted">
@@ -104,16 +106,37 @@ export function StatusBar() {
             <span title="文件大小">{formatBytes(doc.size)}</span>
             <span title="文件类型">PDF 文档</span>
           </>
-        ) : isSheet ? (
+        ) : isSheet || isDelimited ? (
+          /* 表格类文档（xlsx / CSV）：字数、词数、光标行列对表格没有意义，只显示文件与编辑状态 */
           <>
             <span title="文件大小">{formatBytes(doc.size)}</span>
             <span title="文件类型">
               {KIND_LABEL[docKindOf(doc.filePath)]}
               {extName(doc.filePath ?? "") ? ` · ${extName(doc.filePath ?? "")}` : ""}
             </span>
-            <span className="text-warning" title="表格目前仅支持查看，不写回原文件">
-              只读查看
-            </span>
+            {isDelimited ? (
+              <span className="text-faint" title="CSV / TSV 走文本管线：双击单元格即可编辑，Ctrl+E 可切到源码">
+                表格视图可编辑
+              </span>
+            ) : null}
+            {doc.sheetEdits && doc.sheetEdits.length > 0 ? (
+              <span className="text-accent" title="待保存的单元格编辑，按 Ctrl+S 写回文件">
+                已修改 {doc.sheetEdits.length} 格
+              </span>
+            ) : null}
+            {doc.sheetStructurePending ? (
+              <span
+                className="text-accent"
+                title="插入/删除行列、工作表增删改复制只在内存中生效，按 Ctrl+S 才写回文件"
+              >
+                结构已修改（未保存）
+              </span>
+            ) : null}
+            {!doc.readOnly && !isDelimited ? (
+              <span className="text-faint" title="双击单元格即可编辑，Ctrl+S 保存">
+                可编辑
+              </span>
+            ) : null}
           </>
         ) : (
           <>
@@ -193,7 +216,16 @@ export function StatusBar() {
           已解密
         </span>
       ) : null}
-      {doc?.readOnly ? <span className="text-warning">只读</span> : null}
+      {doc?.readOnly ? (
+        <button
+          type="button"
+          onClick={() => void toggleDocReadOnly(doc.id)}
+          className="text-warning hover:underline"
+          title="只读文档（超过自动只读阈值或格式不支持写回）：点击切换为可编辑"
+        >
+          只读 · 点击可编辑
+        </button>
+      ) : null}
       <span title="当前视图模式">
         {isPdfDoc(doc) ? "PDF 查看器" : isSheet ? "表格查看器" : VIEW_LABEL[viewMode]}
       </span>

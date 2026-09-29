@@ -9,11 +9,12 @@ import type {
   PdfHighlight,
   PdfNote,
   Settings,
+  SheetEdit,
   SpreadsheetInfo,
   ViewMode,
 } from "../types";
 import { LARGE_FILE_BYTES } from "./constants";
-import { isPdfPath, isSpreadsheetPath, normalizeSlashes } from "./filePath";
+import { isPdfPath, isSpreadsheetPath, normalizeSlashes, textReadOnlyLimit } from "./filePath";
 import { debounce } from "./timing";
 
 /** 是否运行在 Tauri 环境中（纯浏览器打开 vite 页面时跳过持久化） */
@@ -205,7 +206,14 @@ interface SessionPayload {
   /** 已保存文档的路径及窗格（用于恢复标签页，兼容旧版 string 数组） */
   paths: Array<string | { path: string; pane?: 0 | 1 }>;
   /** 未保存 / 未命名文档的内容及窗格 */
-  unsaved: Array<{ path: string | null; content: string; pane?: 0 | 1; docType?: string }>;
+  unsaved: Array<{
+    path: string | null;
+    content: string;
+    pane?: 0 | 1;
+    docType?: string;
+    /** 表格未提交的单元格编辑（content 为空时靠它恢复） */
+    sheetEdits?: SheetEdit[];
+  }>;
 }
 
 const SESSION_TAB_LIMIT = 8;
@@ -235,6 +243,8 @@ async function writeSession(): Promise<void> {
         pane: doc.pane ?? 0,
         // 不记 docType 的话，未命名的纯文本文档恢复后会变成 Markdown
         docType: doc.docType,
+        // 表格的未提交编辑（体积很小，不受 content 上限影响）
+        sheetEdits: doc.sheetEdits,
       }));
 
     const unsavedPaths = new Set(
@@ -284,8 +294,38 @@ export async function restoreSession(): Promise<void> {
 
     // 1. 未保存 / 未命名文档优先恢复（过滤掉 PDF）
     for (const entry of payload.unsaved ?? []) {
-      if (!entry.content) continue;
+      // 表格的未保存内容在 sheetEdits 里（content 为空），不能按「内容为空」跳过
+      const sheetEdits = entry.sheetEdits ?? [];
+      if (!entry.content && sheetEdits.length === 0) continue;
       if (entry.path && isPdfPath(entry.path)) continue;
+
+      // 表格：按路径重新解析工作簿，再把未提交的单元格编辑挂回去
+      if (sheetEdits.length > 0 && entry.path && isSpreadsheetPath(entry.path)) {
+        try {
+          const info = await invoke<SpreadsheetInfo>("spreadsheet_info", { path: entry.path });
+          state.addDoc(
+            createDoc({
+              filePath: info.path,
+              docType: "spreadsheet",
+              content: "",
+              savedContent: "",
+              isDirty: true,
+              readOnly: !info.editable || info.size > LARGE_FILE_BYTES,
+              encrypted: info.encrypted,
+              sheetEdits,
+              pane: entry.pane ?? 0,
+              modifiedAt: info.modifiedAt,
+              size: info.size,
+            }),
+          );
+          opened.add(entry.path.toLowerCase());
+          void invoke("watch_file", { path: entry.path }).catch(() => undefined);
+        } catch {
+          /* 打不开的表格跳过 */
+        }
+        continue;
+      }
+
       const doc = createDoc({
         filePath: entry.path,
         content: entry.content,
@@ -335,7 +375,8 @@ export async function restoreSession(): Promise<void> {
               content: "",
               savedContent: "",
               isDirty: false,
-              readOnly: true,
+              // 与手动打开一致：只有 .xlsx 且体积不大时可编辑
+              readOnly: !info.editable || info.size > LARGE_FILE_BYTES,
               encrypted: info.encrypted,
               modifiedAt: info.modifiedAt,
               size: info.size,
@@ -379,7 +420,7 @@ export async function restoreSession(): Promise<void> {
         if (payloadData.size > SESSION_RESTORE_MAX_BYTES) continue;
         const restoredDoc = docFromPayload(payloadData);
         restoredDoc.pane = pane;
-        if (payloadData.size > LARGE_FILE_BYTES) restoredDoc.readOnly = true;
+        if (payloadData.size > textReadOnlyLimit(path)) restoredDoc.readOnly = true;
         state.addDoc(restoredDoc);
         opened.add(path.toLowerCase());
         // 会话恢复出来的标签页必须重新注册文件监听：openPath 只在「打开」时注册，

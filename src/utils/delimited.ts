@@ -402,6 +402,29 @@ export interface DelimitedTable {
   truncatedCols: boolean;
   /** 按需取一行（0 起，已补齐/截断到 cols 列）；越界返回 undefined；内部缓存最近访问的行 */
   rowAt(index: number): SheetCell[] | undefined;
+  /**
+   * 某一行的字符区间 `[start, end)`（end 不含行尾换行符），用于「改一格 → 只替换这一行」的就地编辑；
+   * 越界返回 undefined。
+   */
+  rowRange(index: number): [number, number] | undefined;
+}
+
+/**
+ * 把一行字段序列化为 RFC 4180 文本：含分隔符 / 引号 / 换行 / 首尾空格时加引号，内部引号翻倍。
+ * 表格内编辑 CSV 时用它重建被修改的那一行。
+ */
+export function serializeDelimitedRow(cells: string[], delimiter: string): string {
+  return cells
+    .map((value) => {
+      const needsQuote =
+        value.includes(delimiter) ||
+        value.includes('"') ||
+        value.includes("\n") ||
+        value.includes("\r") ||
+        value !== value.trim();
+      return needsQuote ? `"${value.replace(/"/g, '""')}"` : value;
+    })
+    .join(delimiter);
 }
 
 /** 内部构造结果：把偏移表一并交给 parseDelimited，避免二次扫描 */
@@ -463,8 +486,20 @@ function buildDelimitedTable(
     return cells;
   };
 
+  /**
+   * 某一行的字符区间 [start, end)，end **不含行尾换行符**（CR/LF/CRLF 都剥掉），
+   * 便于「改一格 → 只替换这一行」的就地编辑。越界返回 undefined。
+   */
+  const rowRange = (index: number): [number, number] | undefined => {
+    if (!Number.isInteger(index) || index < 0 || index >= rows) return undefined;
+    const start = starts[index];
+    let end = index + 1 < rows ? starts[index + 1] : text.length;
+    while (end > start && (text.charCodeAt(end - 1) === 10 || text.charCodeAt(end - 1) === 13)) end -= 1;
+    return [start, end];
+  };
+
   return {
-    table: { rows, cols, delimiter, truncatedCols: scan.truncatedCols, rowAt },
+    table: { rows, cols, delimiter, truncatedCols: scan.truncatedCols, rowAt, rowRange },
     starts,
     lastRowAtEof: scan.lastRowAtEof,
   };

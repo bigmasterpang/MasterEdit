@@ -121,6 +121,18 @@ export const SHORTCUT_REFERENCE: ShortcutReferenceGroup[] = [
     ],
   },
   {
+    title: "表格编辑（CSV / xlsx）",
+    items: [
+      { keys: "双击 / F2 / 直接输入", label: "编辑当前单元格（中文输入法请先双击或 F2）" },
+      { keys: "Enter / Tab", label: "提交并下移 / 右移（Shift+Tab 左移）" },
+      { keys: "Esc", label: "取消本次编辑" },
+      { keys: "Ctrl+Z / Ctrl+Y", label: "撤销 / 重做单元格编辑" },
+      { keys: "Ctrl+C", label: "复制当前单元格文本" },
+      { keys: "Ctrl+E", label: "CSV：表格 / 源码 / 分屏 切换" },
+      { keys: "Ctrl+S", label: "写回文件（xlsx 保存前会备份 .bak）" },
+    ],
+  },
+  {
     title: "标题与文本格式",
     items: [
       { keys: "Ctrl+1 … Ctrl+6", label: "设置为 H1–H6 标题" },

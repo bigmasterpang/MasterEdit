@@ -6,7 +6,7 @@ import type {
   LayoutState,
   ViewMode,
 } from "../types";
-import { LARGE_FILE_BYTES } from "../utils/constants";
+import { textReadOnlyLimit } from "../utils/filePath";
 
 let docSeq = 0;
 
@@ -67,7 +67,7 @@ export function docFromPayload(payload: FilePayload, pane?: 0 | 1): DocState {
     encoding: payload.encoding ?? "utf-8",
     eol: payload.eol ?? "lf",
     // 加密文档可正常编辑，保存时由后端按原格式加密写回
-    readOnly: payload.size > LARGE_FILE_BYTES,
+    readOnly: payload.size > textReadOnlyLimit(payload.path),
     pane: targetPane,
   });
 }
@@ -595,7 +595,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
                 isDirty: false,
                 modifiedAt,
                 size,
-                readOnly: size > LARGE_FILE_BYTES,
+                readOnly: size > textReadOnlyLimit(d.filePath),
               }
             : d,
         ),

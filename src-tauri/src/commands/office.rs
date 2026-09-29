@@ -52,6 +52,10 @@ pub struct SpreadsheetInfo {
     pub size: u64,
     /// 是否为「企业透明加密」文档（已在内存中解密，仅用于提示用户）
     pub encrypted: bool,
+    /// 是否支持写回编辑：只有 .xlsx 可以（xlsm 含宏、xls/xlsb/ods 结构不同，一律只读）
+    pub editable: bool,
+    /// 是否有未落盘的结构改动（内存影子工作簿里有改动，Ctrl+S 才会写盘）
+    pub pending: bool,
 }
 
 /// 单元格：`v` 为显示文本，`t` 为类型，`f` 为公式（仅含公式的单元格才有）
@@ -248,23 +252,40 @@ fn cell_text(data: &Data) -> (String, &'static str) {
 
 /// 读取工作簿字节。企业透明加密（亿赛通等）文档在**内存中**解密后交给 calamine，
 /// 不写临时文件，避免把明文副本落到磁盘上。
-fn read_workbook_bytes(p: &Path) -> Result<(Vec<u8>, bool), String> {
+/// （`pub(crate)`：`office_ops` 的查找/统计/结构操作复用同一份实现）
+///
+/// **影子优先**：该文件若有未落盘的结构改动（`office_shadow`），直接返回影子工作簿的
+/// 序列化结果 —— 于是 `spreadsheet_rows` / `spreadsheet_find` / `spreadsheet_stats`
+/// 都不需要知道影子的存在，读到的自然就是「结构改动之后」的内容。
+pub(crate) fn read_workbook_bytes(p: &Path) -> Result<(Vec<u8>, bool), String> {
+    if let Some(bytes) = crate::commands::office_shadow::shadow_bytes(&p.to_string_lossy()) {
+        return Ok((bytes.bytes, bytes.encrypted));
+    }
+    let (_, plain, encrypted) = read_raw_and_plain(p)?;
+    Ok((plain, encrypted))
+}
+
+/// 读磁盘原始字节 + 内存解密后的明文（企业加密文件：raw 是密文、plain 是明文）。
+///
+/// 影子工作簿建立时要同时拿到「原始字节」（备份 + 重新加密的文件头）与「明文」，
+/// 因此单独抽出来，供 `read_workbook_bytes` 与 `office_shadow` 共用一份实现。
+pub(crate) fn read_raw_and_plain(p: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), String> {
     let raw = std::fs::read(p).map_err(|e| format!("读取文件失败: {e}"))?;
     match esafenet::decrypt_esafenet(&raw) {
-        Some(plain) => Ok((plain, true)),
-        None => Ok((raw, false)),
+        Some(plain) => Ok((raw, plain, true)),
+        None => Ok((raw.clone(), raw, false)),
     }
 }
 
 /// 从内存解析工作簿：calamine 按内容自动识别 xls / xlsx / xlsb / ods
-fn parse_workbook(bytes: &[u8]) -> Result<Sheets<Cursor<&[u8]>>, String> {
+pub(crate) fn parse_workbook(bytes: &[u8]) -> Result<Sheets<Cursor<&[u8]>>, String> {
     open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|e| e.to_string())
 }
 
 /// 把底层解析错误翻译成用户能照着做的提示。
 /// 常见情况：需要密码的 Office 文档 / 旧版二进制格式（都是 CFB 容器）、
 /// 系统导出的「假 Excel」（真实内容是 HTML 表格）、被加密软件处理过或已损坏的文件。
-fn describe_parse_failure(bytes: &[u8], err: &str) -> String {
+pub(crate) fn describe_parse_failure(bytes: &[u8], err: &str) -> String {
     if bytes.len() >= 4 && bytes[..4] == [0xD0, 0xCF, 0x11, 0xE0] {
         return format!(
             "该文件是加密的 Office 文档（打开需要密码）或旧版二进制格式，暂时无法解析。\n\
@@ -300,7 +321,14 @@ fn open_sheet(
         return Err("目标不是有效的文件".to_string());
     }
     let mtime = modified_ms(&meta);
-    let key = format!("{}|{}", path.to_lowercase(), sheet);
+    // 缓存 key 带上「影子版本」：结构操作只改内存，磁盘 mtime 不变，光靠 mtime 会命中
+    // 改动前的解析结果。没有影子时版本恒为 0（此时 mtime 变化仍能正确失效）。
+    let key = format!(
+        "{}|{}|{}",
+        path.to_lowercase(),
+        sheet,
+        crate::commands::office_shadow::revision(path)
+    );
 
     // 命中缓存（且文件未被外部修改）时直接复用
     if let Ok(mut inner) = cache.0.lock() {
@@ -332,7 +360,11 @@ fn open_sheet(
     Ok((values, formulas, mtime))
 }
 
-fn info_impl(path: &str) -> Result<SpreadsheetInfo, String> {
+/// 文件信息 + 工作表列表。
+///
+/// `pub(crate)`：`office_ops::spreadsheet_state` 在「没有影子」时直接复用它读磁盘。
+/// 有影子时它读的也是影子内容（见 `read_workbook_bytes`），因此表列表天然是最新的。
+pub(crate) fn info_impl(path: &str) -> Result<SpreadsheetInfo, String> {
     let p = Path::new(path);
     let meta = std::fs::metadata(p).map_err(|e| format!("读取文件信息失败: {e}"))?;
     if !meta.is_file() {
@@ -351,10 +383,17 @@ fn info_impl(path: &str) -> Result<SpreadsheetInfo, String> {
         modified_at: modified_ms(&meta),
         size: meta.len(),
         encrypted,
+        // 按扩展名判断是否可写回（判断逻辑与 office_write 共用，避免两处不一致）
+        editable: crate::commands::office_write::is_editable(path),
+        // 有未落盘的结构改动（影子工作簿）
+        pending: crate::commands::office_shadow::pending(path),
     })
 }
 
-fn rows_impl(
+/// 按行窗口读取工作表内容（配合前端虚拟滚动）。
+///
+/// `pub(crate)`：测试要验证「结构操作后行窗口读的是影子内容」。
+pub(crate) fn rows_impl(
     cache: &SheetCache,
     path: &str,
     sheet: &str,

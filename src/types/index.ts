@@ -79,6 +79,103 @@ export interface SpreadsheetInfo {
   size: number;
   /** 是否为企业透明加密文档（已在内存中解密，不落明文副本） */
   encrypted: boolean;
+  /** 是否支持写回编辑：只有 .xlsx 可以（xlsm 含宏、xls/xlsb/ods 结构不同，一律只读） */
+  editable: boolean;
+  /** 是否有未落盘的结构改动（内存影子工作簿与磁盘不一致） */
+  pending?: boolean;
+}
+
+/** 表格编辑的写回方式 */
+export type SheetEditKind = "text" | "number" | "bool" | "formula" | "date" | "empty";
+
+/** 一个待提交的单元格编辑（坐标为 0 起的绝对行列，与网格一致） */
+export interface SheetEdit {
+  sheet: string;
+  row: number;
+  col: number;
+  kind: SheetEditKind;
+  value: string;
+  /**
+   * 公式的计算结果（仅用于界面显示，不写进文件）。
+   * 由后端 spreadsheet_eval 算出；为 undefined 表示还没算或不是公式。
+   */
+  computed?: string | null;
+  /** 公式计算失败的原因（同样只用于显示） */
+  error?: string | null;
+}
+
+/** 后端 spreadsheet_save 返回 */
+export interface SheetSaveResult {
+  path: string;
+  size: number;
+  modifiedAt: number;
+  /** 实际写入的单元格数 */
+  savedCells: number;
+  /** 备份文件路径（原文件字节的副本，未备份时为 null） */
+  backupPath: string | null;
+}
+
+/** 后端 spreadsheet_stats 返回：矩形区域的数值统计（选区超出一屏时用） */
+export interface RangeStats {
+  cells: number;
+  nonEmpty: number;
+  numeric: number;
+  sum: number;
+  average: number | null;
+  min: number | null;
+  max: number | null;
+}
+
+/**
+ * 后端 spreadsheet_structure 返回。
+ * 结构操作（插入/删除行列、工作表增删改复制）只改**内存影子工作簿**，
+ * 不落盘；只有 Ctrl+S（spreadsheet_save）才写回文件。
+ */
+export interface StructureResult {
+  path: string;
+  /** 操作后的完整工作表列表（据此刷新底部标签） */
+  sheets: SheetMeta[];
+  /** 固定 false：结构操作不再直接落盘 */
+  saved: boolean;
+  /** 是否有未落盘的结构改动 */
+  pending: boolean;
+}
+
+/** 后端 spreadsheet_state 返回：未落盘状态 + 工作表列表 + 撤销/重做可用性 */
+export interface SpreadsheetState {
+  path: string;
+  sheets: SheetMeta[];
+  pending: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
+}
+
+/** 后端 spreadsheet_eval 的请求项（0 起坐标） */
+export interface EvalRequest {
+  row: number;
+  col: number;
+  formula: string;
+}
+
+/**
+ * 后端 spreadsheet_eval 的结果项。
+ * 只是**界面显示用**的计算结果，不会写进文件（文件里仍只有公式，Excel 打开时自己算）。
+ */
+export interface EvalResult {
+  row: number;
+  col: number;
+  /** 计算成功的显示文本 */
+  value: string | null;
+  /** 计算失败的原因（「暂不支持函数 X」「循环引用」或 #DIV/0! 这类 Excel 错误码） */
+  error: string | null;
+}
+export interface ShadowEditResult {
+  path: string;
+  sheets: SheetMeta[];
+  /** 影子当前是否与磁盘不同 */
+  pending: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
 }
 
 /** 后端 spreadsheet_rows 返回：按窗口读取的行数据（配合虚拟滚动） */
@@ -129,8 +226,25 @@ export interface DocState {
   pane: 0 | 1;
   /** 当前文档独立缩放字号（未设置时跟随全局默认字号，互不影响双栏） */
   fontSize?: number;
-  /** 新建文档类型：markdown / blank / pdf / spreadsheet（xlsx、xls、ods 只读查看） */
+  /** 新建文档类型：markdown / blank / pdf / spreadsheet（xlsx 可轻量编辑，xls/xlsb/ods 只读查看） */
   docType?: "markdown" | "blank" | "pdf" | "spreadsheet";
+  /** 表格待提交的单元格编辑（未保存前只存在于内存，保存时一次性写回） */
+  sheetEdits?: SheetEdit[];
+  /** 表格首次保存前是否已经确认过「重写工作簿」的提示（每个文档一次） */
+  sheetSaveConfirmed?: boolean;
+  /** 表格首次结构操作前是否已经确认过「重写工作簿 / 公式不重算」的说明（每个文档一次） */
+  sheetStructureConfirmed?: boolean;
+  /** 表格是否有未落盘的结构改动（插入/删除行列、工作表增删改复制只在内存中，Ctrl+S 才写回） */
+  sheetStructurePending?: boolean;
+  /**
+   * 手动调整过的列宽 / 行高（列/行索引 → 像素）。
+   * 由父组件持有，因此能进同一条撤销栈（Ctrl+Z 可撤回调整）；目前只在会话内有效，不写回文件。
+   */
+  sheetColumnWidths?: Record<number, number>;
+  sheetRowHeights?: Record<number, number>;
+  /** 冻结的行数 / 列数（0 = 不冻结；1 = 冻结首行/首列），滚动时始终可见 */
+  sheetFreezeRows?: number;
+  sheetFreezeCols?: number;
   /** PDF 文件的二进制数据（Base64 编码，编辑如删页/旋转后会更新并置 isDirty） */
   pdfBase64?: string;
   /** PDF 原始/已保存的二进制数据（Base64），用于判断脏状态或恢复 */

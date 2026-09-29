@@ -42,6 +42,7 @@ import {
   saveActiveAs,
 } from "../../utils/fileActions";
 import { fileName, isDelimitedDoc, isMarkdownDoc, isPdfDoc, isSpreadsheetDoc } from "../../utils/filePath";
+import { COMMON_FORMULA_TEMPLATES, sendSheetCommand } from "../../utils/sheetCommands";
 import { parseDoc } from "../../utils/markdown";
 
 interface ToolbarProps {
@@ -381,6 +382,74 @@ export function Toolbar({ previewRef, isDark }: ToolbarProps) {
               />
             ))}
           </div>
+          <Divider />
+        </>
+      ) : null}
+
+      {/* 表格类文档：自动调整（列/行/两者）、插入常用公式、冻结窗格 */}
+      {isSheet || isDelimited ? (
+        <>
+          <DropdownMenu
+            icon="columns"
+            label="自动调整"
+            title="按内容自动调整表格的列宽 / 行高"
+            disabled={!hasDoc}
+            groups={[
+              {
+                items: [
+                  {
+                    label: "自动调整列宽",
+                    onClick: () => sendSheetCommand({ kind: "autoFit", target: "columns" }),
+                  },
+                  {
+                    label: "自动调整行高",
+                    onClick: () => sendSheetCommand({ kind: "autoFit", target: "rows" }),
+                  },
+                  {
+                    label: "列宽与行高都调整",
+                    onClick: () => sendSheetCommand({ kind: "autoFit", target: "both" }),
+                  },
+                ],
+              },
+            ]}
+          />
+          {isSheet ? (
+          <DropdownMenu
+            icon="fx"
+            label="插入公式"
+            title="把常用公式插入当前单元格（当前选区会作为公式参数）"
+            disabled={!hasDoc || doc?.readOnly}
+            groups={[
+              {
+                items: COMMON_FORMULA_TEMPLATES.map((item) => ({
+                  label: item.label,
+                  onClick: () => sendSheetCommand({ kind: "insertFormula", template: item.template }),
+                })),
+              },
+            ]}
+          />
+          ) : null}
+          {isSheet ? (
+            <DropdownMenu
+              icon="freeze"
+              label="冻结"
+              title="冻结首行 / 首列，滚动时始终可见"
+              disabled={!hasDoc}
+              groups={[
+                {
+                  items: [
+                    { label: "不冻结", onClick: () => sendSheetCommand({ kind: "freeze", rows: 0, cols: 0 }) },
+                    { label: "冻结首行", onClick: () => sendSheetCommand({ kind: "freeze", rows: 1, cols: 0 }) },
+                    { label: "冻结首列", onClick: () => sendSheetCommand({ kind: "freeze", rows: 0, cols: 1 }) },
+                    {
+                      label: "冻结首行和首列",
+                      onClick: () => sendSheetCommand({ kind: "freeze", rows: 1, cols: 1 }),
+                    },
+                  ],
+                },
+              ]}
+            />
+          ) : null}
           <Divider />
         </>
       ) : null}

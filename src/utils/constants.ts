@@ -90,7 +90,14 @@ export const EOL_OPTIONS = [
 export type EolId = (typeof EOL_OPTIONS)[number]["id"];
 
 /** 超过该大小提示只读打开 */
+/** 超过 10MB 的文件以只读方式打开（表格类见下） */
 export const LARGE_FILE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * CSV / TSV 的自动只读阈值：表格视图走惰性行索引（只扫行首偏移、按需解析行），
+ * 十几 MB / 十几万行也能流畅编辑，因此放宽到 64MB；再大才默认只读。
+ */
+export const DELIMITED_EDIT_LIMIT = 64 * 1024 * 1024;
 
 /** 超过该大小关闭实时预览（分屏改为手动刷新） */
 export const REALTIME_PREVIEW_LIMIT = 1024 * 1024;
