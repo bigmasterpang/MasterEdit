@@ -2,6 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SheetGrid, type SheetRange } from "./SheetGrid";
 import { createDelimitedTable, detectDelimiter } from "../../utils/delimited";
+import {
+  deleteDelimitedColumn,
+  deleteDelimitedRow,
+  insertDelimitedColumn,
+  insertDelimitedRow,
+} from "../../utils/delimitedOps";
 import { applyCellEditsToDelimited } from "../../utils/sheetEdits";
 import {
   commitHistoryStep,
@@ -10,6 +16,7 @@ import {
   popHistoryStep,
   popLayoutOp,
   pushCellStep,
+  pushContentStep,
   pushLayoutOpAgain,
   pushStructureStep,
   returnHistoryStep,
@@ -665,11 +672,83 @@ function DelimitedSheet({ docId }: { docId: string }) {
     [writeCells],
   );
 
+  /**
+   * CSV / TSV 的行列结构操作：整体改写文本，并记一个**内容步骤**（`Ctrl+Z` 一步还原）。
+   * 撤销顺序是后进先出，所以内容步骤之前的单元格步骤不会错位（先撤内容、坐标自然对齐）。
+   */
+  const applyStructure = useCallback(
+    (mutate: (text: string) => string) => {
+      if (readOnly) return;
+      const before = useAppStore.getState().docs.find((d) => d.id === docId)?.content ?? "";
+      const after = mutate(before);
+      if (after === before) return;
+      useAppStore.getState().patchDoc(docId, { content: after });
+      pushContentStep(docId, before, after);
+      setHistoryVersion((value) => value + 1);
+      setSelection(null);
+      setSummary(null);
+    },
+    [docId, readOnly],
+  );
+
+  /** 删除选区内涉及的所有行 / 列（与 Excel 一致：删一整段） */
+  const deleteRowsInRange = useCallback(
+    (from: number, to: number) => {
+      applyStructure((text) => {
+        let next = text;
+        for (let row = to; row >= from; row -= 1) next = deleteDelimitedRow(next, row);
+        return next;
+      });
+    },
+    [applyStructure],
+  );
+  const deleteColsInRange = useCallback(
+    (from: number, to: number) => {
+      applyStructure((text) => {
+        let next = text;
+        for (let col = to; col >= from; col -= 1) next = deleteDelimitedColumn(next, col, table.delimiter);
+        return next;
+      });
+    },
+    [applyStructure, table.delimiter],
+  );
+
   const stepEdit = useCallback(
     (direction: "undo" | "redo"): boolean => {
       const step = popHistoryStep<string>(docId, direction);
       if (!step) return false;
-      // CSV 没有结构操作，历史里只会是单元格步骤
+      // 内容步骤（CSV 行列结构操作）：把整段文本换回去
+      if (step.kind === "content") {
+        useAppStore.getState().patchDoc(docId, {
+          content: direction === "undo" ? step.before : step.after,
+        });
+        commitHistoryStep<string>(docId, direction, step);
+        setHistoryVersion((value) => value + 1);
+        return true;
+      }
+      // 布局步骤（手动拖动 / 自动调整列宽行高）：改回文档状态里的布局覆盖值。
+      // 少了这一支，CSV 下 Ctrl+Z 会把布局步直接吃掉（列宽不变、撤销栈却少一步）。
+      if (step.kind === "layout") {
+        const useBefore = direction === "undo";
+        const target = useAppStore.getState().docs.find((d) => d.id === docId);
+        const cols = { ...(target?.sheetColumnWidths ?? {}) };
+        const rows = { ...(target?.sheetRowHeights ?? {}) };
+        for (const change of step.changes) {
+          const mapped = mapCellKey(docId, change.key, step.layoutVersion);
+          if (mapped === null) continue;
+          const [kind, indexText] = mapped.split(":");
+          const index = Number(indexText);
+          const value = useBefore ? change.before : change.after;
+          const bucket = kind === "col" ? cols : rows;
+          if (value === null) delete bucket[index];
+          else bucket[index] = value;
+        }
+        commitHistoryStep<string>(docId, direction, step);
+        useAppStore.getState().patchDoc(docId, { sheetColumnWidths: cols, sheetRowHeights: rows });
+        setHistoryVersion((value) => value + 1);
+        return true;
+      }
+      // CSV 的其余步骤只会是单元格步骤
       if (step.kind !== "cells") {
         commitHistoryStep<string>(docId, direction, step);
         return false;
@@ -713,6 +792,16 @@ function DelimitedSheet({ docId }: { docId: string }) {
       }
     );
   }, [cellMenu, selection]);
+
+  /** 右键菜单统一取选区（没有选区就什么都不做），避免每个菜单项重复判空 */
+  const withRange = useCallback(
+    (run: (range: SheetRange) => void) => () => {
+      const range = menuRange();
+      if (range) run(range);
+    },
+    [menuRange],
+  );
+
   const pasteFromMenu = useCallback(async () => {
     const range = menuRange();
     if (!range) return;
@@ -723,7 +812,7 @@ function DelimitedSheet({ docId }: { docId: string }) {
       await showMessage("粘贴失败", String(error));
     }
   }, [menuRange, pasteInto]);
-  const { columnWidths, rowHeights, handleColumnResize, handleRowResize, handleRowsResize } = useSheetLayout(
+  const { columnWidths, rowHeights, handleColumnResize, handleRowResize, handleRowsResize, handleColumnsResize } = useSheetLayout(
     docId,
     () => setHistoryVersion((value) => value + 1),
   );
@@ -830,6 +919,11 @@ function DelimitedSheet({ docId }: { docId: string }) {
     return onSheetCommand((command) => {
       if (command.kind === "autoFit") {
         const target = command.target ?? "both";
+        if (target === "wrap") {
+          setWrapText(true);
+          setAutoFitRowsToken((value) => value + 1);
+          return;
+        }
         if (target !== "rows") setAutoFitToken((value) => value + 1);
         if (target !== "columns") setAutoFitRowsToken((value) => value + 1);
       }
@@ -974,6 +1068,7 @@ function DelimitedSheet({ docId }: { docId: string }) {
         rowHeights={rowHeights}
         onColumnResize={handleColumnResize}
         onRowResize={handleRowResize}
+        onColumnsResize={handleColumnsResize}
         freezeRows={freezeRows}
         freezeCols={freezeCols}
         findHits={findApi.state.hits}
@@ -1007,6 +1102,50 @@ function DelimitedSheet({ docId }: { docId: string }) {
                 const range = menuRange();
                 if (range) void clearSelection(range);
               },
+            },
+          ],
+          [
+            {
+              label: "在上方插入行",
+              disabled: readOnly,
+              onClick: withRange((range) =>
+                applyStructure((text) => insertDelimitedRow(text, range.startRow, "above")),
+              ),
+            },
+            {
+              label: "在下方插入行",
+              disabled: readOnly,
+              onClick: withRange((range) =>
+                applyStructure((text) => insertDelimitedRow(text, range.endRow, "below")),
+              ),
+            },
+            {
+              label: "删除行",
+              disabled: readOnly,
+              onClick: withRange((range) => deleteRowsInRange(range.startRow, range.endRow)),
+            },
+            {
+              label: "在左侧插入列",
+              disabled: readOnly,
+              onClick: withRange((range) =>
+                applyStructure((text) =>
+                  insertDelimitedColumn(text, range.startCol, table.delimiter, "left"),
+                ),
+              ),
+            },
+            {
+              label: "在右侧插入列",
+              disabled: readOnly,
+              onClick: withRange((range) =>
+                applyStructure((text) =>
+                  insertDelimitedColumn(text, range.endCol, table.delimiter, "right"),
+                ),
+              ),
+            },
+            {
+              label: "删除列",
+              disabled: readOnly,
+              onClick: withRange((range) => deleteColsInRange(range.startCol, range.endCol)),
             },
           ],
           [
@@ -1083,7 +1222,7 @@ function WorkbookSheet({ docId }: { docId: string }) {
   /** 内容栏是否正在编辑公式：决定网格是否开启"鼠标拾取范围" */
   const [barFormulaMode, setBarFormulaMode] = useState(false);
   const handlePickModeChange = useCallback((active: boolean) => setBarFormulaMode(active), []);
-  const { columnWidths, rowHeights, handleColumnResize, handleRowResize, handleRowsResize } = useSheetLayout(
+  const { columnWidths, rowHeights, handleColumnResize, handleRowResize, handleRowsResize, handleColumnsResize } = useSheetLayout(
     docId,
     () => setHistoryVersion((value) => value + 1),
   );
@@ -1321,6 +1460,16 @@ function WorkbookSheet({ docId }: { docId: string }) {
           }
           commitHistoryStep<SheetEdit>(docId, direction, step);
           useAppStore.getState().patchDoc(docId, { sheetColumnWidths: cols, sheetRowHeights: rows });
+          setHistoryVersion((value) => value + 1);
+          return true;
+        }
+
+        // 内容步骤只可能来自 CSV 的行列结构操作（xlsx 走 Rust 快照栈），这里按同一语义兜底
+        if (step.kind === "content") {
+          useAppStore.getState().patchDoc(docId, {
+            content: direction === "undo" ? step.before : step.after,
+          });
+          commitHistoryStep<SheetEdit>(docId, direction, step);
           setHistoryVersion((value) => value + 1);
           return true;
         }
@@ -2021,6 +2170,12 @@ function WorkbookSheet({ docId }: { docId: string }) {
     return onSheetCommand((command) => {
       if (command.kind === "autoFit") {
         const target = command.target ?? "both";
+        // 「自动换行并调整行高」：先打开换行，再按折行结果重算行高
+        if (target === "wrap") {
+          setWrapText(true);
+          setAutoFitRowsToken((value) => value + 1);
+          return;
+        }
         if (target !== "rows") setAutoFitToken((value) => value + 1);
         if (target !== "columns") setAutoFitRowsToken((value) => value + 1);
         return;
@@ -2227,6 +2382,7 @@ function WorkbookSheet({ docId }: { docId: string }) {
         rowHeights={rowHeights}
         onColumnResize={handleColumnResize}
         onRowResize={handleRowResize}
+        onColumnsResize={handleColumnsResize}
         freezeRows={freezeRows}
         freezeCols={freezeCols}
         findHits={findApi.state.hits}

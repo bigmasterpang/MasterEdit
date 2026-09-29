@@ -409,6 +409,10 @@ export function Toolbar({ previewRef, isDark }: ToolbarProps) {
                     label: "列宽与行高都调整",
                     onClick: () => sendSheetCommand({ kind: "autoFit", target: "both" }),
                   },
+                  {
+                    label: "自动换行并调整行高",
+                    onClick: () => sendSheetCommand({ kind: "autoFit", target: "wrap" }),
+                  },
                 ],
               },
             ]}

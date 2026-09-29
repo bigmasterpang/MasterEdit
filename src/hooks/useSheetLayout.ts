@@ -94,5 +94,37 @@ export function useSheetLayout(docId: string, onHistoryChange: () => void) {
     [docId, onHistoryChange, rowHeights],
   );
 
-  return { columnWidths, rowHeights, handleColumnResize, handleRowResize, handleRowsResize };
+  /**
+   * 一键「自动调整列宽」产生的一批变化：**记成一步撤销**（与行高对称）。
+   * 网格在用户显式触发时把变化的列成批回调过来，父组件据此更新受控值。
+   */
+  const handleColumnsResize = useCallback(
+    (changes: Array<{ index: number; width: number }>) => {
+      if (changes.length === 0) return;
+      const before = columnWidths ?? {};
+      const step = changes
+        .filter((change) => (before[change.index] ?? null) !== change.width)
+        .map((change) => ({
+          key: `col:${change.index}`,
+          before: before[change.index] ?? null,
+          after: change.width,
+        }));
+      if (step.length === 0) return;
+      pushLayoutStep(docId, step);
+      onHistoryChange();
+      const next = { ...before };
+      for (const change of changes) next[change.index] = change.width;
+      useAppStore.getState().patchDoc(docId, { sheetColumnWidths: next });
+    },
+    [columnWidths, docId, onHistoryChange],
+  );
+
+  return {
+    columnWidths,
+    rowHeights,
+    handleColumnResize,
+    handleRowResize,
+    handleRowsResize,
+    handleColumnsResize,
+  };
 }

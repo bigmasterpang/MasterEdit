@@ -10,7 +10,7 @@
  */
 
 export type SheetCommand =
-  | { kind: "autoFit"; target?: "columns" | "rows" | "both" }
+  | { kind: "autoFit"; target?: "columns" | "rows" | "both" | "wrap" }
   | { kind: "insertFormula"; template: string }
   | { kind: "freeze"; rows: number; cols: number };
 

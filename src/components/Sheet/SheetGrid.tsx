@@ -229,6 +229,12 @@ export interface SheetGridProps {
    */
   onRowsResize?: (changes: Array<{ index: number; height: number }>) => void;
   /**
+   * 一键自动调整列宽产生的**一批**列宽变化（可选，形状与 onRowsResize 对称）：
+   * 传了就用它（父组件一次记成一个撤销步），没传则逐列退回 onColumnResize。
+   * 只在**用户显式触发**（autoFitToken 变化）时回调；挂载时那次自动拟合不回调，避免凭空多出撤销步。
+   */
+  onColumnsResize?: (changes: Array<{ index: number; width: number }>) => void;
+  /**
    * 冻结的行数（0 = 不冻结；1 = 冻结首行）：冻结行在垂直滚动时始终可见，其余行正常滚动。
    * 与 headerRow 是同一套实现（headerRow 相当于「冻结 1 行 + 表头样式」），同时传时取两者较大的行数，
    * 不会出现两层表头；冻结区与滚动区之间会多画一条分隔线。
@@ -852,6 +858,8 @@ interface SheetCellEditorProps {
   onPickCancel: () => void;
   /** 文本是否以 = 开头变化时通知网格 */
   onFormulaModeChange: (active: boolean) => void;
+  /** 正在编辑的这格是查找命中：编辑框改用命中提示底色（否则「正在编辑的命中格」完全看不出是命中） */
+  hitTint?: boolean;
 }
 
 /** 候选面板状态：字段与 FormulaSuggestPanel 期望的 state 一致（外加一个等价性 key） */
@@ -888,6 +896,7 @@ function SheetCellEditor({
   readPicking,
   onPickCancel,
   onFormulaModeChange,
+  hitTint = false,
 }: SheetCellEditorProps): JSX.Element {
   const inputRef = useRef<HTMLInputElement>(null);
   /** Enter / Esc / blur 可能在一个提交里接连发生，用它保证一次编辑只提交或取消失败一次 */
@@ -1085,7 +1094,10 @@ function SheetCellEditor({
         spellCheck={false}
         autoComplete="off"
         aria-label={`编辑 ${columnLabel(col)}${row + 1}`}
-        className="absolute top-0 z-[3] truncate border-r border-b border-line bg-app px-1.5 text-[12px] text-fg outline-none! ring-2 ring-inset ring-accent"
+        className={`absolute top-0 z-[3] truncate border-r border-b border-line px-1.5 text-[12px] text-fg outline-none! ring-2 ring-inset ring-accent ${
+          // 正在编辑的命中格：底色换成命中提示色（编辑框本来是不透明的 bg-app，会把命中提示整个盖住）
+          hitTint ? "bg-warning/25" : "bg-app"
+        }`}
         // 可变行高：编辑框跟行一起长高，但 <input> 始终单行，文本按 ROW_H 行高在框内顶部对齐
         style={{ left, width, height, lineHeight: `${ROW_H}px` }}
       />
@@ -1248,34 +1260,40 @@ const SheetRow = memo(function SheetRow({
     // 多格选区里的活动格（拖拽锚点）：不铺底色，只留细边框（见 multiSelection 注释）
     const anchorInSelection = isActive && multiSelection && inSelCol && !coveredByEditor;
     const fill = inSelCol && !isActive && !coveredByEditor;
-    // 注意：无选区时下面拼出的 class 与改造前逐字节一致（只读路径的硬要求）
-    const activeClass = isActive && !coveredByEditor
-      ? anchorInSelection
-        ? " z-[1] ring-1 ring-inset ring-accent"
-        : " z-[1] bg-accent-soft ring-2 ring-inset ring-accent"
-      : "";
-    const fillClass = fill ? " bg-accent/10" : "";
     /**
      * 查找命中提示：一层比选区更浅的底色（warning 系浅色，与蓝色的选区/活动格一眼可分）。
-     * **选区优先**：格子已经是选区填充或活动格时不再加命中底色 —— 否则命中会把选区盖掉，
-     * 用户报告的就是「一查找，选区高亮就没了」。当前命中底色略强，另加一圈细描边区分。
+     * **命中一律有底色**（包括落在选区里的）—— 用户在「范围=选区」里查找时，命中全都在选区底色上，
+     * 不给底色就等于「搜了看不见」。为了在蓝色选区底上仍然明显，选区内/活动格的命中用更强一档的
+     * `bg-warning/40`，普通命中 `bg-warning/15`，当前命中再叠一圈细描边。
+     * 注意：活动格自己已有 `ring-2 ring-accent`，此时**不加** warning 描边（否则两个 ring 会互相盖）。
      */
     const cellKey = `${row},${col}`;
     const isHit = hitKeys.size > 0 && hitKeys.has(cellKey);
-    const hitClass =
-      isHit && !fill && !isActive && !coveredByEditor
-        ? cellKey === currentHitKey
+    const isCurrentHit = isHit && cellKey === currentHitKey;
+    // 注意：无选区时下面拼出的 class 与改造前逐字节一致（只读路径的硬要求）；
+    // 命中格的活动格底色让给命中色（同一个 background-color 只能有一个，靠 CSS 顺序决胜负太脆）
+    const activeClass = isActive && !coveredByEditor
+      ? anchorInSelection
+        ? " z-[1] ring-1 ring-inset ring-accent"
+        : ` z-[1] ring-2 ring-inset ring-accent${isHit ? "" : " bg-accent-soft"}`
+      : "";
+    const fillClass = fill && !isHit ? " bg-accent/10" : "";
+    const hitInSelection = isHit && (fill || isActive);
+    const hitClass = !isHit
+      ? ""
+      : hitInSelection
+        ? ` bg-warning/40${isCurrentHit && !isActive ? " ring-1 ring-inset ring-warning/70" : ""}`
+        : isCurrentHit
           ? " bg-warning/30 ring-1 ring-inset ring-warning/60"
-          : " bg-warning/15"
-        : "";
+          : " bg-warning/15";
     // 冻结行的底色与浅填充 / 命中底色互斥（都是 background-color，留一个才不会看运气）：
     // 表头行用 bg-panel（与改动前一致），普通冻结行用 bg-app（不透明，挡住下面滚过去的行）
     const frozenClass = panel
-      ? fill || hitClass
+      ? fill || isHit
         ? " font-medium"
         : " bg-panel font-medium"
       : frozen
-        ? fill || hitClass
+        ? fill || isHit
           ? ""
           : " bg-app"
         : "";
@@ -1437,6 +1455,7 @@ const SheetRow = memo(function SheetRow({
       readPicking={editor.readPicking}
       onPickCancel={editor.cancelPick}
       onFormulaModeChange={editor.notifyFormulaMode}
+      hitTint={hitKeys.size > 0 && hitKeys.has(`${row},${editingCol}`)}
     />
   ) : null;
   const editorInFrozen = editorEl !== null && frozenCols > 0 && editingCol < frozenCols;
@@ -1539,6 +1558,7 @@ export function SheetGrid({
   onRowResize,
   autoFitRowsToken,
   onRowsResize,
+  onColumnsResize,
   freezeRows = 0,
   freezeCols = 0,
   findHits,
@@ -1583,6 +1603,7 @@ export function SheetGrid({
     onColumnResize,
     onRowResize,
     onRowsResize,
+    onColumnsResize,
     /** selection 是否受控（父组件传了具体值或 null） */
     selectionControlled: selection !== undefined,
     /** 列宽 / 行高是否受控（父组件传了 columnWidths / rowHeights，见 applyColumnWidth 注释） */
@@ -1607,6 +1628,7 @@ export function SheetGrid({
     onColumnResize,
     onRowResize,
     onRowsResize,
+    onColumnsResize,
     selectionControlled: selection !== undefined,
     controlledColumns: columnWidths !== undefined,
     controlledRows: rowHeights !== undefined,
@@ -2160,25 +2182,55 @@ export function SheetGrid({
 
   /**
    * 自动调整列宽（Excel 的自动调整列宽）：autoFitToken 变化时按**已加载**内容采样一次。
-   * 取舍见 computeAutoFitWidths；这里用 lastFitTokenRef 保证「一个令牌值只算一次」，
-   * 令牌在数据到达前就变了（空表点按钮）时，会等这张表真的有内容后再补算一次。
-   * 采样读的是 readCellText（**待提交的编辑优先**）：刚敲进去还没保存的长串也算数。
+   * 取舍见 computeAutoFitWidths；采样读的是 readCellText（**待提交的编辑优先**）：刚敲进去还没保存的长串也算数。
    * 手动拖过宽度的列在 colWidths 合并时优先，因此自动调整不会覆盖它。
+   *
+   * **令牌只在真的采到内容时才消费**：CSV 的表格是 debounce 解析的、xlsx 的行窗口是异步加载的，
+   * 工具栏点「自动调整列宽」时数据常常还没到 —— 那时若把令牌吃掉就再也不会补做，
+   * 用户看到的就是「点了没反应」（用户实测的 CSV 自动调整列宽无效）。这里把 getCell / pendingCells
+   * 放进依赖：数据到达（引用变化）后 effect 会再跑一次，令牌还没消费就补做一次。
    */
   const lastFitTokenRef = useRef<number | null>(null);
+  /** 首次看到的令牌值 = 挂载时的状态：它那次属于「打开文件时自动拟合」，不算用户显式触发 */
+  const initialFitTokenRef = useRef<number | null>(null);
   useEffect(() => {
     if (autoFitToken === undefined || empty) return;
     if (lastFitTokenRef.current === autoFitToken) return;
+    if (initialFitTokenRef.current === null) initialFitTokenRef.current = autoFitToken;
+    let sawContent = false;
+    const widths = computeAutoFitWidths(cols, Math.min(rows, AUTOFIT_SAMPLE_ROWS), visibleRowList(viewRange, headerOffset), (row, col) => {
+      const text = readCellText(callbacksRef.current, row, col);
+      if (text.length > 0) sawContent = true;
+      return text;
+    });
+    if (!sawContent) return; // 数据还没到：不消费令牌，等 getCell 换引用后补做
     lastFitTokenRef.current = autoFitToken;
-    setFitWidths(
-      computeAutoFitWidths(cols, Math.min(rows, AUTOFIT_SAMPLE_ROWS), visibleRowList(viewRange, headerOffset), (row, col) =>
-        readCellText(callbacksRef.current, row, col),
-      ),
-    );
+    setFitWidths(widths);
     setLayoutVersion((value) => value + 1);
-    // 只认令牌：窗口/列数通过当前渲染读到的值取，不放进依赖（否则滚动一次就重算一遍）
+    /**
+     * 用户**显式**触发（令牌变化）时，把变化报给父组件。
+     * 为什么必须回调：受控列宽（用户拖过 / 撤销恢复回来的那一份存在父组件里）优先级高于自动调整结果，
+     * 网格自己改不动它 —— 不回调的话「拖过一次之后，自动调整列宽就永远无效」（用户实测的 CSV 问题）。
+     * 挂载时那次（initialFitTokenRef 记下的首个令牌值）不回调：否则一打开文件就凭空多出撤销步。
+     */
+    if (autoFitToken !== initialFitTokenRef.current) {
+      const changes: Array<{ index: number; width: number }> = [];
+      for (let col = 0; col < cols; col += 1) {
+        const next = widths[col];
+        // 拟合结果与当前生效宽度一致就不用报（避免无意义的撤销步）
+        if (next === undefined || next === colWidths[col]) continue;
+        changes.push({ index: col, width: next });
+      }
+      if (changes.length > 0) {
+        const batched = callbacksRef.current.onColumnsResize;
+        if (batched) batched(changes);
+        else for (const change of changes) callbacksRef.current.onColumnResize?.(change.index, change.width);
+      }
+    }
+    // 只认令牌：窗口/列数通过当前渲染读到的值取，不放进依赖（否则滚动一次就重算一遍）；
+    // 但数据身份（getCell / pendingCells）必须放进依赖，否则「数据后到」永远不会补做
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoFitToken, empty]);
+  }, [autoFitToken, empty, getCell, pendingCells]);
 
   /* ------------------ 手动调整列宽 / 行高（受控优先，未受控时留在会话内） ------------------ */
 

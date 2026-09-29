@@ -74,7 +74,17 @@ export interface LayoutStep {
   layoutVersion: number;
 }
 
-export type HistoryStep<T> = CellStep<T> | StructureStep | LayoutStep;
+/**
+ * 内容步骤（CSV / TSV 的行列结构操作）：整体改写文本，一步还原。
+ * CSV 没有工作簿结构，插入删除行列最终都是文本改写，用前后文本记录最稳妥。
+ */
+export interface ContentStep {
+  kind: "content";
+  before: string;
+  after: string;
+}
+
+export type HistoryStep<T> = CellStep<T> | StructureStep | LayoutStep | ContentStep;
 
 /** 撤销方向 */
 export type HistoryDirection = "undo" | "redo";
@@ -140,6 +150,14 @@ export function amendLastLayoutStep(
     matched = true;
   }
   return matched;
+}
+
+/** 记录一步内容改写（CSV 行列结构操作） */
+export function pushContentStep(docId: string, before: string, after: string): void {
+  if (before === after) return;
+  const slot = slotOf(docId);
+  slot.undo.push({ kind: "content", before, after } as unknown);
+  slot.redo.length = 0;
 }
 
 /** 记录一步布局调整（列宽 / 行高），与内容、结构操作共用同一条撤销栈 */
