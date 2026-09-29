@@ -34,6 +34,12 @@ export const CODE_EXTENSIONS = [
 export const PDF_EXTENSIONS = ["pdf"];
 
 /**
+ * Word 文档扩展名：Rust 侧解析 OOXML，**只读**查看（编辑交给 Word / WPS，见工具栏「打开方式」）
+ * 同样不注册为系统默认打开程序，避免劫持 Office 关联
+ */
+export const DOCUMENT_EXTENSIONS = ["docx"];
+
+/**
  * 电子表格扩展名：由 Rust 侧 calamine 解析，**只读**查看
  * （xlsx / xls / xlsb / ods，不注册为系统默认打开程序，避免劫持 Office 关联）
  */

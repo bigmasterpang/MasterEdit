@@ -1,0 +1,4685 @@
+//! DOCX 只读查看：解密 → 解包 → OOXML 解析成「块模型」。
+//!
+//! 设计要点（详见 `docs/plan-docx.md`）：
+//! 1. **只读**：不写回文件，因此没有"改写 OOXML 弄坏文档"的风险；也不产生临时文件；
+//! 2. **企业加密透明**：复用 `office::read_raw_and_plain`（亿赛通等在内存里解密，
+//!    **绝不落明文临时文件**）；
+//! 3. **不认识的节点不丢**：解析成块模型，无法呈现的对象（SmartArt / 图表 / OLE /
+//!    文本框 / OMML 公式 / altChunk）保留为「占位块 + 中文说明」，而不是静默跳过；
+//! 4. **绝不 panic**：XML 损坏、部件缺失、关系缺失、索引越界一律降级处理（`Option`/`Result` 兜底）；
+//! 5. 解析与渲染分离：这里只产出结构化数据，前端负责排版（结构忠实，不追求像素级还原）。
+//!
+//! 样式继承链（决定"像不像"的就是它）。两条链都按"从最内层往外找"的顺序解析，
+//! 每个属性取第一个明确写了值的层：
+//! ```text
+//! 字符属性（字体/字号/颜色/粗斜体/下划线）：run 的 rPr → 字符样式(含 basedOn)
+//!     → 段落标记的 rPr(pPr/rPr) → 段落样式(含 basedOn 逐级) → docDefaults/rPr
+//! 段落属性（对齐/缩进/间距/大纲级别）：直接 pPr → 编号级别自带的缩进
+//!     → 段落样式(含 basedOn 逐级) → docDefaults/pPr
+//! ```
+//!
+//! 真实样本（WPS 导出的周报）里 `docDefaults` 只写了 **主题字体**（`w:asciiTheme="minorHAnsi"`），
+//! 一个具体字体名都没有 —— 所以必须连 `word/theme/theme1.xml` 的 `a:fontScheme` 一起解析，
+//! 否则整篇文档的字体都是空的（"等线"这个词在这份文档的 document.xml / styles.xml 里
+//! 一次都没出现，只在 theme1.xml 里有）。
+
+use std::collections::HashMap;
+use std::io::{Cursor, Read};
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use serde::Serialize;
+use zip::ZipArchive;
+
+use super::{file, office};
+
+/* ================================================================================== */
+/* 一、块模型：序列化给前端的数据结构（前端按 kind 分派渲染）                          */
+/* ================================================================================== */
+
+/// 文档中的一个有序块。JSON 里带 `kind` 判别字段（`paragraph` / `table` / `image` /
+/// `pageBreak` / `unsupported`），字段名统一 camelCase，前端可以直接写成 TS 联合类型。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum Block {
+    /// 普通段落（含表格单元格里的段落）
+    Paragraph(ParagraphBlock),
+    /// 表格（行 × 单元格，单元格里是块列表，可含嵌套表格）
+    Table(TableBlock),
+    /// 独立成块的图片：段落里没有文字、只有图片时，一张图一个块
+    Image(ImageBlock),
+    /// 显式分页符（`<w:br w:type="page"/>` 独占一段时）
+    PageBreak,
+    /// 无法呈现的对象 —— **绝不静默丢失**，前端显示占位卡片 + 中文说明
+    Unsupported { label: String, detail: String },
+}
+
+/// 段落块。所有长度单位已换算成 **pt / px**（XML 里的 twip、半磅、EMU 都已折算）。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphBlock {
+    /// 段落样式名（`w:pStyle` 指向的样式在 `w:name` 里显示的名字，如「heading 4」）
+    pub style: Option<String>,
+    /// 段落样式 id（`w:pStyle@w:val`，WPS 里常是 `4`/`a9` 这种）
+    pub style_id: Option<String>,
+    /// 段落内的文本片段
+    pub runs: Vec<Run>,
+    /// 段落纯文本（各 run 文本拼接，`\n`=软换行、`\t`=制表符）；查找与"复制全部文本"直接用它
+    pub text: String,
+    /// 对齐：left / center / right / both（两端对齐）/ distribute
+    pub align: Option<String>,
+    /// 左缩进（pt）
+    pub indent_left_pt: Option<f32>,
+    /// 右缩进（pt）
+    pub indent_right_pt: Option<f32>,
+    /// 首行缩进（pt，**负值表示悬挂缩进**，列表常用）
+    pub indent_first_line_pt: Option<f32>,
+    /// 段前间距（pt）
+    pub space_before_pt: Option<f32>,
+    /// 段后间距（pt）
+    pub space_after_pt: Option<f32>,
+    /// 行距
+    pub line_spacing: Option<LineSpacing>,
+    /// 列表（项目符号 / 编号）信息，含该段应显示的前缀文本
+    pub list: Option<ListInfo>,
+    /// 大纲级别 0..8（标题样式 → 前端大纲侧栏用）
+    pub outline_level: Option<u8>,
+    /// `w:pageBreakBefore`：段前分页
+    pub page_break_before: bool,
+    /// 段落内部含分页符（与文字混排时；独占一段时整个块是 [`Block::PageBreak`]）
+    pub page_break: bool,
+    /// 分节符类型（nextPage / continuous / evenPage / oddPage）；有值时前端可画一条淡色"分页提示线"
+    pub section_break: Option<String>,
+}
+
+/// 行距。`multiple` 时 value 是倍数（1.0 = 单倍），`exact`/`atLeast` 时 value 是 pt。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineSpacing {
+    pub kind: String,
+    pub value: f32,
+}
+
+/// 列表信息：前缀文本已经算好（含多级编号的父级计数）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListInfo {
+    /// `w:numId`
+    pub num_id: u32,
+    /// `w:ilvl`（0 起）
+    pub level: u8,
+    /// 有序（编号 1. /（一）/ 1.1）还是无序（项目符号 •）
+    pub ordered: bool,
+    /// 该段应显示的前缀文本，例如 `•` / `1.` / `1.1` / `（一）`；项目符号级就是那个符号
+    pub prefix: String,
+    /// `w:numFmt` 原值（decimal / bullet / chineseCounting …；未知时原样给出）
+    pub format: String,
+    /// 标记与正文之间的间隔方式：tab / space / nothing（`w:suff`）
+    pub suffix: String,
+}
+
+/// 文本片段（run）。布尔值都是"最终生效"的结果，不是原始值。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Run {
+    pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    /// 西文字体（`w:rFonts/@w:ascii`→`@w:hAnsi`，含主题字体解析）
+    pub font: Option<String>,
+    /// 中日韩字体（`w:rFonts/@w:eastAsia`，含主题字体解析）；中文按它渲染
+    pub font_east_asia: Option<String>,
+    /// 字号（pt；文档里是半磅，故 ÷2）
+    pub size_pt: Option<f32>,
+    /// 文字颜色（RRGGBB，`w:color`；`auto` 视为未指定）
+    pub color: Option<String>,
+    /// 高亮或底纹（RRGGBB，`w:highlight` → `w:shd@w:fill`）
+    pub highlight: Option<String>,
+    /// superscript / subscript（`w:vertAlign`）
+    pub vert_align: Option<String>,
+    /// 字符样式 id（`w:rStyle@w:val`）
+    pub style_id: Option<String>,
+}
+
+/// 表格块
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableBlock {
+    pub rows: Vec<TableRow>,
+    /// 列宽（px，来自 `w:tblGrid`；文档里没写就是空数组）
+    pub columns: Vec<f32>,
+    /// 表格总宽（px，仅当 `w:tblW` 用 dxa/twip 给出时才有）
+    pub width_px: Option<f32>,
+    /// 表格对齐：left / center / right
+    pub align: Option<String>,
+    /// 表格是否有可见边框（表格边框 + 任一单元格边框，两者取或）
+    pub borders: bool,
+    /// 表格样式 id（`w:tblStyle@w:val`）
+    pub style_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableRow {
+    pub cells: Vec<TableCell>,
+    /// 行高（px，`w:trHeight`；`hRule="auto"` 时它是最小高度）
+    pub height_px: Option<f32>,
+    /// `w:tblHeader`：跨页重复的表头行
+    pub header: bool,
+}
+
+/// 表格单元格。合并信息按 OOXML 原样给出：
+/// - `grid_span > 1`：横向合并了这么多列
+/// - `v_merge = restart`：纵向合并的**起点**；后续同列的 `continue` 表示"和上面是同一格"
+///   （前端据此算 rowspan，continue 单元格一般不重复渲染内容）
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableCell {
+    /// 单元格内的块（多个段落，甚至嵌套表格）
+    pub blocks: Vec<Block>,
+    /// 单元格纯文本（各段用 `\n` 连接）；「复制表格为制表符文本」直接用
+    pub text: String,
+    /// 横向合并列数（`w:gridSpan`，至少 1）
+    pub grid_span: usize,
+    pub v_merge: VMerge,
+    /// 单元格宽度（px，仅当 `w:tcW` 用 dxa 给出时）
+    pub width_px: Option<f32>,
+    /// 底纹（RRGGBB，`w:shd@w:fill`）
+    pub shading: Option<String>,
+    /// 垂直对齐：top / center / bottom
+    pub v_align: Option<String>,
+    /// 单元格四条边是否有可见边框（已把表格级 `w:tblBorders` 作为兜底算进来）
+    pub borders: CellBorders,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VMerge {
+    #[default]
+    None,
+    /// 纵向合并的起点（`<w:vMerge w:val="restart"/>`）
+    Restart,
+    /// 纵向合并的延续（`<w:vMerge/>` 或 `w:val="continue"`）
+    Continue,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CellBorders {
+    pub top: bool,
+    pub left: bool,
+    pub bottom: bool,
+    pub right: bool,
+}
+
+/// 图片块（`word/media/` 里的媒体文件；前端走已有 asset 协议按需取）
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageBlock {
+    /// 包内路径，如 `word/media/image1.png`
+    pub media: String,
+    /// `wp:docPr@name`（原始插入名，Word 里是「图片 1」）
+    pub name: Option<String>,
+    /// 替代文本（`wp:docPr@descr`）
+    pub alt: Option<String>,
+    /// 显示宽（px，EMU ÷ 9525）
+    pub width_px: f32,
+    /// 显示高（px）
+    pub height_px: f32,
+}
+
+/// `document_blocks` 的返回：窗口化的块 + 总数（前端虚拟滚动用）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockPage {
+    /// 文档里的块总数（**含表格单元格内的块**不参与，这里只算顶层块）
+    pub total: usize,
+    /// 实际返回的起始下标（已夹到 [0, total]）
+    pub from: usize,
+    pub blocks: Vec<Block>,
+    /// 是否为亿赛通等透明加密文档（已在内存中解密）
+    pub encrypted: bool,
+}
+
+/// 一处查找命中（块级：一个块最多一条，`block` 是顶层块下标，供前端滚动定位）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindHit {
+    /// 顶层块下标（可直接喂给 `document_blocks(from = block)`）
+    pub block: usize,
+    /// 命中处的上下文片段（首尾可能带 `…`）
+    pub text: String,
+}
+
+/// 打开文档时读到的包信息（供状态栏与调试用）
+#[derive(Debug, Serialize)]
+pub struct DocumentInfo {
+    /// 是否为亿赛通等透明加密文档（已在内存中解密）
+    pub encrypted: bool,
+    /// 文档是否可编辑 —— DOCX 目前**一律只读**（编辑交给 Word / WPS，见「打开方式」）
+    pub editable: bool,
+    /// 包内部件（名称 + 原始大小），按大小降序
+    pub parts: Vec<DocumentPart>,
+    /// 段落数（初步统计，用于状态栏显示规模）
+    pub paragraphs: usize,
+    /// 表格数
+    pub tables: usize,
+    /// 图片数（`word/media/` 下的文件数）
+    pub images: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocumentPart {
+    pub name: String,
+    pub size: u64,
+}
+
+/* ================================================================================== */
+/* 二、极简 XML DOM                                                                   */
+/* ================================================================================== */
+
+/// 一个极简 DOM。docx 的 XML 单部件通常几百 KB ~ 几 MB，建成树再按名字查最省心，
+/// 也避免手写状态机在"未知节点"上丢内容。用完即随 `ParsedDocument` 一起释放。
+struct XmlNode {
+    /// **原始限定名**（如 `w:pStyle`），保留下来是为了在占位说明里报出真实节点名
+    name: String,
+    attrs: Vec<(String, String)>,
+    children: Vec<XmlChild>,
+}
+
+enum XmlChild {
+    Elem(XmlNode),
+    Text(String),
+}
+
+/// 取限定名的本地名（`w:pStyle` → `pStyle`）。
+/// 全程按本地名匹配：Word/WPS/严格 ISO 文档的前缀各不相同，按前缀匹配会漏。
+fn local_name(qname: &str) -> &str {
+    match qname.rsplit_once(':') {
+        Some((_, local)) => local,
+        None => qname,
+    }
+}
+
+impl XmlNode {
+    fn local(&self) -> &str {
+        local_name(&self.name)
+    }
+
+    /// 按**限定名**精确取属性（部件内部无前缀的属性用它，如 `Id` / `Target`）
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// 按**本地名**取属性（`w:val` / `r:embed` / `w:w` 都用它）
+    fn attr_local(&self, local: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(key, _)| local_name(key) == local)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn children(&self) -> impl Iterator<Item = &XmlNode> {
+        self.children.iter().filter_map(|child| match child {
+            XmlChild::Elem(node) => Some(node),
+            XmlChild::Text(_) => None,
+        })
+    }
+
+    /// 直接子元素里第一个本地名匹配的
+    fn child(&self, local: &str) -> Option<&XmlNode> {
+        self.children().find(|node| node.local() == local)
+    }
+
+    /// 全部直接子元素里本地名匹配的
+    fn children_named<'a>(&'a self, local: &'a str) -> impl Iterator<Item = &'a XmlNode> + 'a {
+        self.children().filter(move |node| node.local() == local)
+    }
+
+    /// 直接文本子节点拼接（`<w:t>文字</w:t>` 用它取文字）
+    fn texts(&self) -> String {
+        let mut out = String::new();
+        for child in &self.children {
+            if let XmlChild::Text(text) = child {
+                out.push_str(text);
+            }
+        }
+        out
+    }
+
+    /// 深度优先找第一个本地名匹配的后代（**迭代式**，避免深文档递归爆栈）
+    fn find_descendant(&self, local: &str) -> Option<&XmlNode> {
+        let mut stack: Vec<&XmlNode> = self.children().collect();
+        stack.reverse();
+        while let Some(node) = stack.pop() {
+            if node.local() == local {
+                return Some(node);
+            }
+            let mut next: Vec<&XmlNode> = node.children().collect();
+            next.reverse();
+            stack.extend(next);
+        }
+        None
+    }
+
+    /// 后代里是否存在某本地名的节点
+    fn has_descendant(&self, local: &str) -> bool {
+        self.find_descendant(local).is_some()
+    }
+
+    /// 后代里所有 `w:t` / `m:t` 的文字（占位说明里回显"丢掉了什么内容"）。
+    /// 用显式栈按**文档顺序**遍历（递归写法遇到深文档可能爆栈）
+    fn collect_text(&self) -> String {
+        let mut out = String::new();
+        let mut stack: Vec<&XmlNode> = vec![self];
+        while let Some(node) = stack.pop() {
+            if node.local() == "t" {
+                out.push_str(&node.texts());
+                continue;
+            }
+            // 逆序压栈 → 弹出顺序与文档顺序一致
+            let children: Vec<&XmlNode> = node.children().collect();
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+        out
+    }
+}
+
+/// 解析 XML 文本。**损坏的 XML 不返回 Err 而是尽力而为**：能读多少读多少，
+/// 结束标签不匹配、裸 `&` 都容忍（只读查看场景下"少显示一点"远好过"整篇打不开"）。
+fn parse_xml(text: &str) -> Option<XmlNode> {
+    use quick_xml::events::Event;
+
+    if text.trim().is_empty() {
+        return None;
+    }
+    let mut reader = quick_xml::reader::Reader::from_str(text);
+    {
+        let config = reader.config_mut();
+        config.check_end_names = false; // 结束标签名不匹配也继续
+        config.allow_unmatched_ends = true; // 多出来的结束标签直接忽略
+        config.allow_dangling_amp = true; // 裸 & 不报错
+        config.trim_text(false); // 保留 <w:t xml:space="preserve"> 里的空白
+    }
+
+    let mut roots: Vec<XmlNode> = Vec::new();
+    let mut stack: Vec<XmlNode> = Vec::new();
+
+    loop {
+        let event = match reader.read_event() {
+            Ok(event) => event,
+            // 解析不动了就收手：已经读到的部分照常用，绝不 panic
+            Err(_) => break,
+        };
+        match event {
+            Event::Start(start) => stack.push(new_node(&start)),
+            Event::Empty(start) => {
+                let node = new_node(&start);
+                attach(&mut roots, &mut stack, node);
+            }
+            Event::End(_) => {
+                if let Some(node) = stack.pop() {
+                    attach(&mut roots, &mut stack, node);
+                }
+            }
+            Event::Text(text) => push_text(&mut stack, text.into_inner().as_ref()),
+            Event::CData(data) => push_text(&mut stack, data.into_inner().as_ref()),
+            // quick-xml 0.42 把实体引用单独作为事件抛出（`&amp;` / `&#x4E2D;`）
+            Event::GeneralRef(reference) => {
+                push_text(&mut stack, &resolve_entity(reference.into_inner().as_ref()))
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    while let Some(node) = stack.pop() {
+        attach(&mut roots, &mut stack, node);
+    }
+
+    match roots.len() {
+        0 => None,
+        1 => roots.pop(),
+        // 多个根（严重损坏）：合成一个容器，后续按名字仍能找到 w:body
+        _ => Some(XmlNode {
+            name: "#fragment".to_string(),
+            attrs: Vec::new(),
+            children: roots.into_iter().map(XmlChild::Elem).collect(),
+        }),
+    }
+}
+
+/// 从开始标签建节点（属性值做实体反转义；反转义失败就退回原始值，不丢数据）
+fn new_node(start: &quick_xml::events::BytesStart<'_>) -> XmlNode {
+    let mut attrs = Vec::with_capacity(4);
+    for attr in start.attributes().flatten() {
+        let key = attr.key.as_ref().to_string();
+        // normalized_value：属性值按 XML 规范归一化（换行/制表变空格 + 预定义实体反转义）
+        let value = match attr.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
+            Ok(value) => value.into_owned(),
+            Err(_) => attr.value.as_ref().to_string(),
+        };
+        attrs.push((key, value));
+    }
+    XmlNode {
+        name: start.name().as_ref().to_string(),
+        attrs,
+        children: Vec::new(),
+    }
+}
+
+/// 把节点挂到栈顶（或作为根）
+fn attach(roots: &mut Vec<XmlNode>, stack: &mut [XmlNode], node: XmlNode) {
+    match stack.last_mut() {
+        Some(parent) => parent.children.push(XmlChild::Elem(node)),
+        None => roots.push(node),
+    }
+}
+
+fn push_text(stack: &mut [XmlNode], text: &str) {
+    if let Some(parent) = stack.last_mut() {
+        parent.children.push(XmlChild::Text(text.to_string()));
+    }
+}
+
+/// 实体引用 → 文本（`amp` / `#x4E2D` / …；认不出来就原样保留，不丢字符）
+fn resolve_entity(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix('#') {
+        let code = match rest.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => rest.parse::<u32>().ok(),
+        };
+        return code
+            .and_then(char::from_u32)
+            .map(|ch| ch.to_string())
+            .unwrap_or_default();
+    }
+    match name {
+        "amp" => "&".to_string(),
+        "lt" => "<".to_string(),
+        "gt" => ">".to_string(),
+        "quot" => "\"".to_string(),
+        "apos" => "'".to_string(),
+        other => format!("&{other};"),
+    }
+}
+
+/* ================================================================================== */
+/* 三、样式继承链（docDefaults → 段落样式 basedOn → 字符样式 → 直接格式）              */
+/* ================================================================================== */
+
+/// 字符级属性。全部是 `Option`：`Some` = 这条链上明确写了值，`None` = 没写（继续往下找）。
+/// 颜色/字体/字号都是"最靠内层说了算"，所以用 Option 而不是带默认值的 bool。
+#[derive(Debug, Clone, Default)]
+struct RunProps {
+    font_latin: Option<String>,
+    font_ea: Option<String>,
+    size_half_pt: Option<f32>,
+    color: Option<String>,
+    highlight: Option<String>,
+    bold: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<bool>,
+    strike: Option<bool>,
+    vert_align: Option<String>,
+}
+
+impl RunProps {
+    /// 用 `lower`（优先级更低的一层）补齐自己还没有的字段。
+    /// 层叠时从高优先级往低优先级依次调用，每个字段自然取到最靠内层的值。
+    fn apply_over(&mut self, lower: &RunProps) {
+        fn fill<T: Clone>(slot: &mut Option<T>, lower: &Option<T>) {
+            if slot.is_none() {
+                *slot = lower.clone();
+            }
+        }
+        fill(&mut self.font_latin, &lower.font_latin);
+        fill(&mut self.font_ea, &lower.font_ea);
+        fill(&mut self.size_half_pt, &lower.size_half_pt);
+        fill(&mut self.color, &lower.color);
+        fill(&mut self.highlight, &lower.highlight);
+        fill(&mut self.bold, &lower.bold);
+        fill(&mut self.italic, &lower.italic);
+        fill(&mut self.underline, &lower.underline);
+        fill(&mut self.strike, &lower.strike);
+        fill(&mut self.vert_align, &lower.vert_align);
+    }
+}
+
+/// 段落级属性（长度统一换算成 pt）
+///
+/// 有两类设置**不能**在解析 `w:pPr` 时就算完，必须等整条层叠链走完：
+/// - **字符单位**的缩进（`w:firstLineChars` / `w:leftChars` / `w:hangingChars`）：
+///   1 字符 = 本段**最终生效的字号**，字号要等样式链算完才知道；
+/// - **自动段间距**（`w:beforeAutospacing` / `w:afterAutospacing`）：开了「自动」时段前/段后
+///   要盖掉样式与 docDefaults 里那些常常是 0 的具体值。
+///
+/// 所以这两类先用 `Option` 原样带过来，层叠结束后由 [`ParaProps::resolve_char_indents`] /
+/// [`ParaProps::resolve_autospacing`] 定稿。
+#[derive(Debug, Clone, Default)]
+struct ParaProps {
+    align: Option<String>,
+    indent_left_pt: Option<f32>,
+    indent_right_pt: Option<f32>,
+    first_line_pt: Option<f32>,
+    space_before_pt: Option<f32>,
+    space_after_pt: Option<f32>,
+    line: Option<LineSpacing>,
+    outline_level: Option<u8>,
+    /// `w:leftChars` / `w:startChars`（单位：百分之一字符，200 = 2 字符）
+    left_chars: Option<f32>,
+    /// `w:rightChars` / `w:endChars`
+    right_chars: Option<f32>,
+    /// `w:firstLineChars`（正）或 `-w:hangingChars`（负）
+    first_line_chars: Option<f32>,
+    /// `w:beforeAutospacing`（自动段前间距）
+    auto_before: Option<bool>,
+    /// `w:afterAutospacing`（自动段后间距）
+    auto_after: Option<bool>,
+}
+
+impl ParaProps {
+    fn apply_over(&mut self, lower: &ParaProps) {
+        fn fill<T: Clone>(slot: &mut Option<T>, lower: &Option<T>) {
+            if slot.is_none() {
+                *slot = lower.clone();
+            }
+        }
+        fill(&mut self.align, &lower.align);
+        fill(&mut self.indent_left_pt, &lower.indent_left_pt);
+        fill(&mut self.indent_right_pt, &lower.indent_right_pt);
+        fill(&mut self.first_line_pt, &lower.first_line_pt);
+        fill(&mut self.space_before_pt, &lower.space_before_pt);
+        fill(&mut self.space_after_pt, &lower.space_after_pt);
+        fill(&mut self.line, &lower.line);
+        fill(&mut self.outline_level, &lower.outline_level);
+        fill(&mut self.left_chars, &lower.left_chars);
+        fill(&mut self.right_chars, &lower.right_chars);
+        fill(&mut self.first_line_chars, &lower.first_line_chars);
+        fill(&mut self.auto_before, &lower.auto_before);
+        fill(&mut self.auto_after, &lower.auto_after);
+    }
+
+    /// 把「字符单位」的缩进折算成 pt（用该段**最终生效的字号**）。
+    ///
+    /// 为什么必须等层叠结束：Word / WPS 里「首行缩进 2 字符」是相对本段字号的 ——
+    /// 同一份 XML 在 10.5pt 段落里是 21pt、在 24pt 段落里是 48pt。
+    /// 优先用显式 twips（Word 写文档时会把 Chars 折算成 twips 一起写下来，
+    /// 两者都有时以 twips 为准），只有缺 twips 时才用 Chars 折算 ——
+    /// 有些生成器**只写 Chars**，不折算就会把首行缩进整段丢掉。
+    fn resolve_char_indents(&mut self, font_size_pt: f32) {
+        let per_char = |chars: f32| chars / 100.0 * font_size_pt;
+        if self.indent_left_pt.is_none() {
+            if let Some(chars) = self.left_chars {
+                self.indent_left_pt = Some(per_char(chars));
+            }
+        }
+        if self.indent_right_pt.is_none() {
+            if let Some(chars) = self.right_chars {
+                self.indent_right_pt = Some(per_char(chars));
+            }
+        }
+        if self.first_line_pt.is_none() {
+            if let Some(chars) = self.first_line_chars {
+                self.first_line_pt = Some(per_char(chars));
+            }
+        }
+    }
+
+    /// 自动段间距定稿（`w:beforeAutospacing` / `w:afterAutospacing`）。
+    ///
+    /// Word 里勾上「自动」时，段落对话框的段前/段后显示为 **Auto**：它会**忽略样式与
+    /// docDefaults 里的具体值**（那些值常常是 0，照搬就会比 Word 紧一大截），
+    /// 实际排版约为 [`AUTO_SPACE_PT`]。但段落自己显式写了 `w:before` / `w:after` 时以显式值为准
+    /// （Word 在用户手填数值时会把这个开关关掉，所以两者同时存在属异常文档，按显式值处理更稳）。
+    fn resolve_autospacing(&mut self, explicit_before: bool, explicit_after: bool) {
+        if self.auto_before == Some(true) && !explicit_before {
+            self.space_before_pt = Some(AUTO_SPACE_PT);
+        }
+        if self.auto_after == Some(true) && !explicit_after {
+            self.space_after_pt = Some(AUTO_SPACE_PT);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StyleKind {
+    Paragraph,
+    Character,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+struct StyleDef {
+    /// `w:name`（Word 界面里显示的名字，如 `heading 4`）
+    name: Option<String>,
+    based_on: Option<String>,
+    rpr: RunProps,
+    ppr: ParaProps,
+}
+
+#[derive(Debug, Default)]
+struct StyleSheet {
+    /// `w:docDefaults/w:rPrDefault/w:rPr`
+    doc_rpr: RunProps,
+    /// `w:docDefaults/w:pPrDefault/w:pPr`
+    doc_ppr: ParaProps,
+    styles: HashMap<String, StyleDef>,
+    /// `w:default="1"` 的段落样式（通常是 Normal）：段落没写 `w:pStyle` 时用它
+    default_para_style: Option<String>,
+    /// `w:default="1"` 的字符样式（通常是 Default Paragraph Font）
+    default_char_style: Option<String>,
+}
+
+/// 样式继承最大层数：正常文档 3~5 层，给到 10 足够；
+/// 同时用 visited 集合防止 `basedOn` 成环（WPS/手工改过的文档真出现过）。
+const MAX_STYLE_DEPTH: usize = 10;
+
+/// 「自动段间距」（`w:beforeAutospacing` / `w:afterAutospacing`）的取值。
+/// Word 勾上「自动」后段前/段后显示为 Auto，实际约 14pt（≈0.49cm）；想调只改这一处。
+const AUTO_SPACE_PT: f32 = 14.0;
+
+/// 文档里完全查不到字号时的兜底（中文文档的默认五号字 = 10.5pt）。
+/// 只有「字符单位缩进」需要它：1 字符 = 1 个字号。
+const DEFAULT_FONT_SIZE_PT: f32 = 10.5;
+
+impl StyleSheet {
+    /// `theme` 必须传进来：样式里的 `w:rFonts` 经常**只写主题字体名**（`w:asciiTheme="minorHAnsi"`），
+    /// 拿不到主题就等于整篇没有字体名。
+    fn parse(xml: &str, theme: &Theme) -> StyleSheet {
+        let mut sheet = StyleSheet::default();
+        let Some(root) = parse_xml(xml) else {
+            return sheet;
+        };
+
+        if let Some(defaults) = root.child("docDefaults").or_else(|| root.find_descendant("docDefaults")) {
+            if let Some(rpr) = defaults.child("rPrDefault").and_then(|node| node.child("rPr")) {
+                sheet.doc_rpr = parse_run_props(rpr, theme);
+            }
+            if let Some(ppr) = defaults.child("pPrDefault").and_then(|node| node.child("pPr")) {
+                sheet.doc_ppr = parse_para_props(ppr);
+            }
+        }
+
+        for node in root.children_named("style") {
+            let Some(id) = node.attr_local("val").or_else(|| node.attr_local("styleId")) else {
+                continue;
+            };
+            let kind = match node.attr_local("type") {
+                Some("paragraph") => StyleKind::Paragraph,
+                Some("character") => StyleKind::Character,
+                _ => StyleKind::Other,
+            };
+            // 表格样式 / 编号样式不参与文字排版，直接跳过（省内存也避免误用）
+            if kind == StyleKind::Other {
+                continue;
+            }
+            if matches!(node.attr_local("default"), Some("1") | Some("true") | Some("on")) {
+                match kind {
+                    StyleKind::Paragraph => sheet.default_para_style = Some(id.to_string()),
+                    StyleKind::Character => sheet.default_char_style = Some(id.to_string()),
+                    StyleKind::Other => {}
+                }
+            }
+            let def = StyleDef {
+                name: node.child("name").and_then(|node| node.attr_local("val")).map(str::to_string),
+                based_on: node.child("basedOn").and_then(|node| node.attr_local("val")).map(str::to_string),
+                // 注意：样式里的 rPr 也可能只写主题字体，所以这里必须传主题
+                rpr: node
+                    .child("rPr")
+                    .map(|node| parse_run_props(node, theme))
+                    .unwrap_or_default(),
+                ppr: node.child("pPr").map(parse_para_props).unwrap_or_default(),
+            };
+            sheet.styles.insert(id.to_string(), def);
+        }
+        sheet
+    }
+
+    /// 段落样式的继承链：`[本样式, 父样式, 祖父, …]`，最多 [`MAX_STYLE_DEPTH`] 层，防环。
+    fn chain(&self, style_id: Option<&str>) -> Vec<&StyleDef> {
+        let start = style_id
+            .map(str::to_string)
+            .or_else(|| self.default_para_style.clone());
+        let mut out = Vec::new();
+        let mut visited: Vec<String> = Vec::new();
+        let mut current = start;
+        while let Some(id) = current {
+            if out.len() >= MAX_STYLE_DEPTH || visited.iter().any(|seen| seen == &id) {
+                break;
+            }
+            let Some(def) = self.styles.get(&id) else { break };
+            visited.push(id);
+            out.push(def);
+            current = def.based_on.clone();
+        }
+        out
+    }
+
+    /// 段落样式链给出的字符属性（不含 docDefaults，那层另外兜底）
+    fn chain_rpr(&self, style_id: Option<&str>) -> RunProps {
+        let mut props = RunProps::default();
+        for def in self.chain(style_id) {
+            props.apply_over(&def.rpr);
+        }
+        props
+    }
+
+    /// 段落样式链给出的段落属性
+    fn chain_ppr(&self, style_id: Option<&str>) -> ParaProps {
+        let mut props = ParaProps::default();
+        for def in self.chain(style_id) {
+            props.apply_over(&def.ppr);
+        }
+        props
+    }
+
+    fn style_name(&self, style_id: &str) -> Option<String> {
+        self.styles.get(style_id).and_then(|def| def.name.clone())
+    }
+}
+
+/// 主题（`word/theme/theme1.xml`）里的字体方案。
+/// 真实样本的 `docDefaults` 只写了 `w:asciiTheme="minorHAnsi"`，没有具体字体名 ——
+/// 不解析主题就整篇拿不到字体，这是"看起来不像"最隐蔽的一种原因。
+#[derive(Debug, Clone, Default)]
+struct Theme {
+    major_latin: Option<String>,
+    major_ea: Option<String>,
+    minor_latin: Option<String>,
+    minor_ea: Option<String>,
+}
+
+impl Theme {
+    fn parse(xml: &str) -> Theme {
+        let Some(root) = parse_xml(xml) else {
+            return Theme::default();
+        };
+        let Some(scheme) = root.find_descendant("fontScheme") else {
+            return Theme::default();
+        };
+        Theme {
+            major_latin: scheme.child("majorFont").and_then(|node| typeface(node, "latin")),
+            major_ea: scheme.child("majorFont").and_then(east_asian_typeface),
+            minor_latin: scheme.child("minorFont").and_then(|node| typeface(node, "latin")),
+            minor_ea: scheme.child("minorFont").and_then(east_asian_typeface),
+        }
+    }
+
+    /// `w:asciiTheme="minorHAnsi"` 这类主题字体名 → 真实字体名
+    fn font_for(&self, theme_name: &str) -> Option<String> {
+        match theme_name {
+            "minorHAnsi" | "minorAscii" | "minorBidi" => self.minor_latin.clone(),
+            "majorHAnsi" | "majorAscii" | "majorBidi" => self.major_latin.clone(),
+            "minorEastAsia" => self.minor_ea.clone(),
+            "majorEastAsia" => self.major_ea.clone(),
+            _ => None,
+        }
+    }
+}
+
+fn typeface(font_node: &XmlNode, which: &str) -> Option<String> {
+    let value = font_node.child(which)?.attr("typeface")?;
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// 东亚字体：`a:ea` 在 Office 主题里**通常是空串**，此时按简体中文用 `<a:font script="Hans">` 兜底。
+fn east_asian_typeface(font_node: &XmlNode) -> Option<String> {
+    if let Some(name) = typeface(font_node, "ea") {
+        return Some(name);
+    }
+    for script in ["Hans", "Hant", "Jpan", "Hang"] {
+        if let Some(node) = font_node
+            .children_named("font")
+            .find(|node| node.attr("script") == Some(script))
+        {
+            if let Some(name) = node.attr("typeface") {
+                if !name.trim().is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `w:rPr` → 字符属性
+fn parse_run_props(node: &XmlNode, theme: &Theme) -> RunProps {
+    let mut props = RunProps::default();
+
+    if let Some(fonts) = node.child("rFonts") {
+        // 显式字体名优先；只写了主题字体名时查主题表
+        props.font_latin = fonts
+            .attr_local("ascii")
+            .or_else(|| fonts.attr_local("hAnsi"))
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                fonts
+                    .attr_local("asciiTheme")
+                    .or_else(|| fonts.attr_local("hAnsiTheme"))
+                    .and_then(|name| theme.font_for(name))
+            });
+        props.font_ea = fonts
+            .attr_local("eastAsia")
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                fonts
+                    .attr_local("eastAsiaTheme")
+                    .and_then(|name| theme.font_for(name))
+            });
+    }
+
+    props.bold = on_off(node.child("b"));
+    props.italic = on_off(node.child("i"));
+    props.strike = on_off(node.child("strike")).or_else(|| on_off(node.child("dstrike")));
+    // 下划线：`w:u` 不带 val 就是单下划线；val="none" 才是明确取消
+    props.underline = node.child("u").map(|under| {
+        !matches!(under.attr_local("val"), Some("none") | Some("0") | Some("false"))
+    });
+
+    if let Some(size) = node.child("sz").and_then(|size| number(size.attr_local("val"))) {
+        // 半磅 → pt
+        if size > 0.0 {
+            props.size_half_pt = Some(size);
+        }
+    }
+
+    if let Some(color) = node.child("color").and_then(|color| color.attr_local("val")) {
+        props.color = normalize_color(color);
+    }
+
+    // 高亮（文字荧光笔）优先；没有就看底纹填充
+    if let Some(highlight) = node.child("highlight").and_then(|node| node.attr_local("val")) {
+        props.highlight = highlight_color(highlight);
+    }
+    if props.highlight.is_none() {
+        if let Some(fill) = node.child("shd").and_then(|node| node.attr_local("fill")) {
+            props.highlight = normalize_color(fill);
+        }
+    }
+
+    if let Some(align) = node.child("vertAlign").and_then(|node| node.attr_local("val")) {
+        match align {
+            "superscript" | "subscript" => props.vert_align = Some(align.to_string()),
+            _ => {}
+        }
+    }
+
+    props
+}
+
+/// `w:pPr` → 段落属性
+fn parse_para_props(node: &XmlNode) -> ParaProps {
+    let mut props = ParaProps::default();
+
+    if let Some(align) = node.child("jc").and_then(|node| node.attr_local("val")) {
+        props.align = Some(align.to_string());
+    }
+
+    if let Some(indent) = node.child("ind") {
+        // 严格 ISO 文档用 start/end，Word 用 left/right
+        props.indent_left_pt = twips_to_pt(indent.attr_local("left").or_else(|| indent.attr_local("start")));
+        props.indent_right_pt = twips_to_pt(indent.attr_local("right").or_else(|| indent.attr_local("end")));
+        // 首行缩进与悬挂缩进互斥：悬挂为负的首行缩进
+        let hanging_twips = twips_to_pt(indent.attr_local("hanging"));
+        if let Some(hanging) = hanging_twips {
+            props.first_line_pt = Some(-hanging);
+        } else {
+            props.first_line_pt = twips_to_pt(indent.attr_local("firstLine"));
+        }
+        // 字符单位（百分之一字符）：层叠结束后按最终字号折算，见 ParaProps::resolve_char_indents
+        props.left_chars = number(indent.attr_local("leftChars").or_else(|| indent.attr_local("startChars")));
+        props.right_chars = number(indent.attr_local("rightChars").or_else(|| indent.attr_local("endChars")));
+        props.first_line_chars = match number(indent.attr_local("hangingChars")) {
+            Some(hanging) => Some(-hanging),
+            None => number(indent.attr_local("firstLineChars")),
+        };
+    }
+
+    if let Some(spacing) = node.child("spacing") {
+        props.space_before_pt = twips_to_pt(spacing.attr_local("before"));
+        props.space_after_pt = twips_to_pt(spacing.attr_local("after"));
+        // 自动段间距：`w:beforeAutospacing` / `w:afterAutospacing` 是 w:spacing 的**属性**；
+        // 先记开关，层叠结束后定稿（见 ParaProps::resolve_autospacing）
+        props.auto_before = attr_on_off(spacing, "beforeAutospacing");
+        props.auto_after = attr_on_off(spacing, "afterAutospacing");
+        if let Some(line) = number(spacing.attr_local("line")) {
+            let rule = spacing.attr_local("lineRule").unwrap_or("auto");
+            let value = match rule {
+                // auto：240 = 单倍行距
+                "auto" => line / 240.0,
+                _ => line / 20.0, // exact / atLeast：twip → pt
+            };
+            props.line = Some(LineSpacing {
+                kind: match rule {
+                    "auto" => "multiple".to_string(),
+                    other => other.to_string(),
+                },
+                value,
+            });
+        }
+    }
+
+    if let Some(level) = node
+        .child("outlineLvl")
+        .and_then(|node| number(node.attr_local("val")))
+    {
+        if (0.0..=8.0).contains(&level) {
+            props.outline_level = Some(level as u8);
+        }
+    }
+
+    props
+}
+
+/// `<w:b/>` / `<w:b w:val="0"/>` → Some(true/false)；节点不存在 → None（没表态）
+fn on_off(node: Option<&XmlNode>) -> Option<bool> {
+    let node = node?;
+    match node.attr_local("val") {
+        None => Some(true),
+        Some("0") | Some("false") | Some("off") => Some(false),
+        Some(_) => Some(true),
+    }
+}
+
+/// **属性**形式的开关（`w:beforeAutospacing="1"`）；属性不存在 → None（没表态）
+fn attr_on_off(node: &XmlNode, name: &str) -> Option<bool> {
+    match node.attr_local(name) {
+        None => None,
+        Some("0") | Some("false") | Some("off") => Some(false),
+        Some(_) => Some(true),
+    }
+}
+
+fn number(value: Option<&str>) -> Option<f32> {
+    value?.trim().parse::<f32>().ok()
+}
+
+fn integer(value: Option<&str>) -> Option<i64> {
+    value?.trim().parse::<i64>().ok()
+}
+
+/// twip（1/20 pt）→ pt
+fn twips_to_pt(value: Option<&str>) -> Option<f32> {
+    number(value).map(|twips| twips / 20.0)
+}
+
+/// twip → px（96 dpi：1pt = 4/3 px）
+fn twips_to_px(value: f32) -> f32 {
+    value / 20.0 * 4.0 / 3.0
+}
+
+/// 1 英寸 = 914400 EMU = 96 px → 9525 EMU/px
+fn emu_to_px(value: f32) -> f32 {
+    value / 9525.0
+}
+
+/// `w:color` 值 → RRGGBB；`auto` / 非法值当没写
+fn normalize_color(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    // `w:shd w:val="clear" w:fill="FFFFFF"` 是"没有底纹"的惯用写法，别把整篇刷成白色
+    if value.eq_ignore_ascii_case("FFFFFF") {
+        return None;
+    }
+    let hex: String = value
+        .trim_start_matches('#')
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .collect();
+    match hex.len() {
+        6 => Some(hex.to_uppercase()),
+        3 => Some(hex.chars().flat_map(|c| [c, c]).collect::<String>().to_uppercase()),
+        _ => None,
+    }
+}
+
+/// `w:highlight` 的具名颜色 → RRGGBB
+fn highlight_color(name: &str) -> Option<String> {
+    let hex = match name {
+        "black" => "000000",
+        "blue" => "0000FF",
+        "cyan" => "00FFFF",
+        "darkBlue" => "000080",
+        "darkCyan" => "008080",
+        "darkGray" => "808080",
+        "darkGreen" => "008000",
+        "darkMagenta" => "800080",
+        "darkRed" => "800000",
+        "darkYellow" => "808000",
+        "green" => "00FF00",
+        "lightGray" => "C0C0C0",
+        "magenta" => "FF00FF",
+        "red" => "FF0000",
+        "white" => "FFFFFF",
+        "yellow" => "FFFF00",
+        "none" => return None,
+        other => return normalize_color(other),
+    };
+    Some(hex.to_string())
+}
+
+/* ================================================================================== */
+/* 四、编号与多级列表（numbering.xml）                                                */
+/* ================================================================================== */
+
+/// 某一级编号的定义
+#[derive(Debug, Clone)]
+struct LevelDef {
+    /// `w:start`（默认 1）
+    start: u32,
+    /// `w:numFmt`（decimal / bullet / chineseCounting …）
+    format: String,
+    /// `w:lvlText`，如 `%1.` / `（%1）` / `•`
+    text: String,
+    /// `w:suff`：标记与正文的间隔（tab / space / nothing）
+    suffix: String,
+    /// 该级自带的缩进（作为段落属性的中间层）
+    indent_left_twips: Option<f32>,
+    /// 悬挂缩进（正数，渲染时取负作为首行缩进）
+    hanging_twips: Option<f32>,
+    /// `w:leftChars`（百分之一字符）：层叠后按最终字号折算
+    left_chars: Option<f32>,
+    /// `w:firstLineChars`（正）或 `-w:hangingChars`（负）：同样按最终字号折算
+    first_line_chars: Option<f32>,
+}
+
+impl Default for LevelDef {
+    fn default() -> Self {
+        // 文档里找不到级别定义时的兜底：按最普通的 "1." 处理，绝不让编号整段消失
+        LevelDef {
+            start: 1,
+            format: "decimal".to_string(),
+            text: "%1.".to_string(),
+            suffix: "tab".to_string(),
+            indent_left_twips: None,
+            hanging_twips: None,
+            left_chars: None,
+            first_line_chars: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AbstractNum {
+    /// ilvl → 级别定义（0..8）
+    levels: HashMap<u8, LevelDef>,
+}
+
+#[derive(Debug, Default)]
+struct NumDef {
+    abstract_id: u32,
+    /// `w:lvlOverride/w:lvl`：整级覆盖（WPS/Word 重排编号时会出现）
+    level_overrides: HashMap<u8, LevelDef>,
+    /// `w:lvlOverride/w:startOverride`：只覆盖起始值
+    start_overrides: HashMap<u8, u32>,
+}
+
+#[derive(Debug, Default)]
+struct Numbering {
+    nums: HashMap<u32, NumDef>,
+    abstracts: HashMap<u32, AbstractNum>,
+}
+
+impl Numbering {
+    fn parse(xml: &str) -> Numbering {
+        let mut numbering = Numbering::default();
+        let Some(root) = parse_xml(xml) else {
+            return numbering;
+        };
+
+        for node in root.children_named("abstractNum") {
+            let Some(id) = integer(node.attr_local("abstractNumId")) else {
+                continue;
+            };
+            let mut abstract_num = AbstractNum::default();
+            for level in node.children_named("lvl") {
+                let index = integer(level.attr_local("ilvl")).unwrap_or(0).clamp(0, 8) as u8;
+                abstract_num.levels.insert(index, parse_level(level));
+            }
+            numbering.abstracts.insert(id.max(0) as u32, abstract_num);
+        }
+
+        for node in root.children_named("num") {
+            let Some(id) = integer(node.attr_local("numId")) else {
+                continue;
+            };
+            let mut def = NumDef {
+                abstract_id: node
+                    .child("abstractNumId")
+                    .and_then(|node| integer(node.attr_local("val")))
+                    .unwrap_or(0)
+                    .max(0) as u32,
+                ..NumDef::default()
+            };
+            for over in node.children_named("lvlOverride") {
+                let Some(index) = integer(over.attr_local("ilvl")) else {
+                    continue;
+                };
+                let index = index.clamp(0, 8) as u8;
+                if let Some(level) = over.child("lvl") {
+                    def.level_overrides.insert(index, parse_level(level));
+                }
+                if let Some(start) = over
+                    .child("startOverride")
+                    .and_then(|node| integer(node.attr_local("val")))
+                {
+                    def.start_overrides.insert(index, start.max(0) as u32);
+                }
+            }
+            numbering.nums.insert(id.max(0) as u32, def);
+        }
+        numbering
+    }
+
+    /// 取某一级的定义（级别覆盖 > 抽象编号；都没有就兜底）
+    fn level(&self, num_id: u32, ilvl: u8) -> (LevelDef, u32) {
+        let Some(def) = self.nums.get(&num_id) else {
+            return (LevelDef::default(), 1);
+        };
+        let mut level = def
+            .level_overrides
+            .get(&ilvl)
+            .cloned()
+            .or_else(|| {
+                self.abstracts
+                    .get(&def.abstract_id)
+                    .and_then(|abs| abs.levels.get(&ilvl))
+                    .cloned()
+            })
+            .unwrap_or_default();
+        if let Some(start) = def.start_overrides.get(&ilvl) {
+            level.start = *start;
+        }
+        (level, def.abstract_id)
+    }
+
+    /// 该级自带的缩进 → 段落属性（层叠里位于"段落样式之上、直接格式之下"）
+    fn level_indent(&self, num_id: u32, ilvl: u8) -> ParaProps {
+        let (level, _) = self.level(num_id, ilvl);
+        let mut props = ParaProps::default();
+        props.indent_left_pt = level.indent_left_twips.map(|twips| twips / 20.0);
+        props.first_line_pt = level.hanging_twips.map(|twips| -twips / 20.0);
+        // 有些生成器在编号级别上只写 Chars：一起带上，等层叠结束按最终字号折算
+        props.left_chars = level.left_chars;
+        props.first_line_chars = level.first_line_chars;
+        props
+    }
+}
+
+fn parse_level(node: &XmlNode) -> LevelDef {
+    let mut level = LevelDef::default();
+    if let Some(start) = integer(node.child("start").and_then(|node| node.attr_local("val"))) {
+        level.start = start.max(0) as u32;
+    }
+    if let Some(format) = node.child("numFmt").and_then(|node| node.attr_local("val")) {
+        level.format = format.to_string();
+    }
+    if let Some(text) = node.child("lvlText").and_then(|node| node.attr_local("val")) {
+        level.text = text.to_string();
+    }
+    if let Some(suffix) = node.child("suff").and_then(|node| node.attr_local("val")) {
+        level.suffix = suffix.to_string();
+    }
+    if let Some(indent) = node.child("pPr").and_then(|node| node.child("ind")) {
+        level.indent_left_twips = number(indent.attr_local("left").or_else(|| indent.attr_local("start")));
+        level.hanging_twips = number(
+            indent
+                .attr_local("hanging")
+                .or_else(|| indent.attr_local("firstLine")),
+        );
+        // 字符单位同理（编号级别的缩进也可能是「2 字符」）
+        level.left_chars = number(
+            indent
+                .attr_local("leftChars")
+                .or_else(|| indent.attr_local("startChars")),
+        );
+        level.first_line_chars = match number(indent.attr_local("hangingChars")) {
+            Some(hanging) => Some(-hanging),
+            None => number(indent.attr_local("firstLineChars")),
+        };
+    }
+    level
+}
+
+/// 编号计数器：`(numId, ilvl) → 当前值`。
+///
+/// 为什么要按 numId 分别计数：`w:num` 才是"一套独立的编号"（同一 abstractNum 可以被多个
+/// numId 复用，各自从头数），所以计数器必须挂在 numId 上而不是 abstractNumId 上，
+/// 否则两个都指向 abstractNum 8 的列表会被串成一条连续编号。
+#[derive(Debug, Default)]
+struct NumberingState {
+    counters: HashMap<(u32, u8), u32>,
+}
+
+impl NumberingState {
+    /// 推进一级并算出该段要显示的前缀文本
+    fn next(&mut self, numbering: &Numbering, num_id: u32, ilvl: u8) -> ListInfo {
+        let (level, _) = numbering.level(num_id, ilvl);
+        let start = level.start.max(1);
+
+        let counter = self.counters.entry((num_id, ilvl)).or_insert(start - 1);
+        *counter = counter.saturating_add(1);
+
+        // 更深的级别重新计数：1.1 之后的 1.2 出现时，2.1 必须从头开始
+        self.counters
+            .retain(|(other_num, other_level), _| !(*other_num == num_id && *other_level > ilvl));
+
+        let prefix = self.render(&level.text, numbering, num_id);
+        let ordered = !matches!(level.format.as_str(), "bullet" | "none");
+        ListInfo {
+            num_id,
+            level: ilvl,
+            ordered,
+            prefix,
+            format: level.format.clone(),
+            suffix: level.suffix.clone(),
+        }
+    }
+
+    /// `%N` → 第 N 级（1 起）的编号文本；父级没用过时按它的 start 显示。
+    /// 项目符号级的 `lvlText` 就是符号本身（`•` / `` / `o`），不含 `%N`，会原样带出。
+    fn render(&self, text: &str, numbering: &Numbering, num_id: u32) -> String {
+        let mut out = String::with_capacity(text.len() + 4);
+        let chars: Vec<char> = text.chars().collect();
+        let mut index = 0;
+        while index < chars.len() {
+            let ch = chars[index];
+            if ch == '%' && index + 1 < chars.len() && chars[index + 1].is_ascii_digit() {
+                let level_index = chars[index + 1] as u8 - b'0';
+                if (1..=9).contains(&level_index) {
+                    let target = level_index - 1;
+                    let (level, _) = numbering.level(num_id, target);
+                    let value = self
+                        .counters
+                        .get(&(num_id, target))
+                        .copied()
+                        // 父级还没出现过：按它的起始值显示（与 Word 的观感一致）
+                        .unwrap_or_else(|| level.start.max(1));
+                    out.push_str(&format_value(&level.format, value));
+                    index += 2;
+                    continue;
+                }
+            }
+            out.push(ch);
+            index += 1;
+        }
+        out
+    }
+}
+
+/// 编号格式 → 文本。未知格式退回阿拉伯数字（宁可显示成 "1." 也不要空着）。
+fn format_value(format: &str, value: u32) -> String {
+    match format {
+        "bullet" | "none" => String::new(),
+        "decimal" => value.to_string(),
+        "decimalZero" => format!("{value:02}"),
+        "lowerLetter" => latin_letters(value, false),
+        "upperLetter" => latin_letters(value, true),
+        "lowerRoman" => roman(value, false),
+        "upperRoman" => roman(value, true),
+        "ordinal" => ordinal(value),
+        "decimalFullWidth" => value
+            .to_string()
+            .chars()
+            .map(|ch| char::from_u32(0xFF10 + (ch as u32 - '0' as u32)).unwrap_or(ch))
+            .collect(),
+        "decimalEnclosedCircle" | "decimalEnclosedCircleChinese" => enclosed(value, 0x2460),
+        "decimalEnclosedParen" => enclosed(value, 0x2474),
+        "decimalEnclosedFullstop" => enclosed(value, 0x2488),
+        "chineseCounting"
+        | "chineseCountingThousand"
+        | "chineseLegalSimplified"
+        | "ideographDigital"
+        | "ideographTraditional"
+        | "japaneseCounting"
+        | "japaneseDigitalTenThousand"
+        | "japaneseLegal"
+        | "koreanCounting"
+        | "koreanDigital"
+        | "taiwaneseCounting"
+        | "taiwaneseCountingThousand" => cjk_number(value),
+        _ => value.to_string(),
+    }
+}
+
+/// 1 → a、26 → z、27 → aa（Word 的 lowerLetter/upperLetter 规则）
+fn latin_letters(value: u32, upper: bool) -> String {
+    let mut value = value.max(1);
+    let mut out = Vec::new();
+    while value > 0 {
+        let rem = ((value - 1) % 26) as u8;
+        out.push((b'a' + rem) as char);
+        value = (value - 1) / 26;
+    }
+    out.reverse();
+    let text: String = out.into_iter().collect();
+    if upper {
+        text.to_uppercase()
+    } else {
+        text
+    }
+}
+
+fn roman(value: u32, upper: bool) -> String {
+    const TABLE: [(u32, &str); 13] = [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut value = value.min(3999);
+    let mut out = String::new();
+    for (amount, symbol) in TABLE {
+        while value >= amount {
+            out.push_str(symbol);
+            value -= amount;
+        }
+    }
+    if upper {
+        out.to_uppercase()
+    } else {
+        out
+    }
+}
+
+fn ordinal(value: u32) -> String {
+    let suffix = if (11..=13).contains(&(value % 100)) {
+        "th"
+    } else {
+        match value % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        }
+    };
+    format!("{value}{suffix}")
+}
+
+/// 带圈/带括号数字（① ⑴ ⒈）：Unicode 块里只排到 20，超出就退回普通数字
+fn enclosed(value: u32, base: u32) -> String {
+    if (1..=20).contains(&value) {
+        if let Some(ch) = char::from_u32(base + value - 1) {
+            return ch.to_string();
+        }
+    }
+    value.to_string()
+}
+
+/// 中文数字（一、十、二十三、一百零五…）；用于 chineseCounting / japaneseCounting 等。
+/// 这些格式在 Word 里的差异只在"万以上怎么读"，本项目只到千位，取最通用的一套。
+fn cjk_number(value: u32) -> String {
+    const DIGITS: [char; 10] = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+    const UNITS: [char; 4] = [' ', '十', '百', '千'];
+    if value == 0 {
+        return "零".to_string();
+    }
+    if value >= 10000 {
+        // 万以上：递归处理"万"位（编号极少超过 9999，这里只是别显示成乱码）
+        let high = value / 10000;
+        let low = value % 10000;
+        let mut out = cjk_number(high);
+        out.push('万');
+        if low > 0 {
+            if low < 1000 {
+                out.push('零');
+            }
+            out.push_str(&cjk_number(low));
+        }
+        return out;
+    }
+    let digits: Vec<u32> = value
+        .to_string()
+        .chars()
+        .filter_map(|ch| ch.to_digit(10))
+        .collect();
+    let mut out = String::new();
+    let len = digits.len();
+    for (index, digit) in digits.iter().enumerate() {
+        let unit_index = len - index - 1;
+        if *digit == 0 {
+            // 连续的 0 只写一个"零"，且末尾的 0 不写
+            if !out.ends_with('零') && index + 1 < len {
+                out.push('零');
+            }
+            continue;
+        }
+        if !(*digit == 1 && unit_index == 1 && index == 0) {
+            // 十、十一 里的"一十"按中文习惯简写成"十"
+            out.push(DIGITS[*digit as usize]);
+        }
+        if unit_index > 0 {
+            out.push(UNITS[unit_index]);
+        }
+    }
+    if out.is_empty() {
+        "零".to_string()
+    } else {
+        out
+    }
+}
+
+/* ================================================================================== */
+/* 五、关系与媒体（document.xml.rels）                                                */
+/* ================================================================================== */
+
+#[derive(Debug, Clone, Default)]
+struct RelInfo {
+    /// 解析后的包内路径（`media/image1.png` → `word/media/image1.png`）
+    target: String,
+    /// 关系类型（URI 末段：image / chart / oleObject / hyperlink …）
+    kind: String,
+    /// `TargetMode="External"`：目标是外部 URL，不在包里
+    external: bool,
+}
+
+/// 解析 `word/_rels/document.xml.rels`
+fn parse_rels(xml: &str) -> HashMap<String, RelInfo> {
+    let mut out = HashMap::new();
+    let Some(root) = parse_xml(xml) else {
+        return out;
+    };
+    for node in root.children_named("Relationship") {
+        let Some(id) = node.attr("Id") else { continue };
+        let target = node.attr("Target").unwrap_or_default();
+        let kind = node
+            .attr("Type")
+            .map(|uri| uri.rsplit('/').next().unwrap_or(uri).to_string())
+            .unwrap_or_default();
+        let external = node.attr("TargetMode") == Some("External");
+        out.insert(
+            id.to_string(),
+            RelInfo {
+                target: if external {
+                    target.to_string()
+                } else {
+                    resolve_part_path("word", target)
+                },
+                kind,
+                external,
+            },
+        );
+    }
+    out
+}
+
+/// `Target` 相对部件目录的路径 → 包内绝对路径（`../customXml/item1.xml` → `customXml/item1.xml`）
+fn resolve_part_path(base_dir: &str, target: &str) -> String {
+    let target = target.replace('\\', "/");
+    let joined = if let Some(absolute) = target.strip_prefix('/') {
+        absolute.to_string()
+    } else if base_dir.is_empty() {
+        target.clone()
+    } else {
+        format!("{base_dir}/{target}")
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in joined.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+/* ================================================================================== */
+/* 六、块构建器                                                                       */
+/* ================================================================================== */
+
+/// 单元格没有明确尺寸时的图片兜底显示尺寸（px）—— 宁可给个可见的占位尺寸，
+/// 也不要算出 0×0 让图片"消失"。
+const FALLBACK_IMAGE_PX: (f32, f32) = (320.0, 200.0);
+
+/// 段落里的行内内容收集结果
+#[derive(Default)]
+struct ParagraphContent {
+    runs: Vec<Run>,
+    images: Vec<ImageBlock>,
+    unsupported: Vec<Block>,
+    /// 段落里出现过 `<w:br w:type="page"/>`
+    page_break: bool,
+}
+
+impl ParagraphContent {
+    fn is_empty(&self) -> bool {
+        self.runs.is_empty() && self.images.is_empty() && self.unsupported.is_empty() && !self.page_break
+    }
+}
+
+struct DocBuilder<'a> {
+    styles: &'a StyleSheet,
+    numbering: &'a Numbering,
+    theme: &'a Theme,
+    rels: &'a HashMap<String, RelInfo>,
+    numbering_state: NumberingState,
+    /// 文档里的 `w:p` 元素总数（含表格单元格内的），用于与 `document_info` 对账
+    paragraph_count: usize,
+}
+
+impl<'a> DocBuilder<'a> {
+    fn new(
+        styles: &'a StyleSheet,
+        numbering: &'a Numbering,
+        theme: &'a Theme,
+        rels: &'a HashMap<String, RelInfo>,
+    ) -> Self {
+        DocBuilder {
+            styles,
+            numbering,
+            theme,
+            rels,
+            numbering_state: NumberingState::default(),
+            paragraph_count: 0,
+        }
+    }
+
+    /// 容器（body / tc / sdtContent）的直接子元素 → 有序块
+    fn collect_blocks(&mut self, container: &XmlNode, out: &mut Vec<Block>) {
+        for child in container.children() {
+            match child.local() {
+                "p" => self.push_paragraph(child, out),
+                "tbl" => out.push(self.build_table(child)),
+                "sdt" => {
+                    // 内容控件：真正的内容在 w:sdtContent 里，直接展开，别把文字丢了
+                    if let Some(content) = child.child("sdtContent") {
+                        self.collect_blocks(content, out);
+                    }
+                }
+                "altChunk" => {
+                    let detail = child
+                        .attr_local("id")
+                        .map(|id| format!("引用的外部内容关系：{id}"))
+                        .unwrap_or_else(|| "文档引用了未嵌入的外部内容".to_string());
+                    out.push(unsupported("嵌入的外部内容（altChunk，暂不支持显示）", detail));
+                }
+                // 纯元数据/锚点：跳过不算丢失
+                "sectPr" | "bookmarkStart" | "bookmarkEnd" | "proofErr" | "permStart" | "permEnd"
+                | "commentRangeStart" | "commentRangeEnd" | "customXmlInsRangeStart"
+                | "customXmlInsRangeEnd" | "customXmlDelRangeStart" | "customXmlDelRangeEnd"
+                | "customXmlMoveFromRangeStart" | "customXmlMoveFromRangeEnd" => {}
+                // 修订：显示最终态 —— w:ins 里的内容要显示，w:del 里的不显示
+                "ins" | "moveTo" | "smartTag" | "customXml" => self.collect_blocks(child, out),
+                "del" | "moveFrom" => {}
+                _ => {
+                    // 不认识的容器：只要它直接装着段落/表格就展开（WPS 常见各种包装节点）
+                    if child
+                        .children()
+                        .any(|grand| matches!(grand.local(), "p" | "tbl"))
+                    {
+                        self.collect_blocks(child, out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 一个 `w:p` → 1 个或多个块（图片/占位对象会单独成块）
+    fn push_paragraph(&mut self, node: &XmlNode, out: &mut Vec<Block>) {
+        self.paragraph_count += 1;
+
+        let style_id = node
+            .child("pPr")
+            .and_then(|ppr| ppr.child("pStyle"))
+            .and_then(|style| style.attr_local("val"))
+            .map(str::to_string);
+
+        // ---- 编号：先把 numId/ilvl 读出来，编号级别的缩进要参与段落属性层叠 ----
+        let num_pr = node.child("pPr").and_then(|ppr| ppr.child("numPr"));
+        let num_id = num_pr
+            .and_then(|num| num.child("numId"))
+            .and_then(|num| integer(num.attr_local("val")));
+        let ilvl = num_pr
+            .and_then(|num| num.child("ilvl"))
+            .and_then(|num| integer(num.attr_local("val")))
+            .unwrap_or(0)
+            .clamp(0, 8) as u8;
+
+        // numId=0 是"取消编号"（Word 用 0 表示无编号）
+        let list = match num_id {
+            Some(id) if id > 0 => Some(
+                self.numbering_state
+                    .next(self.numbering, id.max(0) as u32, ilvl),
+            ),
+            _ => None,
+        };
+        let numbering_ppr = match &list {
+            Some(info) => self.numbering.level_indent(info.num_id, info.level),
+            None => ParaProps::default(),
+        };
+
+        // ---- 段落属性层叠：直接格式 → 编号级别缩进 → 段落样式（basedOn 逐级）→ docDefaults ----
+        let direct_ppr = node.child("pPr").map(parse_para_props).unwrap_or_default();
+        // 段落自己显式写了段前/段后吗？自动段间距遇到显式值要让位（见 resolve_autospacing）
+        let explicit_before = direct_ppr.space_before_pt.is_some();
+        let explicit_after = direct_ppr.space_after_pt.is_some();
+        let mut ppr = direct_ppr;
+        ppr.apply_over(&numbering_ppr);
+        ppr.apply_over(&self.styles.chain_ppr(style_id.as_deref()));
+        ppr.apply_over(&self.styles.doc_ppr);
+
+        // ---- 字符属性基线（给没有自己 rPr 的 run 用）：段落标记的 rPr → 段落样式链 → docDefaults
+        //      `w:pPr/w:rPr` 是"段落标记"的格式，Word 把它当作本段文字默认格式；
+        //      很多文档（尤其 WPS）靠它给整段设字体字号，漏掉就会"字号不对"。----
+        let mut base_rpr = node
+            .child("pPr")
+            .and_then(|ppr| ppr.child("rPr"))
+            .map(|rpr| parse_run_props(rpr, self.theme))
+            .unwrap_or_default();
+        base_rpr.apply_over(&self.styles.chain_rpr(style_id.as_deref()));
+        base_rpr.apply_over(&self.styles.doc_rpr);
+
+        // ---- 两类"必须等层叠结束"的段落设置在这里定稿 ----
+        // 1) 字符单位缩进：1 字符 = 本段最终生效的字号（段落标记 rPr → 样式链 → docDefaults）
+        let font_size_pt = base_rpr
+            .size_half_pt
+            .map(|half| half / 2.0)
+            .unwrap_or(DEFAULT_FONT_SIZE_PT);
+        ppr.resolve_char_indents(font_size_pt);
+        // 2) 自动段间距（Auto）：盖掉样式/docDefaults 里那些常常是 0 的具体值
+        ppr.resolve_autospacing(explicit_before, explicit_after);
+
+        // ---- 行内内容 ----
+        let mut content = ParagraphContent::default();
+        for child in node.children() {
+            self.walk_inline(child, &base_rpr, None, &mut content);
+        }
+
+        let text: String = content.runs.iter().map(|run| run.text.as_str()).collect();
+        let has_visible_text = text.chars().any(|ch| !ch.is_whitespace());
+
+        let page_break_before = node
+            .child("pPr")
+            .and_then(|ppr| ppr.child("pageBreakBefore"))
+            .map(|flag| match flag.attr_local("val") {
+                Some("0") | Some("false") | Some("off") => false,
+                _ => true,
+            })
+            .unwrap_or(false);
+        // 段落级别的分节符（分节符藏在段落属性里，前端据此画"分页提示线"）
+        let section_break = node
+            .child("pPr")
+            .and_then(|ppr| ppr.child("sectPr"))
+            .map(|sect| {
+                sect.child("type")
+                    .and_then(|node| node.attr_local("val"))
+                    .unwrap_or("nextPage")
+                    .to_string()
+            });
+
+        // 只含分页符的段落（Word 里 Ctrl+Enter 就是这个形态）→ 独立的分页块。
+        // 注意判断的是"没有可见文字"而不是"没有 run"：run 里的 `\n` 是分页符本身带来的。
+        if !has_visible_text && content.images.is_empty() && content.unsupported.is_empty()
+            && content.page_break
+        {
+            out.push(Block::PageBreak);
+            return;
+        }
+
+        // 完全空的段落（`<w:p/>`）：也要留成块，前端用它撑出空行高度
+        if content.is_empty() {
+            out.push(Block::Paragraph(ParagraphBlock {
+                style: style_id.as_deref().and_then(|id| self.styles.style_name(id)),
+                style_id,
+                align: ppr.align.clone(),
+                indent_left_pt: ppr.indent_left_pt,
+                indent_right_pt: ppr.indent_right_pt,
+                indent_first_line_pt: ppr.first_line_pt,
+                space_before_pt: ppr.space_before_pt,
+                space_after_pt: ppr.space_after_pt,
+                line_spacing: ppr.line.clone(),
+                outline_level: ppr.outline_level,
+                page_break_before,
+                section_break,
+                list,
+                ..ParagraphBlock::default()
+            }));
+            return;
+        }
+
+        // 完全没有文字 run、只有图片/占位对象的段落：图片与占位各自成块
+        // （前端按块渲染即可，不必再去解析段落内部；有换行 run 的空段落仍走下面的段落分支）
+        if !has_visible_text && content.runs.is_empty() {
+            for image in content.images.drain(..) {
+                out.push(Block::Image(image));
+            }
+            for block in content.unsupported.drain(..) {
+                out.push(block);
+            }
+            return;
+        }
+
+        out.push(Block::Paragraph(ParagraphBlock {
+            style: style_id.as_deref().and_then(|id| self.styles.style_name(id)),
+            style_id,
+            runs: content.runs,
+            text,
+            align: ppr.align,
+            indent_left_pt: ppr.indent_left_pt,
+            indent_right_pt: ppr.indent_right_pt,
+            indent_first_line_pt: ppr.first_line_pt,
+            space_before_pt: ppr.space_before_pt,
+            space_after_pt: ppr.space_after_pt,
+            line_spacing: ppr.line,
+            list,
+            outline_level: ppr.outline_level,
+            page_break_before,
+            page_break: content.page_break,
+            section_break,
+        }));
+        for image in content.images {
+            out.push(Block::Image(image));
+        }
+        for block in content.unsupported {
+            out.push(block);
+        }
+    }
+
+    /// 行内节点（run / 超链接 / 修订包装 / 图形 …）
+    fn walk_inline(
+        &mut self,
+        node: &XmlNode,
+        base_rpr: &RunProps,
+        char_style: Option<&str>,
+        content: &mut ParagraphContent,
+    ) {
+        match node.local() {
+            "r" => self.parse_run(node, base_rpr, char_style, content),
+            "hyperlink" => {
+                let style = node
+                    .attr_local("rStyle")
+                    .map(str::to_string)
+                    .or_else(|| char_style.map(str::to_string));
+                for child in node.children() {
+                    self.walk_inline(child, base_rpr, style.as_deref(), content);
+                }
+            }
+            "ins" | "smartTag" | "customXml" | "fldSimple" | "moveTo" => {
+                for child in node.children() {
+                    self.walk_inline(child, base_rpr, char_style, content);
+                }
+            }
+            "sdt" => {
+                if let Some(inner) = node.child("sdtContent") {
+                    for child in inner.children() {
+                        self.walk_inline(child, base_rpr, char_style, content);
+                    }
+                }
+            }
+            // 修订痕迹：只显示最终态 —— w:del 里的文字不显示，w:ins 里的显示
+            "del" | "moveFrom" | "delText" | "instrText" => {}
+            "oMath" | "oMathPara" => {
+                let plain = node.collect_text();
+                let detail = if plain.trim().is_empty() {
+                    "文档里有公式，Word / WPS 可正常显示".to_string()
+                } else {
+                    format!("公式内容（纯文本）：{}", plain.trim())
+                };
+                content
+                    .unsupported
+                    .push(unsupported("数学公式（OMML，暂不支持显示）", detail));
+            }
+            "AlternateContent" => self.walk_alternate(node, base_rpr, char_style, content),
+            "drawing" => self.handle_drawing(node, content),
+            "pict" => self.handle_pict(node, content),
+            "object" => self.handle_object(node, content),
+            "txbxContent" => {
+                let plain = node.collect_text();
+                let detail = if plain.trim().is_empty() {
+                    "文本框内容无法显示，Word / WPS 可正常显示".to_string()
+                } else {
+                    format!("文本框内容（纯文本）：{}", plain.trim())
+                };
+                content
+                    .unsupported
+                    .push(unsupported("文本框（暂不支持显示）", detail));
+            }
+            // 段落/表格/单元格属性、锚点、书签：都不是可显示内容
+            "pPr" | "rPr" | "tblPr" | "trPr" | "tcPr" | "sectPr" | "bookmarkStart"
+            | "bookmarkEnd" | "proofErr" | "permStart" | "permEnd" | "commentRangeStart"
+            | "commentRangeEnd" | "commentReference" | "footnoteReference" | "endnoteReference"
+            | "lastRenderedPageBreak" | "annotationRef" => {}
+            // 少数生成器会省掉 w:r 直接写 w:t —— 兜住，别丢字
+            "t" => {
+                let text = node.texts();
+                if !text.is_empty() {
+                    content.runs.push(Run {
+                        text,
+                        ..Run::default()
+                    });
+                }
+            }
+            _ => {
+                // 不认识的包装节点：向下找可显示内容
+                for child in node.children() {
+                    self.walk_inline(child, base_rpr, char_style, content);
+                }
+            }
+        }
+    }
+
+    /// `mc:AlternateContent`：优先 `mc:Choice`（新版表示），它没产出内容再用 `mc:Fallback`
+    fn walk_alternate(
+        &mut self,
+        node: &XmlNode,
+        base_rpr: &RunProps,
+        char_style: Option<&str>,
+        content: &mut ParagraphContent,
+    ) {
+        let before = (
+            content.runs.len(),
+            content.images.len(),
+            content.unsupported.len(),
+        );
+        if let Some(choice) = node.child("Choice") {
+            for child in choice.children() {
+                self.walk_inline(child, base_rpr, char_style, content);
+            }
+        }
+        let produced = content.runs.len() != before.0
+            || content.images.len() != before.1
+            || content.unsupported.len() != before.2;
+        if !produced {
+            if let Some(fallback) = node.child("Fallback") {
+                for child in fallback.children() {
+                    self.walk_inline(child, base_rpr, char_style, content);
+                }
+            }
+        }
+    }
+
+    /// 一个 `w:r`：解析文本 + 其中的图形对象
+    fn parse_run(
+        &mut self,
+        node: &XmlNode,
+        base_rpr: &RunProps,
+        char_style: Option<&str>,
+        content: &mut ParagraphContent,
+    ) {
+        let mut rpr = node
+            .child("rPr")
+            .map(|node| parse_run_props(node, self.theme))
+            .unwrap_or_default();
+        let run_style = node
+            .child("rPr")
+            .and_then(|node| node.child("rStyle"))
+            .and_then(|node| node.attr_local("val"))
+            .map(str::to_string)
+            .or_else(|| char_style.map(str::to_string));
+        // 字符样式（含 basedOn）覆盖段落样式，但让位给 run 自己的直接格式
+        if let Some(style) = run_style.as_deref() {
+            rpr.apply_over(&self.styles.chain_rpr(Some(style)));
+        }
+        rpr.apply_over(base_rpr);
+
+        let mut text = String::new();
+        for child in node.children() {
+            match child.local() {
+                "t" => text.push_str(&child.texts()),
+                "tab" => text.push('\t'),
+                "br" => {
+                    // 分页符：独占一段时整段变成 PageBreak 块；与文字混排时保留换行
+                    if child.attr_local("type") == Some("page") {
+                        content.page_break = true;
+                    }
+                    text.push('\n');
+                }
+                "cr" => text.push('\n'),
+                "sym" => {
+                    // 符号字符（`w:sym@w:char` 是十六进制码位）
+                    if let Some(code) = child
+                        .attr_local("char")
+                        .and_then(|value| u32::from_str_radix(value.trim(), 16).ok())
+                    {
+                        if let Some(ch) = char::from_u32(code) {
+                            text.push(ch);
+                        }
+                    }
+                }
+                "noBreakHyphen" => text.push('\u{2011}'),
+                "softHyphen" => text.push('\u{00AD}'),
+                "drawing" => self.handle_drawing(child, content),
+                "pict" => self.handle_pict(child, content),
+                "object" => self.handle_object(child, content),
+                "txbxContent" => {
+                    let plain = child.collect_text();
+                    let detail = if plain.trim().is_empty() {
+                        "文本框内容无法显示，Word / WPS 可正常显示".to_string()
+                    } else {
+                        format!("文本框内容（纯文本）：{}", plain.trim())
+                    };
+                    content
+                        .unsupported
+                        .push(unsupported("文本框（暂不支持显示）", detail));
+                }
+                "oMath" | "oMathPara" => {
+                    let plain = child.collect_text();
+                    let detail = if plain.trim().is_empty() {
+                        "文档里有公式，Word / WPS 可正常显示".to_string()
+                    } else {
+                        format!("公式内容（纯文本）：{}", plain.trim())
+                    };
+                    content
+                        .unsupported
+                        .push(unsupported("数学公式（OMML，暂不支持显示）", detail));
+                }
+                "AlternateContent" => self.walk_alternate(child, base_rpr, char_style, content),
+                _ => {}
+            }
+        }
+
+        if !text.is_empty() {
+            content.runs.push(Run {
+                text,
+                bold: rpr.bold.unwrap_or(false),
+                italic: rpr.italic.unwrap_or(false),
+                underline: rpr.underline.unwrap_or(false),
+                strike: rpr.strike.unwrap_or(false),
+                font: rpr.font_latin,
+                font_east_asia: rpr.font_ea,
+                size_pt: rpr.size_half_pt.map(|half| half / 2.0),
+                color: rpr.color,
+                highlight: rpr.highlight,
+                vert_align: rpr.vert_align,
+                style_id: run_style,
+            });
+        }
+    }
+
+    /// `w:drawing`：图片 / SmartArt / 图表 / 文本框
+    fn handle_drawing(&mut self, node: &XmlNode, content: &mut ParagraphContent) {
+        // 先看 graphicData 的 URI：它决定这是图片还是图表/SmartArt
+        if let Some(data) = node.find_descendant("graphicData") {
+            if let Some(uri) = data.attr("uri") {
+                if uri.contains("diagram") {
+                    content.unsupported.push(unsupported(
+                        "SmartArt 图形（暂不支持显示）",
+                        "组织结构图 / 流程图等 SmartArt 需要 Word / WPS 渲染",
+                    ));
+                    return;
+                }
+                if uri.contains("chart") {
+                    content.unsupported.push(unsupported(
+                        "图表（暂不支持显示）",
+                        "文档里的统计图表需要 Word / WPS 渲染",
+                    ));
+                    return;
+                }
+            }
+        }
+
+        if let Some(blip) = node.find_descendant("blip") {
+            let rel_id = blip
+                .attr_local("embed")
+                .or_else(|| blip.attr_local("link"));
+            if let Some(rel_id) = rel_id {
+                match self.image_source(rel_id) {
+                    Ok(media) => {
+                        let (width, height) = node
+                            .find_descendant("extent")
+                            .map(|extent| {
+                                (
+                                    number(extent.attr_local("cx")).unwrap_or(0.0),
+                                    number(extent.attr_local("cy")).unwrap_or(0.0),
+                                )
+                            })
+                            .filter(|(cx, cy)| *cx > 0.0 && *cy > 0.0)
+                            .map(|(cx, cy)| (emu_to_px(cx), emu_to_px(cy)))
+                            .unwrap_or(FALLBACK_IMAGE_PX);
+                        let doc_pr = node.find_descendant("docPr");
+                        content.images.push(ImageBlock {
+                            media,
+                            name: doc_pr.and_then(|node| node.attr("name")).map(str::to_string),
+                            alt: doc_pr
+                                .and_then(|node| node.attr("descr"))
+                                .filter(|value| !value.trim().is_empty())
+                                .map(str::to_string),
+                            width_px: width,
+                            height_px: height,
+                        });
+                    }
+                    // 关系缺失 / 指向非图片：说明白，别静默丢
+                    Err(reason) => content
+                        .unsupported
+                        .push(unsupported("图片（无法显示）", reason)),
+                }
+                return;
+            }
+            content.unsupported.push(unsupported(
+                "图形对象（暂不支持显示）",
+                "这段内容用了本项目还不支持的图形表示，Word / WPS 可正常显示",
+            ));
+            return;
+        }
+
+        if node.has_descendant("txbxContent") {
+            let plain = node.collect_text();
+            let detail = if plain.trim().is_empty() {
+                "文本框内容无法显示，Word / WPS 可正常显示".to_string()
+            } else {
+                format!("文本框内容（纯文本）：{}", plain.trim())
+            };
+            content
+                .unsupported
+                .push(unsupported("文本框（暂不支持显示）", detail));
+            return;
+        }
+
+        content.unsupported.push(unsupported(
+            "图形对象（暂不支持显示）",
+            "这段内容用了本项目还不支持的图形表示，Word / WPS 可正常显示",
+        ));
+    }
+
+    /// `w:pict`（VML 老式图形）：图片 → 图片块；文本框 → 占位
+    fn handle_pict(&mut self, node: &XmlNode, content: &mut ParagraphContent) {
+        if let Some(image) = self.vml_image(node) {
+            content.images.push(image);
+            return;
+        }
+        if node.has_descendant("textbox") || node.has_descendant("txbxContent") {
+            let plain = node.collect_text();
+            let detail = if plain.trim().is_empty() {
+                "文本框内容无法显示，Word / WPS 可正常显示".to_string()
+            } else {
+                format!("文本框内容（纯文本）：{}", plain.trim())
+            };
+            content
+                .unsupported
+                .push(unsupported("文本框（暂不支持显示）", detail));
+            return;
+        }
+        content.unsupported.push(unsupported(
+            "图形对象（VML，暂不支持显示）",
+            "这段内容用了老式 VML 图形，Word / WPS 可正常显示",
+        ));
+    }
+
+    /// `w:object`（OLE 嵌入对象，如公式编辑器 3.0、Excel 表格对象）。
+    /// 这类对象在文档里通常自带一张**预览图**，把预览图显示出来并附占位说明，
+    /// 比只给一个空占位卡片有用得多。
+    fn handle_object(&mut self, node: &XmlNode, content: &mut ParagraphContent) {
+        let mut previewed = false;
+        if let Some(image) = self.vml_image(node) {
+            content.images.push(image);
+            previewed = true;
+        }
+        let prog_id = node
+            .find_descendant("OLEObject")
+            .and_then(|ole| ole.attr("ProgID"))
+            .map(|prog| format!("（{prog}）"))
+            .unwrap_or_default();
+        content.unsupported.push(unsupported(
+            "OLE 嵌入对象（暂不支持显示）",
+            if previewed {
+                format!("上面显示的是文档里的预览图{prog_id}；打开/编辑实际对象请用 Word / WPS")
+            } else {
+                format!("文档里嵌入了对象{prog_id}，需要 Word / WPS 打开查看")
+            },
+        ));
+    }
+
+    /// VML 图片（`v:imagedata`），尺寸从 `v:shape@style` 的 width/height 里读
+    fn vml_image(&self, node: &XmlNode) -> Option<ImageBlock> {
+        let imagedata = node.find_descendant("imagedata")?;
+        let rel_id = imagedata
+            .attr_local("id")
+            .or_else(|| imagedata.attr_local("relid"))
+            .or_else(|| imagedata.attr_local("embed"))?;
+        let media = self.image_source(rel_id).ok()?;
+        let (width, height) = node
+            .find_descendant("shape")
+            .and_then(|shape| shape.attr("style"))
+            .map(parse_vml_size)
+            .unwrap_or(FALLBACK_IMAGE_PX);
+        Some(ImageBlock {
+            media,
+            name: node
+                .find_descendant("shape")
+                .and_then(|shape| shape.attr("id"))
+                .map(str::to_string),
+            alt: imagedata.attr_local("title").map(str::to_string),
+            width_px: width,
+            height_px: height,
+        })
+    }
+
+    /// 关系 id → 图片块要用的媒体地址。
+    /// 包内部件给包内路径（前端走 asset 协议）；外部链接给 URL 原样带回；
+    /// 关系缺失、或关系指向的不是图片，返回中文原因（调用方转成占位块）。
+    fn image_source(&self, rel_id: &str) -> Result<String, String> {
+        let Some(rel) = self.rels.get(rel_id) else {
+            return Err(format!(
+                "文档引用了关系 {rel_id}，但 document.xml.rels 里找不到它，图片部件可能已丢失"
+            ));
+        };
+        if !rel.external && !rel.kind.is_empty() && rel.kind != "image" {
+            return Err(format!(
+                "关系 {rel_id} 指向的不是图片（{}：{}）",
+                rel.kind, rel.target
+            ));
+        }
+        Ok(rel.target.clone())
+    }
+
+    /// 一个 `w:tbl`
+    fn build_table(&mut self, node: &XmlNode) -> Block {
+        let pr = node.child("tblPr");
+        let style_id = pr
+            .and_then(|pr| pr.child("tblStyle"))
+            .and_then(|node| node.attr_local("val"))
+            .map(str::to_string);
+        let align = pr
+            .and_then(|pr| pr.child("jc"))
+            .and_then(|node| node.attr_local("val"))
+            .map(str::to_string);
+
+        // 表格总宽：只认 dxa（twip）；pct/auto 交给前端按列宽算
+        let width_px = pr
+            .and_then(|pr| pr.child("tblW"))
+            .filter(|w| w.attr_local("type").map(|kind| kind == "dxa").unwrap_or(true))
+            .and_then(|w| number(w.attr_local("w")))
+            .filter(|value| *value > 0.0)
+            .map(twips_to_px);
+
+        // 表格级边框：作为单元格没写边框时的兜底
+        let table_borders = pr
+            .and_then(|pr| pr.child("tblBorders"))
+            .map(parse_borders)
+            .unwrap_or_default();
+
+        let columns: Vec<f32> = node
+            .child("tblGrid")
+            .map(|grid| {
+                grid.children_named("gridCol")
+                    .filter_map(|col| number(col.attr_local("w")))
+                    .filter(|value| *value > 0.0)
+                    .map(twips_to_px)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut rows: Vec<TableRow> = Vec::new();
+        let table_grid: Vec<f32> = columns.clone();
+        for row in node.children_named("tr").chain(
+            // 少数文档把 w:tr 包在 w:sdt 里
+            node.children_named("sdt")
+                .filter_map(|sdt| sdt.child("sdtContent"))
+                .flat_map(|content| content.children_named("tr")),
+        ) {
+            rows.push(self.build_row(row, &table_borders, &table_grid));
+        }
+
+        let borders = table_borders.iter().any(|side| *side == Some(true))
+            || rows.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .any(|cell| cell.borders.top || cell.borders.left || cell.borders.bottom || cell.borders.right)
+            });
+
+        Block::Table(TableBlock {
+            rows,
+            columns,
+            width_px,
+            align,
+            borders,
+            style_id,
+        })
+    }
+
+    fn build_row(
+        &mut self,
+        node: &XmlNode,
+        table_borders: &[Option<bool>; 4],
+        grid: &[f32],
+    ) -> TableRow {
+        let mut row = TableRow::default();
+        if let Some(tr_pr) = node.child("trPr") {
+            row.header = tr_pr.child("tblHeader").is_some();
+            row.height_px = tr_pr
+                .child("trHeight")
+                .and_then(|height| number(height.attr_local("val")))
+                .filter(|value| *value > 0.0)
+                .map(twips_to_px);
+        }
+
+        let mut column_index = 0usize;
+        for cell in node.children_named("tc") {
+            let tc_pr = cell.child("tcPr");
+            let mut block = TableCell::default();
+
+            block.grid_span = tc_pr
+                .and_then(|pr| pr.child("gridSpan"))
+                .and_then(|span| integer(span.attr_local("val")))
+                .unwrap_or(1)
+                .clamp(1, 100) as usize;
+
+            block.v_merge = match tc_pr.and_then(|pr| pr.child("vMerge")) {
+                None => VMerge::None,
+                Some(merge) => match merge.attr_local("val") {
+                    Some("restart") => VMerge::Restart,
+                    _ => VMerge::Continue,
+                },
+            };
+
+            if let Some(width) = tc_pr.and_then(|pr| pr.child("tcW")) {
+                let is_dxa = width.attr_local("type").map(|kind| kind == "dxa").unwrap_or(true);
+                if is_dxa {
+                    block.width_px = number(width.attr_local("w"))
+                        .filter(|value| *value > 0.0)
+                        .map(twips_to_px);
+                }
+            }
+            // tcW 常写成百分比，这时退而用表格网格里的列宽（前两列通常够用）
+            if block.width_px.is_none() && column_index < grid.len() {
+                block.width_px = Some(grid[column_index]);
+            }
+
+            block.shading = tc_pr
+                .and_then(|pr| pr.child("shd"))
+                .and_then(|shd| shd.attr_local("fill"))
+                .and_then(normalize_color);
+            block.v_align = tc_pr
+                .and_then(|pr| pr.child("vAlign"))
+                .and_then(|node| node.attr_local("val"))
+                .map(str::to_string);
+
+            // 单元格边框：自己写了的边用自己的，没写的边沿用表格级（逐边合并）
+            let own = tc_pr
+                .and_then(|pr| pr.child("tcBorders"))
+                .map(parse_borders);
+            let borders = merge_borders(own, *table_borders);
+            block.borders = CellBorders {
+                top: borders[0],
+                left: borders[1],
+                bottom: borders[2],
+                right: borders[3],
+            };
+
+            // 单元格里的块（多个段落 / 嵌套表格）
+            let mut blocks = Vec::new();
+            self.collect_blocks(cell, &mut blocks);
+            block.text = blocks
+                .iter()
+                .map(block_plain_text)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            block.blocks = blocks;
+
+            column_index += block.grid_span;
+            row.cells.push(block);
+        }
+        row
+    }
+}
+
+/// `w:tblBorders` / `w:tcBorders` → [上, 左, 下, 右]。
+/// `Some(true/false)` = 这一侧明确写了（可见 / `nil`、`none` 明确不可见），
+/// `None` = 这一侧没写 —— 单元格要按"边"去沿用表格级设置，不能整块覆盖。
+fn parse_borders(node: &XmlNode) -> [Option<bool>; 4] {
+    let side = |name: &str| -> Option<bool> {
+        let border = node.child(name)?;
+        Some(!matches!(border.attr_local("val"), Some("nil") | Some("none")))
+    };
+    [side("top"), side("left"), side("bottom"), side("right")]
+}
+
+/// 单元格四边：自己写了的边用自己的，没写的边沿用表格级
+fn merge_borders(cell: Option<[Option<bool>; 4]>, table: [Option<bool>; 4]) -> [bool; 4] {
+    let mut out = [false; 4];
+    for (index, slot) in out.iter_mut().enumerate() {
+        *slot = cell
+            .and_then(|sides| sides[index])
+            .or(table[index])
+            .unwrap_or(false);
+    }
+    out
+}
+
+/// VML `style="width:72pt;height:36pt"` → px（认不出就给兜底尺寸，绝不给 0）
+fn parse_vml_size(style: &str) -> (f32, f32) {
+    let mut size = FALLBACK_IMAGE_PX;
+    for part in style.split(';') {
+        let Some((key, value)) = part.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        let (number_part, factor) = if let Some(value) = value.strip_suffix("pt") {
+            (value, 4.0 / 3.0)
+        } else if let Some(value) = value.strip_suffix("px") {
+            (value, 1.0)
+        } else if let Some(value) = value.strip_suffix("in") {
+            (value, 96.0)
+        } else if let Some(value) = value.strip_suffix("cm") {
+            (value, 96.0 / 2.54)
+        } else if let Some(value) = value.strip_suffix("mm") {
+            (value, 96.0 / 25.4)
+        } else {
+            continue;
+        };
+        let Ok(parsed) = number_part.trim().parse::<f32>() else {
+            continue;
+        };
+        if parsed <= 0.0 {
+            continue;
+        }
+        match key.trim() {
+            "width" => size.0 = parsed * factor,
+            "height" => size.1 = parsed * factor,
+            _ => {}
+        }
+    }
+    size
+}
+
+/// 占位块构造（`label` 是给用户看的中文说明）
+fn unsupported(label: &str, detail: impl Into<String>) -> Block {
+    Block::Unsupported {
+        label: label.to_string(),
+        detail: detail.into(),
+    }
+}
+
+/// 块的纯文本（查找索引 / 表格单元格文本用）
+fn block_plain_text(block: &Block) -> String {
+    match block {
+        Block::Paragraph(paragraph) => paragraph.text.clone(),
+        Block::Table(table) => table
+            .rows
+            .iter()
+            .map(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Block::Image(image) => image.name.clone().unwrap_or_default(),
+        Block::PageBreak => String::new(),
+        Block::Unsupported { label, detail } => {
+            if detail.is_empty() {
+                label.clone()
+            } else {
+                format!("{label} {detail}")
+            }
+        }
+    }
+}
+
+/* ================================================================================== */
+/* 七、文档解析入口 + 内存缓存                                                        */
+/* ================================================================================== */
+
+/// 解析结果。`document_blocks` / `document_find` 共用，靠缓存避免虚拟滚动时反复解析。
+struct ParsedDocument {
+    blocks: Vec<Block>,
+    /// 查找索引：顶层块下标 → 该块的可检索文本（表格用整表文本，命中后定位到表格这一块）
+    search_index: Vec<(usize, String)>,
+    /// 文档里 `w:p` 元素总数（含表格单元格内的）——用于与 `document_info` 的段落统计对账
+    /// （解析完整性的自检指标；非测试构建下没人读它）
+    #[cfg_attr(not(test), allow(dead_code))]
+    paragraph_count: usize,
+    encrypted: bool,
+}
+
+/// 缓存最近打开的 2 个文档（只读查看，缓存是安全的；解析大文档要几十毫秒，虚拟滚动会反复要）
+const CACHE_DOCUMENTS: usize = 2;
+/// 单次最多返回的块数（防止前端误传超大 count 把整篇文档序列化过去）
+const MAX_BLOCK_WINDOW: usize = 2000;
+/// 查找命中上限（与表格模块一致）
+const MAX_FIND_HITS: usize = 500;
+/// 命中上下文片段的左右留白（字符数）
+const EXCERPT_PAD: usize = 30;
+/// 单张图片的大小上限（32MB）：超过就明确拒绝，别把几十 MB 解压进内存再 base64 传前端
+const MAX_MEDIA_BYTES: usize = 32 * 1024 * 1024;
+
+struct CacheEntry {
+    /// 路径原样（用户视角的 key）
+    key: String,
+    /// 大小 + 修改时间：文件变了就重新解析
+    stamp: String,
+    doc: Arc<ParsedDocument>,
+}
+
+static DOCUMENT_CACHE: OnceLock<Mutex<Vec<CacheEntry>>> = OnceLock::new();
+
+fn cache() -> &'static Mutex<Vec<CacheEntry>> {
+    DOCUMENT_CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cache_stamp(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Some(format!("{}:{modified}", meta.len()))
+}
+
+/// 取（必要时解析）文档；命中缓存时只做一次元数据检查
+fn load_document(path: &str) -> Result<Arc<ParsedDocument>, String> {
+    let file = Path::new(path);
+    let stamp = cache_stamp(file);
+    if let Some(stamp) = stamp.as_deref() {
+        let entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.key == path && entry.stamp == stamp)
+        {
+            return Ok(entry.doc.clone());
+        }
+    }
+
+    let (bytes, encrypted) = read_document_bytes(file)?;
+    let doc = Arc::new(parse_document(&bytes, encrypted)?);
+
+    if let Some(stamp) = stamp {
+        let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+        // 同一个文件的新版本：先把旧的挤掉
+        entries.retain(|entry| entry.key != path);
+        entries.insert(
+            0,
+            CacheEntry {
+                key: path.to_string(),
+                stamp,
+                doc: doc.clone(),
+            },
+        );
+        entries.truncate(CACHE_DOCUMENTS);
+    }
+    Ok(doc)
+}
+
+/// 把整个 docx 解析成块模型。**任何路径上的"缺东西"都降级处理**，不 panic。
+fn parse_document(bytes: &[u8], encrypted: bool) -> Result<ParsedDocument, String> {
+    let mut zip = open_zip(bytes)?;
+
+    let document_xml = read_part_lossy(&mut zip, "word/document.xml")
+        .ok_or_else(|| "包内没有 word/document.xml，可能不是 Word 文档".to_string())?;
+    // 下面这些都是"有则用、没有就用默认"，缺失不影响正文显示
+    let styles_xml = read_part_lossy(&mut zip, "word/styles.xml").unwrap_or_default();
+    let numbering_xml = read_part_lossy(&mut zip, "word/numbering.xml").unwrap_or_default();
+    let rels_xml = read_part_lossy(&mut zip, "word/_rels/document.xml.rels").unwrap_or_default();
+    let theme_xml = read_part_lossy(&mut zip, "word/theme/theme1.xml").unwrap_or_default();
+
+    let root = parse_xml(&document_xml)
+        .ok_or_else(|| "word/document.xml 解析不出内容（文件可能已损坏）".to_string())?;
+    let body = find_body(&root)
+        .ok_or_else(|| "这个 .docx 里没有正文（缺少 w:body），文件可能已损坏".to_string())?;
+
+    let theme = Theme::parse(&theme_xml);
+    let styles = StyleSheet::parse(&styles_xml, &theme);
+    let numbering = Numbering::parse(&numbering_xml);
+    let rels = parse_rels(&rels_xml);
+
+    let mut builder = DocBuilder::new(&styles, &numbering, &theme, &rels);
+    let mut blocks = Vec::new();
+    builder.collect_blocks(body, &mut blocks);
+
+    let search_index = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (index, block_plain_text(block)))
+        .filter(|(_, text)| !text.trim().is_empty())
+        .collect();
+
+    Ok(ParsedDocument {
+        blocks,
+        search_index,
+        paragraph_count: builder.paragraph_count,
+        encrypted,
+    })
+}
+
+/// 找正文节点：正常是 `w:document/w:body`；XML 有点毛病时退化为深度搜索
+fn find_body(root: &XmlNode) -> Option<&XmlNode> {
+    if root.local() == "body" {
+        return Some(root);
+    }
+    root.child("body").or_else(|| root.find_descendant("body"))
+}
+
+/// 读取部件的原始字节（图片等二进制部件用；文本部件见 [`read_part_lossy`]）
+fn read_part_bytes(zip: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<Vec<u8>> {
+    let mut file = zip.by_name(name).ok()?;
+    let mut bytes = Vec::with_capacity(file.size().min(4 * 1024 * 1024) as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// 读取部件字节并解码成文本：UTF-8 优先，带 BOM 的 UTF-16 也认（少数生成器会写 UTF-16），
+/// 最后兜底 lossy（宁可个别字符变成 U+FFFD，也不要整篇读不出来）。
+fn read_part_lossy(zip: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<String> {
+    Some(decode_part_bytes(&read_part_bytes(zip, name)?))
+}
+
+fn decode_part_bytes(bytes: &[u8]) -> String {
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, true),
+        [0xFE, 0xFF, rest @ ..] => decode_utf16(rest, false),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .collect();
+    char::decode_utf16(units)
+        .map(|item| item.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
+}
+
+/* ================================================================================== */
+/* 八、既有能力：读字节 / 解包 / 概览 / 源码                                          */
+/* ================================================================================== */
+
+/// 读文档字节：磁盘原始字节 → 内存解密 → 明文（企业加密文件自动处理）
+pub(crate) fn read_document_bytes(path: &Path) -> Result<(Vec<u8>, bool), String> {
+    let (_, plain, encrypted) = office::read_raw_and_plain(path)?;
+    Ok((plain, encrypted))
+}
+
+/// 把明文当 zip 打开；失败时给出能照着做的提示
+fn open_zip<'a>(bytes: &'a [u8]) -> Result<ZipArchive<Cursor<&'a [u8]>>, String> {
+    ZipArchive::new(Cursor::new(bytes)).map_err(|error| {
+        // 走到这里说明"解密后仍不是 zip"：多半是 .doc 老格式、需要密码、或根本不是 docx
+        format!(
+            "这个文件不是有效的 .docx（解压失败：{error}）。\n\n\
+             常见原因：\n\
+             · 它是 Word 97-2003 的 .doc 老格式 —— 请用 Word / WPS 另存为 .docx\n\
+             · 文件需要密码才能打开\n\
+             · 文件已损坏，或不是 Word 文档（改扩展名得到的假 docx）"
+        )
+    })
+}
+
+/// 读取包内某个部件为字符串（缺失返回 None）
+fn read_part(zip: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<String> {
+    let mut file = zip.by_name(name).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+/// 文档概览：部件清单 + 规模统计
+#[tauri::command]
+pub fn document_info(path: String) -> Result<DocumentInfo, String> {
+    let (bytes, encrypted) = read_document_bytes(Path::new(&path))?;
+    let mut zip = open_zip(&bytes)?;
+
+    let mut parts = Vec::with_capacity(zip.len());
+    for index in 0..zip.len() {
+        let file = zip.by_index(index).map_err(|e| e.to_string())?;
+        parts.push(DocumentPart {
+            name: file.name().to_string(),
+            size: file.size(),
+        });
+    }
+    parts.sort_by(|a, b| b.size.cmp(&a.size));
+    let images = parts
+        .iter()
+        .filter(|part| part.name.starts_with("word/media/"))
+        .count();
+
+    let document_xml = read_part(&mut zip, "word/document.xml").unwrap_or_default();
+    let paragraphs = document_xml.matches("<w:p ").count() + document_xml.matches("<w:p>").count();
+    let tables = document_xml.matches("<w:tbl>").count();
+
+    Ok(DocumentInfo {
+        encrypted,
+        editable: false,
+        parts,
+        paragraphs,
+        tables,
+        images,
+    })
+}
+
+/// 原始 `word/document.xml`（供「源码」视图查看，也是解析问题的排查入口）
+#[tauri::command]
+pub fn document_xml(path: String) -> Result<String, String> {
+    let (bytes, _) = read_document_bytes(Path::new(&path))?;
+    let mut zip = open_zip(&bytes)?;
+    read_part(&mut zip, "word/document.xml")
+        .ok_or_else(|| "包内没有 word/document.xml，可能不是 Word 文档".to_string())
+}
+
+/* ================================================================================== */
+/* 九、命令：窗口化取块 / 查找                                                        */
+/* ================================================================================== */
+
+/// 取一段块（虚拟滚动窗口）。
+///
+/// `from` / `count` 越界按夹取处理（**不报错**）：`from > total` 返回空窗口，
+/// `count` 超过 [`MAX_BLOCK_WINDOW`] 按上限截断（`total` 始终告诉前端真实块数）。
+///
+/// 解析 + DOM 构建是纯 CPU 活，标记 `(async)` 让 Tauri 放到线程池执行（不卡 UI 主线程），
+/// Rust 签名与前端调用参数都保持不变。
+#[tauri::command(async)]
+pub fn document_blocks(path: String, from: usize, count: usize) -> Result<BlockPage, String> {
+    let doc = load_document(&path)?;
+    let total = doc.blocks.len();
+    let from = from.min(total);
+    let count = count.min(MAX_BLOCK_WINDOW);
+    let end = from.saturating_add(count).min(total);
+    Ok(BlockPage {
+        total,
+        from,
+        blocks: doc.blocks[from..end].to_vec(),
+        encrypted: doc.encrypted,
+    })
+}
+
+/// 全文查找（**块级命中**：一个块最多一条，供前端滚动定位；上限 [`MAX_FIND_HITS`] 条）。
+///
+/// 注意：前端 invoke 的参数名是 `matchCase`（Tauri 会把 JS 的 camelCase 参数映射到
+/// Rust 的 snake_case）。
+#[tauri::command(async)]
+pub fn document_find(path: String, query: String, match_case: bool) -> Result<Vec<FindHit>, String> {
+    let doc = load_document(&path)?;
+    Ok(find_in(&doc, &query, match_case))
+}
+
+/// 取包内媒体（图片）部件，返回 **data URL**（前端可直接塞进 `<img src>`）。
+///
+/// - 只读且**不落临时文件**：复用 [`read_document_bytes`]（亿赛通等透明加密在内存里解密）；
+/// - `media` 就是 [`ImageBlock::media`]（如 `word/media/image1.png`）；
+/// - **防目录穿越**（安全边界）：只允许 `word/media/` 下的部件名，拒绝 `..`、绝对路径、盘符；
+/// - 单张上限 [`MAX_MEDIA_BYTES`]，超限给中文提示，不会把几十 MB 塞进 UI。
+///
+/// 注意：EMF/WMF（Word 里粘贴 Excel 图表得到的矢量图）会按原 MIME 返回，但浏览器渲染不了，
+/// 前端遇到这两种应显示占位卡片。
+#[tauri::command(async)]
+pub fn document_media(path: String, media: String) -> Result<String, String> {
+    let name = validate_media_name(&media)?;
+    let (bytes, _) = read_document_bytes(Path::new(&path))?;
+    let mut zip = open_zip(&bytes)?;
+    let data = read_media_bytes(&mut zip, &name)?;
+    Ok(format!(
+        "data:{};base64,{}",
+        media_mime(&name),
+        file::base64_encode(&data)
+    ))
+}
+
+/// 校验媒体部件名。名字来自前端，这里是一道**安全边界**：
+/// 我们只做 `zip.by_name` 的查表，不会碰到文件系统；但没有这层校验，前端就能拿
+/// `word/document.xml`（或 `word/../word/settings.xml`）读到包内**任意部件**
+/// （里面可能有批注、作者名、嵌入对象的原始数据等本不该暴露给界面的东西），
+/// 所以只放行 `word/media/` 下、不含空段/`.`/`..` 的名字。
+fn validate_media_name(media: &str) -> Result<String, String> {
+    let name = media.trim().replace('\\', "/");
+    if name.is_empty() {
+        return Err("图片路径为空".to_string());
+    }
+    if name.starts_with('/') || name.contains(':') {
+        return Err(format!("图片路径不合法（不接受绝对路径 / 盘符）：{media}"));
+    }
+    if name
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(format!("图片路径不合法（含空段或 ..）：{media}"));
+    }
+    if !name.starts_with("word/media/") {
+        return Err(format!(
+            "只允许读取 word/media/ 下的图片，收到的是：{media}"
+        ));
+    }
+    Ok(name)
+}
+
+/// 按扩展名给 MIME（认不出来按二进制流，前端仍可按 URL 存盘）
+fn media_mime(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or_default().to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "tif" | "tiff" => "image/tiff",
+        "ico" => "image/x-icon",
+        // Word 里很常见的矢量图（粘贴 Excel 图表就是它）；浏览器渲染不了，MIME 照给
+        "emf" => "image/emf",
+        "wmf" => "image/wmf",
+        _ => "application/octet-stream",
+    }
+}
+
+/// 读媒体部件的**原始字节**（图片是二进制，不能按字符串读）。
+/// zip 头里记录了原始大小，先按它拦一次，读完再兜一次（流式写入的包可能是 0）。
+fn read_media_bytes(zip: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Vec<u8>, String> {
+    let mut file = zip.by_name(name).map_err(|_| {
+        format!("包里没有这张图片：{name}（可能已被删除，或文档是用「链接到文件」插入的外部图片）")
+    })?;
+    let declared = file.size();
+    if declared > MAX_MEDIA_BYTES as u64 {
+        return Err(too_large_media(name, declared as usize));
+    }
+    let mut data = Vec::with_capacity(declared.min(4 * 1024 * 1024) as usize);
+    file.read_to_end(&mut data)
+        .map_err(|error| format!("读取图片 {name} 失败：{error}"))?;
+    if data.len() > MAX_MEDIA_BYTES {
+        return Err(too_large_media(name, data.len()));
+    }
+    if data.is_empty() {
+        return Err(format!("图片 {name} 是空文件（0 字节），无法显示"));
+    }
+    Ok(data)
+}
+
+fn too_large_media(name: &str, size: usize) -> String {
+    format!(
+        "图片 {name} 太大了（{}，上限 {} MB），暂不在界面里显示；用 Word / WPS 打开可以正常看到",
+        human_size(size),
+        MAX_MEDIA_BYTES / 1024 / 1024
+    )
+}
+
+/// 字节数转成人看的大小
+fn human_size(bytes: usize) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    const KB: f64 = 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes / KB)
+    } else {
+        format!("{bytes:.0} 字节")
+    }
+}
+
+fn find_in(doc: &ParsedDocument, query: &str, match_case: bool) -> Vec<FindHit> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for (index, text) in &doc.search_index {
+        if let Some(start) = find_first(text, query, match_case) {
+            hits.push(FindHit {
+                block: *index,
+                text: excerpt(text, start, query.chars().count()),
+            });
+            if hits.len() >= MAX_FIND_HITS {
+                break;
+            }
+        }
+    }
+    hits
+}
+
+/// 返回**字符下标**（不是字节下标，方便截上下文）
+fn find_first(text: &str, query: &str, match_case: bool) -> Option<usize> {
+    if match_case {
+        return text.find(query).map(|byte| text[..byte].chars().count());
+    }
+    // ASCII 快路径：文档里绝大多数是 ASCII 时不用按字符拆
+    if text.is_ascii() && query.is_ascii() {
+        let hay = text.as_bytes();
+        let needle = query.as_bytes();
+        if needle.len() > hay.len() {
+            return None;
+        }
+        return (0..=hay.len() - needle.len())
+            .find(|&index| hay[index..index + needle.len()].eq_ignore_ascii_case(needle));
+    }
+    let hay: Vec<char> = text.chars().collect();
+    let needle: Vec<char> = query.chars().collect();
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&index| chars_eq_ignore_case(&hay[index..index + needle.len()], &needle))
+}
+
+/// 逐字符大小写无关比较（`to_lowercase()` 对个别字符会返回多个 char，所以比较迭代器而不是字符）
+fn chars_eq_ignore_case(left: &[char], right: &[char]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| a == b || a.to_lowercase().eq(b.to_lowercase()))
+}
+
+/// 命中处的上下文片段（前后各留 [`EXCERPT_PAD`] 个字符；被截断的一侧加 `…`）
+fn excerpt(text: &str, start: usize, length: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let begin = start.saturating_sub(EXCERPT_PAD);
+    let end = start.saturating_add(length).saturating_add(EXCERPT_PAD).min(chars.len());
+    let mut out = String::new();
+    if begin > 0 {
+        out.push('…');
+    }
+    for ch in &chars[begin.min(chars.len())..end] {
+        out.push(*ch);
+    }
+    if end < chars.len() {
+        out.push('…');
+    }
+    out
+}
+
+/* ================================================================================== */
+/* 测试                                                                              */
+/* ================================================================================== */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// 命名空间声明：真实文档里这些前缀都得有（解析按本地名匹配，写上是为了贴近真实 XML）
+    const NS: &str = concat!(
+        r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" "#,
+        r#"xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+        r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" "#,
+        r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" "#,
+        r#"xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" "#,
+        r#"xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" "#,
+        r#"xmlns:v="urn:schemas-microsoft-com:vml" "#,
+        r#"xmlns:o="urn:schemas-microsoft-com:office:office" "#,
+        r#"xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" "#,
+        r#"xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#
+    );
+
+    /// 造一个最小可用的 docx（只有 document.xml + Content_Types），用于不依赖外部样本的单测
+    fn minimal_docx(document_xml: &str) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
+            let options: zip::write::FileOptions<'_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer
+                .start_file("word/document.xml", options)
+                .expect("写入 document.xml 失败");
+            writer
+                .write_all(document_xml.as_bytes())
+                .expect("写入失败");
+            writer.finish().expect("收尾失败");
+        }
+        buffer
+    }
+
+    /// 造一个多部件的 docx（内存里，不落盘），允许二进制部件（图片）
+    fn docx_parts_bytes(files: Vec<(String, Vec<u8>)>) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
+            let options: zip::write::FileOptions<'_, ()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            for (name, body) in files {
+                writer.start_file(name, options).expect("写入部件失败");
+                writer.write_all(&body).expect("写入失败");
+            }
+            writer.finish().expect("收尾失败");
+        }
+        buffer
+    }
+
+    /// 造一个多部件的 docx（内存里，不落盘）
+    fn docx_parts(files: Vec<(String, String)>) -> Vec<u8> {
+        docx_parts_bytes(
+            files
+                .into_iter()
+                .map(|(name, body)| (name, body.into_bytes()))
+                .collect(),
+        )
+    }
+
+    /// 用正文片段造 docx；`extras` 是额外的部件（styles.xml / numbering.xml / rels …）
+    fn docx_with(body: &str, extras: &[(&str, &str)]) -> Vec<u8> {
+        let document = format!(r#"<?xml version="1.0" encoding="UTF-8"?><w:document {NS}><w:body>{body}</w:body></w:document>"#);
+        let mut files = vec![("word/document.xml".to_string(), document)];
+        for (name, xml) in extras {
+            files.push((name.to_string(), xml.to_string()));
+        }
+        docx_parts(files)
+    }
+
+    /// 直接解析字节（单测主入口）
+    fn parse(bytes: &[u8]) -> ParsedDocument {
+        parse_document(bytes, false).expect("解析应当成功")
+    }
+
+    /// 解析并取块
+    fn blocks_of(bytes: &[u8]) -> Vec<Block> {
+        parse(bytes).blocks
+    }
+
+    fn paragraph_of(block: &Block) -> &ParagraphBlock {
+        match block {
+            Block::Paragraph(paragraph) => paragraph,
+            other => panic!("期望段落块，实际是 {other:?}"),
+        }
+    }
+
+    fn table_of(block: &Block) -> &TableBlock {
+        match block {
+            Block::Table(table) => table,
+            other => panic!("期望表格块，实际是 {other:?}"),
+        }
+    }
+
+    fn label_of(block: &Block) -> &str {
+        match block {
+            Block::Unsupported { label, .. } => label,
+            other => panic!("期望占位块，实际是 {other:?}"),
+        }
+    }
+
+    /// 落盘一份测试用 docx（命令级测试必须给路径），测试结束自动删除
+    struct TempDocx {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDocx {
+        fn new(tag: &str, bytes: &[u8]) -> TempDocx {
+            let dir = std::env::temp_dir().join("masteredit-docx-tests");
+            std::fs::create_dir_all(&dir).expect("建临时目录失败");
+            let path = dir.join(format!("{tag}-{}.docx", std::process::id()));
+            std::fs::write(&path, bytes).expect("写测试文档失败");
+            TempDocx { path }
+        }
+
+        fn path(&self) -> String {
+            self.path.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TempDocx {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /* ------------------------------ 既有测试（不要动） ------------------------------ */
+
+    #[test]
+    fn opens_minimal_docx_and_counts_blocks() {
+        let xml = r#"<?xml version="1.0"?><w:document><w:body>
+            <w:p><w:r><w:t>第一段</w:t></w:r></w:p>
+            <w:p><w:r><w:t>第二段</w:t></w:r></w:p>
+            <w:tbl><w:tr><w:tc><w:p><w:r><w:t>单元格</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        </w:body></w:document>"#;
+        let bytes = minimal_docx(xml);
+        let mut zip = open_zip(&bytes).expect("应能作为 zip 打开");
+        let text = read_part(&mut zip, "word/document.xml").expect("应能读到 document.xml");
+        assert!(text.contains("第一段"), "应能读到正文内容");
+        assert_eq!(text.matches("<w:p>").count(), 3, "应有 3 个段落（含表格单元格内那段）");
+        assert_eq!(text.matches("<w:tbl>").count(), 1, "应有 1 个表格");
+    }
+
+    #[test]
+    fn non_zip_bytes_give_actionable_error() {
+        let err = open_zip(b"not a zip at all").unwrap_err();
+        assert!(err.contains("不是有效的 .docx"), "错误应说明不是有效 docx：{err}");
+        assert!(err.contains(".doc"), "错误应提示老格式的解决办法：{err}");
+    }
+
+    /// 用真实样本（亿赛通加密的周报）验证「解密 → 解包 → 读 XML」整条链路。
+    /// 样本不存在时自动跳过，保证其它机器 / CI 上也能通过。
+    #[test]
+    fn decrypts_and_opens_real_encrypted_sample() {
+        let sample = std::env::var("MASTEREDIT_DOCX_SAMPLE").unwrap_or_else(|_| {
+            r"C:\Users\master\Documents\7.20-24周报.docx".to_string()
+        });
+        let path = Path::new(&sample);
+        if !path.exists() {
+            eprintln!("跳过：样本不存在 {sample}");
+            return;
+        }
+        let (bytes, encrypted) = read_document_bytes(path).expect("应能读取样本");
+        assert!(encrypted, "该样本应是亿赛通加密的（前 4 字节 E0 A8 91 E7）");
+        assert_eq!(&bytes[0..2], b"PK", "解密后应是 zip（PK 魔数）");
+        let mut zip = open_zip(&bytes).expect("解密后应能解包");
+        let xml = read_part(&mut zip, "word/document.xml").expect("应能读到 document.xml");
+        assert!(xml.starts_with("<?xml"), "document.xml 应是 XML 文本");
+        assert!(xml.contains("<w:body>"), "应包含文档主体");
+        eprintln!(
+            "样本解析成功：{} 个部件，document.xml {} 字节，段落标记 {} 个，表格 {} 个",
+            zip.len(),
+            xml.len(),
+            xml.matches("<w:p ").count() + xml.matches("<w:p>").count(),
+            xml.matches("<w:tbl>").count()
+        );
+    }
+
+    /* ------------------------------ 段落与 run 格式 ------------------------------ */
+
+    #[test]
+    fn parses_paragraph_runs_and_direct_formatting() {
+        let body = r#"
+            <w:p><w:pPr><w:jc w:val="center"/><w:ind w:left="420" w:firstLine="210"/>
+              <w:spacing w:before="120" w:after="240" w:line="360" w:lineRule="auto"/></w:pPr>
+              <w:r><w:rPr><w:b/><w:i/><w:u w:val="single"/><w:strike/>
+                <w:rFonts w:ascii="Arial" w:eastAsia="宋体"/><w:sz w:val="28"/>
+                <w:color w:val="ff0000"/><w:highlight w:val="yellow"/></w:rPr>
+                <w:t>加粗红色</w:t></w:r>
+              <w:r><w:rPr><w:vertAlign w:val="superscript"/><w:sz w:val="20"/></w:rPr><w:t>上标</w:t></w:r>
+            </w:p>"#;
+        let blocks = blocks_of(&docx_with(body, &[]));
+        let paragraph = paragraph_of(&blocks[0]);
+
+        assert_eq!(paragraph.text, "加粗红色上标");
+        assert_eq!(paragraph.align.as_deref(), Some("center"));
+        assert_eq!(paragraph.indent_left_pt, Some(21.0), "420 twip = 21pt");
+        assert_eq!(paragraph.indent_first_line_pt, Some(10.5), "210 twip = 10.5pt");
+        assert_eq!(paragraph.space_before_pt, Some(6.0));
+        assert_eq!(paragraph.space_after_pt, Some(12.0));
+        let line = paragraph.line_spacing.as_ref().expect("应解析出行距");
+        assert_eq!(line.kind, "multiple");
+        assert!((line.value - 1.5).abs() < 0.001, "360/240 = 1.5 倍行距");
+
+        let first = &paragraph.runs[0];
+        assert!(first.bold && first.italic && first.underline && first.strike);
+        assert_eq!(first.font.as_deref(), Some("Arial"));
+        assert_eq!(first.font_east_asia.as_deref(), Some("宋体"));
+        assert_eq!(first.size_pt, Some(14.0), "28 半磅 = 14pt");
+        assert_eq!(first.color.as_deref(), Some("FF0000"), "颜色统一大写");
+        assert_eq!(first.highlight.as_deref(), Some("FFFF00"), "具名高亮转 RRGGBB");
+
+        let second = &paragraph.runs[1];
+        assert_eq!(second.size_pt, Some(10.0));
+        assert_eq!(second.vert_align.as_deref(), Some("superscript"));
+    }
+
+    #[test]
+    fn resolves_doc_defaults_style_chain_and_direct_overrides() {
+        // docDefaults：字号 21 半磅（10.5pt）+ 主题字体；Normal 段落样式：两端对齐
+        // heading 1 基于 Normal：加粗 + 32 半磅（16pt） + 一级大纲
+        let styles = format!(
+            r#"<?xml version="1.0"?><w:styles {NS}>
+              <w:docDefaults><w:rPrDefault><w:rPr>
+                <w:rFonts w:asciiTheme="minorHAnsi" w:eastAsiaTheme="minorEastAsia"/>
+                <w:sz w:val="21"/></w:rPr></w:rPrDefault><w:pPrDefault/></w:docDefaults>
+              <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/>
+                <w:pPr><w:jc w:val="both"/></w:pPr></w:style>
+              <w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/>
+                <w:basedOn w:val="Normal"/><w:pPr><w:outlineLvl w:val="0"/>
+                  <w:spacing w:before="240"/></w:pPr>
+                <w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style>
+              <w:style w:type="character" w:styleId="Em"><w:name w:val="Emphasis"/>
+                <w:rPr><w:i/><w:color w:val="0000FF"/></w:rPr></w:style>
+            </w:styles>"#
+        );
+        let theme = format!(
+            r#"<?xml version="1.0"?><a:theme {NS}><a:themeElements><a:clrScheme name="Office"/>
+              <a:fontScheme name="Office">
+                <a:majorFont><a:latin typeface="等线 Light"/><a:ea typeface=""/>
+                  <a:font script="Hans" typeface="等线 Light"/></a:majorFont>
+                <a:minorFont><a:latin typeface="等线"/><a:ea typeface=""/>
+                  <a:font script="Hans" typeface="等线"/></a:minorFont>
+              </a:fontScheme></a:themeElements></a:theme>"#
+        );
+        let body = r#"
+            <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+              <w:r><w:t>标题文字</w:t></w:r></w:p>
+            <w:p><w:r><w:rPr><w:rStyle w:val="Em"/></w:rPr><w:t>强调</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="Heading1"/><w:jc w:val="left"/></w:pPr>
+              <w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>直接格式覆盖</w:t></w:r></w:p>
+            <w:p><w:pPr><w:rPr><w:rFonts w:eastAsia="仿宋"/><w:sz w:val="32"/></w:rPr></w:pPr>
+              <w:r><w:t>段落标记给的字体字号</w:t></w:r></w:p>
+            <w:p><w:pPr><w:rPr><w:sz w:val="32"/></w:rPr></w:pPr>
+              <w:r><w:rPr><w:sz w:val="18"/></w:rPr><w:t>run 覆盖段落标记</w:t></w:r></w:p>"#;
+        let blocks = blocks_of(&docx_with(
+            body,
+            &[
+                ("word/styles.xml", &styles),
+                ("word/theme/theme1.xml", &theme),
+            ],
+        ));
+
+        // 1) 标题：字号/加粗来自样式，两端对齐来自 Normal，主题字体解析成"等线"
+        let heading = paragraph_of(&blocks[0]);
+        assert_eq!(heading.style.as_deref(), Some("heading 1"));
+        assert_eq!(heading.style_id.as_deref(), Some("Heading1"));
+        assert_eq!(heading.outline_level, Some(0), "大纲级别来自样式链");
+        assert_eq!(heading.align.as_deref(), Some("both"), "对齐来自 basedOn 的 Normal");
+        assert_eq!(heading.space_before_pt, Some(12.0));
+        let run = &heading.runs[0];
+        assert_eq!(run.size_pt, Some(16.0), "样式里的 sz=32 覆盖 docDefaults 的 21");
+        assert!(run.bold, "加粗来自样式");
+        assert_eq!(run.font.as_deref(), Some("等线"), "主题 minorHAnsi → minorFont latin");
+        assert_eq!(run.font_east_asia.as_deref(), Some("等线"), "a:ea 为空 → 用 Hans 字体");
+
+        // 2) 字符样式：斜体 + 蓝色，字号仍走 docDefaults
+        let emphasis = paragraph_of(&blocks[1]);
+        let run = &emphasis.runs[0];
+        assert!(run.italic, "字符样式给出斜体");
+        assert_eq!(run.color.as_deref(), Some("0000FF"));
+        assert_eq!(run.size_pt, Some(10.5), "docDefaults 的 21 半磅");
+        assert_eq!(run.style_id.as_deref(), Some("Em"));
+        assert_eq!(emphasis.align.as_deref(), Some("both"), "没写 pStyle → 用默认段落样式");
+
+        // 3) 直接格式覆盖样式
+        let overridden = paragraph_of(&blocks[2]);
+        assert_eq!(overridden.align.as_deref(), Some("left"));
+        assert_eq!(overridden.runs[0].size_pt, Some(12.0));
+        assert!(overridden.runs[0].bold, "样式里的加粗仍然生效");
+
+        // 4) 段落标记的 rPr（w:pPr/w:rPr）是段落文字的默认格式：run 没写就继承它
+        let from_mark = paragraph_of(&blocks[3]);
+        assert_eq!(from_mark.runs[0].size_pt, Some(16.0), "32 半磅来自段落标记的 rPr");
+        assert_eq!(from_mark.runs[0].font_east_asia.as_deref(), Some("仿宋"));
+
+        // 5) run 自己的 rPr 仍然盖过段落标记
+        let run_wins = paragraph_of(&blocks[4]);
+        assert_eq!(run_wins.runs[0].size_pt, Some(9.0), "18 半磅来自 run");
+    }
+
+    #[test]
+    fn cyclic_style_inheritance_does_not_hang() {
+        let styles = format!(
+            r#"<?xml version="1.0"?><w:styles {NS}>
+              <w:style w:type="paragraph" w:styleId="A"><w:name w:val="A"/><w:basedOn w:val="B"/>
+                <w:rPr><w:sz w:val="20"/></w:rPr></w:style>
+              <w:style w:type="paragraph" w:styleId="B"><w:name w:val="B"/><w:basedOn w:val="A"/>
+                <w:rPr><w:b/></w:rPr></w:style>
+            </w:styles>"#
+        );
+        let body = r#"<w:p><w:pPr><w:pStyle w:val="A"/></w:pPr><w:r><w:t>成环</w:t></w:r></w:p>"#;
+        let blocks = blocks_of(&docx_with(body, &[("word/styles.xml", &styles)]));
+        let paragraph = paragraph_of(&blocks[0]);
+        assert_eq!(paragraph.runs[0].size_pt, Some(10.0), "本样式的 sz 生效");
+        assert!(paragraph.runs[0].bold, "父样式的 b 也能拿到（成环被截断但没崩）");
+    }
+
+    #[test]
+    fn decodes_entities_tabs_breaks_and_symbols() {
+        let body = r#"
+            <w:p><w:r><w:t xml:space="preserve">a &amp; b &lt;tag&gt; &#x4E2D; </w:t></w:r>
+              <w:r><w:t>换</w:t><w:br/><w:t>行</w:t></w:r>
+              <w:r><w:tab/><w:t>制表</w:t></w:r>
+              <w:r><w:sym w:font="Wingdings" w:char="F0E0"/></w:r>
+            </w:p>"#;
+        let blocks = blocks_of(&docx_with(body, &[]));
+        let paragraph = paragraph_of(&blocks[0]);
+        assert!(paragraph.text.starts_with("a & b <tag> 中 "), "实体应还原：{:?}", paragraph.text);
+        assert!(paragraph.text.contains("换\n行"), "软换行应是 \\n：{:?}", paragraph.text);
+        assert!(paragraph.text.contains("\t制表"), "制表符应保留：{:?}", paragraph.text);
+        assert!(paragraph.text.contains('\u{F0E0}'), "w:sym 应按码位还原");
+    }
+
+    /* ------------------------------ 编号与多级列表 ------------------------------ */
+
+    #[test]
+    fn parses_multilevel_numbering_and_bullets() {
+        let numbering = format!(
+            r#"<?xml version="1.0"?><w:numbering {NS}>
+              <w:abstractNum w:abstractNumId="7">
+                <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>
+                  <w:suff w:val="space"/><w:pPr><w:ind w:left="420" w:hanging="420"/></w:pPr></w:lvl>
+                <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%2)"/>
+                  <w:pPr><w:ind w:left="840" w:hanging="420"/></w:pPr></w:lvl>
+                <w:lvl w:ilvl="2"><w:start w:val="1"/><w:numFmt w:val="chineseCounting"/><w:lvlText w:val="%3、"/></w:lvl>
+              </w:abstractNum>
+              <w:abstractNum w:abstractNumId="9">
+                <w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/></w:lvl>
+              </w:abstractNum>
+              <w:num w:numId="3"><w:abstractNumId w:val="7"/></w:num>
+              <w:num w:numId="4"><w:abstractNumId w:val="9"/></w:num>
+            </w:numbering>"#
+        );
+        let item = |num: u32, level: u32, text: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="{num}"/></w:numPr></w:pPr>
+                   <w:r><w:t>{text}</w:t></w:r></w:p>"#
+            )
+        };
+        let body = format!(
+            "{}{}{}{}{}{}",
+            item(3, 0, "一"),
+            item(3, 1, "一甲"),
+            item(3, 1, "一乙"),
+            item(3, 2, "深"),
+            item(3, 0, "二"),
+            item(4, 0, "符号项"),
+        );
+        let blocks = blocks_of(&docx_with(&body, &[("word/numbering.xml", &numbering)]));
+
+        let prefixes: Vec<String> = blocks
+            .iter()
+            .map(|block| {
+                paragraph_of(block)
+                    .list
+                    .as_ref()
+                    .map(|list| list.prefix.clone())
+                    .unwrap_or_else(|| "<无编号>".to_string())
+            })
+            .collect();
+        assert_eq!(
+            prefixes,
+            vec!["1.", "a)", "b)", "一、", "2.", "•"],
+            "多级编号要算对父级：第二层用字母、第三层用中文数字、回到一级后继续 2."
+        );
+
+        let first = paragraph_of(&blocks[0]).list.clone().expect("应有列表信息");
+        assert!(first.ordered);
+        assert_eq!(first.level, 0);
+        assert_eq!(first.suffix, "space");
+        assert_eq!(first.format, "decimal");
+        // 编号级别自带的缩进参与段落层叠（420 twip = 21pt，悬挂缩进 → 首行 -21pt）
+        let paragraph = paragraph_of(&blocks[0]);
+        assert_eq!(paragraph.indent_left_pt, Some(21.0));
+        assert_eq!(paragraph.indent_first_line_pt, Some(-21.0));
+
+        let bullet = paragraph_of(&blocks[5]).list.clone().expect("项目符号也是列表");
+        assert!(!bullet.ordered, "bullet 应标成无序");
+        assert_eq!(bullet.prefix, "•");
+    }
+
+    #[test]
+    fn numbering_restarts_per_num_id_and_supports_overrides() {
+        // 同一个 abstractNum 被两个 numId 复用：两条列表各自从 1 开始数
+        let numbering = format!(
+            r#"<?xml version="1.0"?><w:numbering {NS}>
+              <w:abstractNum w:abstractNumId="1">
+                <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1、"/></w:lvl>
+              </w:abstractNum>
+              <w:num w:numId="10"><w:abstractNumId w:val="1"/></w:num>
+              <w:num w:numId="11"><w:abstractNumId w:val="1"/>
+                <w:lvlOverride w:ilvl="0"><w:startOverride w:val="5"/></w:lvlOverride></w:num>
+            </w:numbering>"#
+        );
+        let item = |num: u32, text: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="{num}"/></w:numPr></w:pPr>
+                   <w:r><w:t>{text}</w:t></w:r></w:p>"#
+            )
+        };
+        let body = format!(
+            "{}{}{}{}",
+            item(10, "A"),
+            item(10, "B"),
+            item(11, "C"),
+            item(11, "D")
+        );
+        let blocks = blocks_of(&docx_with(&body, &[("word/numbering.xml", &numbering)]));
+        let prefixes: Vec<String> = blocks
+            .iter()
+            .map(|block| paragraph_of(block).list.clone().unwrap().prefix)
+            .collect();
+        assert_eq!(
+            prefixes,
+            vec!["I、", "II、", "V、", "VI、"],
+            "numId=10 从 I 开始；numId=11 用 startOverride=5 从 V 开始"
+        );
+    }
+
+    /* ------------------------------ 表格 ------------------------------ */
+
+    #[test]
+    fn parses_table_merges_widths_borders_and_nested_table() {
+        let body = r#"
+            <w:tbl>
+              <w:tblPr><w:tblStyle w:val="a1"/><w:tblW w:w="6000" w:type="dxa"/><w:jc w:val="center"/>
+                <w:tblBorders><w:top w:val="single" w:sz="4"/><w:left w:val="single" w:sz="4"/>
+                  <w:bottom w:val="nil"/><w:right w:val="none"/></w:tblBorders>
+              </w:tblPr>
+              <w:tblGrid><w:gridCol w:w="1500"/><w:gridCol w:w="1500"/><w:gridCol w:w="3000"/></w:tblGrid>
+              <w:tr><w:trPr><w:trHeight w:val="400"/><w:tblHeader/></w:trPr>
+                <w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/><w:gridSpan w:val="2"/>
+                    <w:shd w:val="clear" w:fill="DDEEFF"/></w:tcPr>
+                  <w:p><w:r><w:t>合并两列</w:t></w:r></w:p></w:tc>
+                <w:tc><w:tcPr><w:vAlign w:val="center"/></w:tcPr>
+                  <w:p><w:r><w:t>第三列</w:t></w:r></w:p>
+                  <w:p><w:r><w:t>第二段</w:t></w:r></w:p>
+                  <w:tbl><w:tblGrid><w:gridCol w:w="600"/></w:tblGrid>
+                    <w:tr><w:tc><w:p><w:r><w:t>嵌套</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+                </w:tc>
+              </w:tr>
+              <w:tr>
+                <w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc>
+                <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>
+              </w:tr>
+              <w:tr>
+                <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>
+                <w:tc><w:tcPr><w:tcBorders><w:top w:val="nil"/></w:tcBorders></w:tcPr>
+                  <w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc>
+                <w:tc><w:tcPr/></w:tc>
+              </w:tr>
+            </w:tbl>"#;
+        let blocks = blocks_of(&docx_with(body, &[]));
+        assert_eq!(blocks.len(), 1, "一个表格就是一个顶层块");
+        let table = table_of(&blocks[0]);
+
+        assert_eq!(table.rows.len(), 3);
+        assert_eq!(table.align.as_deref(), Some("center"));
+        assert_eq!(table.style_id.as_deref(), Some("a1"));
+        assert!(table.borders, "单元格上的可见边框也算表格有边框");
+        assert_eq!(
+            table.columns,
+            vec![100.0, 100.0, 200.0],
+            "1500 twip = 100px，3000 twip = 200px"
+        );
+        assert_eq!(table.width_px, Some(400.0), "6000 twip = 400px");
+
+        // 第一行：横跨两列 + 底纹 + 行高 + 表头
+        let row = &table.rows[0];
+        assert!(row.header, "w:tblHeader 应标成表头行");
+        assert!((row.height_px.unwrap() - 26.6667).abs() < 0.01, "400 twip ≈ 26.67px");
+        assert_eq!(row.cells.len(), 2);
+        assert_eq!(row.cells[0].grid_span, 2);
+        assert_eq!(row.cells[0].text, "合并两列");
+        assert_eq!(row.cells[0].shading.as_deref(), Some("DDEEFF"));
+        assert_eq!(row.cells[0].width_px, Some(200.0));
+        assert_eq!(row.cells[1].v_align.as_deref(), Some("center"));
+        assert_eq!(
+            row.cells[1].text, "第三列\n第二段\n嵌套",
+            "单元格内多段落/嵌套表格的文本用换行连接"
+        );
+        assert_eq!(row.cells[1].blocks.len(), 3, "两个段落 + 一个嵌套表格");
+        let nested = table_of(&row.cells[1].blocks[2]);
+        assert_eq!(nested.rows[0].cells[0].text, "嵌套");
+
+        // 单元格边框：自己没写就用表格级兜底（top=single 可见，bottom=nil 不可见）
+        let inherited = row.cells[1].borders;
+        assert!(inherited.top && inherited.left && !inherited.bottom && !inherited.right);
+
+        // 纵向合并
+        assert_eq!(table.rows[1].cells[0].v_merge, VMerge::Restart);
+        assert_eq!(table.rows[2].cells[0].v_merge, VMerge::Continue);
+        assert_eq!(table.rows[1].cells[2].v_merge, VMerge::Continue);
+        assert_eq!(table.rows[0].cells[0].v_merge, VMerge::None);
+
+        // 单元格自己写的 nil 覆盖表格级边框
+        let explicit = table.rows[2].cells[1].borders;
+        assert!(!explicit.top, "自己写了 nil 就按 nil");
+        assert!(explicit.left, "没写的边继续沿用表格级");
+
+        // 空单元格也要保留（否则前端表格会错列）
+        assert!(table.rows[2].cells[2].blocks.is_empty());
+        assert_eq!(table.rows[2].cells[2].text, "");
+    }
+
+    /* ------------------------------ 图片与占位块 ------------------------------ */
+
+    #[test]
+    fn resolves_images_from_relationships() {
+        let rels = format!(
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+              <Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../word/media/image2.jpeg"/>
+              <Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com" TargetMode="External"/>
+            </Relationships>"#
+        );
+        let body = r#"
+            <w:p><w:r><w:rPr><w:noProof/></w:rPr><w:drawing>
+              <wp:inline><wp:extent cx="914400" cy="457200"/>
+                <wp:docPr id="1" name="图片 1" descr="示意图"/>
+                <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                  <pic:pic><pic:blipFill><a:blip r:embed="rId5"/></pic:blipFill></pic:pic>
+                </a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
+            <w:p><w:r><w:t>带图段落</w:t></w:r>
+              <w:r><w:drawing><wp:inline><wp:extent cx="9525" cy="9525"/>
+                <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                  <pic:pic><pic:blipFill><a:blip r:embed="rId6"/></pic:blipFill></pic:pic>
+                </a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
+            <w:p><w:r><w:drawing><wp:inline><wp:extent cx="9525" cy="9525"/>
+              <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                <pic:pic><pic:blipFill><a:blip r:embed="rId404"/></pic:blipFill></pic:pic>
+              </a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#;
+        let blocks = blocks_of(&docx_with(
+            body,
+            &[("word/_rels/document.xml.rels", &rels)],
+        ));
+
+        let image = match &blocks[0] {
+            Block::Image(image) => image,
+            other => panic!("整段只有图片时应产出图片块，实际 {other:?}"),
+        };
+        assert_eq!(image.media, "word/media/image1.png");
+        assert_eq!(image.name.as_deref(), Some("图片 1"));
+        assert_eq!(image.alt.as_deref(), Some("示意图"));
+        assert_eq!((image.width_px, image.height_px), (96.0, 48.0), "914400 EMU = 96px");
+
+        // 段落里有文字 + 图片：文字成段落块，图片紧跟其后
+        let paragraph = paragraph_of(&blocks[1]);
+        assert_eq!(paragraph.text, "带图段落");
+        let second = match &blocks[2] {
+            Block::Image(image) => image,
+            other => panic!("期望图片块，实际 {other:?}"),
+        };
+        assert_eq!(second.media, "word/media/image2.jpeg", "../word/media → 归一化");
+        assert_eq!((second.width_px, second.height_px), (1.0, 1.0));
+
+        // 关系缺失：给占位说明而不是静默丢
+        let missing = label_of(&blocks[3]);
+        assert!(missing.contains("图片"), "关系缺失的图片要有明确说明：{missing}");
+        let detail = match &blocks[3] {
+            Block::Unsupported { detail, .. } => detail,
+            _ => unreachable!(),
+        };
+        assert!(detail.contains("找不到"), "说明里要讲清原因：{detail}");
+    }
+
+    #[test]
+    fn emits_placeholders_for_unsupported_objects() {
+        let rels = format!(
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/ole.png"/>
+              <Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/altChunk" Target="afchunk.html"/>
+            </Relationships>"#
+        );
+        let body = r#"
+            <w:p><w:r><w:drawing><wp:inline><wp:extent cx="9525" cy="9525"/>
+              <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram">
+                <dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
+            <w:p><w:r><w:drawing><wp:inline><wp:extent cx="9525" cy="9525"/>
+              <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+                <a:blip r:embed="rId99"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
+            <w:p><w:r><w:object>
+              <v:shape id="ole预览" style="width:72pt;height:36pt"><v:imagedata r:id="rId6"/></v:shape>
+              <o:OLEObject ProgID="Equation.DSMT4"/></w:object></w:r></w:p>
+            <w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent>
+              <w:p><w:r><w:t>框内文字</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>
+            <w:p><m:oMathPara><m:oMath><m:r><m:t>E</m:t></m:r><m:r><m:t>=mc</m:t></m:r></m:oMath></m:oMathPara></w:p>
+            <w:p><w:r><w:t>普通段落</w:t></w:r></w:p>
+            <w:altChunk r:id="rId9"/>"#;
+        let blocks = blocks_of(&docx_with(
+            body,
+            &[("word/_rels/document.xml.rels", &rels)],
+        ));
+
+        let shape: Vec<&str> = blocks
+            .iter()
+            .map(|block| match block {
+                Block::Paragraph(_) => "段落",
+                Block::Table(_) => "表格",
+                Block::Image(_) => "图片",
+                Block::PageBreak => "分页",
+                Block::Unsupported { .. } => "占位",
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec!["占位", "占位", "图片", "占位", "占位", "占位", "段落", "占位"],
+            "每个不认识的节点都要有落点，绝不能静默消失"
+        );
+
+        assert!(label_of(&blocks[0]).contains("SmartArt"), "SmartArt 要有中文说明");
+        assert!(label_of(&blocks[1]).contains("图表"), "图表要有中文说明");
+        // OLE：先给预览图（文档里内嵌的），再给占位说明
+        let preview_image = match &blocks[2] {
+            Block::Image(image) => image,
+            other => panic!("OLE 对象前应有预览图块，实际 {other:?}"),
+        };
+        assert_eq!(preview_image.media, "word/media/ole.png");
+        assert_eq!(
+            (preview_image.width_px, preview_image.height_px),
+            (96.0, 48.0),
+            "72pt × 36pt → 96px × 48px"
+        );
+        assert!(label_of(&blocks[3]).contains("OLE"), "OLE 对象给占位");
+        let ole_detail = match &blocks[3] {
+            Block::Unsupported { detail, .. } => detail,
+            _ => unreachable!(),
+        };
+        assert!(ole_detail.contains("预览图"), "OLE 应说明显示的是预览图：{ole_detail}");
+        assert!(ole_detail.contains("Equation.DSMT4"), "OLE 应报出 ProgID：{ole_detail}");
+        assert!(label_of(&blocks[4]).contains("文本框"));
+        let textbox_detail = match &blocks[4] {
+            Block::Unsupported { detail, .. } => detail,
+            _ => unreachable!(),
+        };
+        assert!(textbox_detail.contains("框内文字"), "文本框占位里回显纯文本：{textbox_detail}");
+        assert!(label_of(&blocks[5]).contains("公式"));
+        let math_detail = match &blocks[5] {
+            Block::Unsupported { detail, .. } => detail,
+            _ => unreachable!(),
+        };
+        assert!(math_detail.contains("E=mc"), "公式占位里回显纯文本：{math_detail}");
+        assert!(label_of(&blocks[7]).contains("altChunk"));
+    }
+
+    #[test]
+    fn handles_page_break_image_paragraphs_and_empty_paragraphs() {
+        let rels = format!(
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/a.png"/>
+              <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/b.png"/>
+            </Relationships>"#
+        );
+        let drawing = |rid: &str| {
+            format!(
+                r#"<w:r><w:drawing><wp:inline><wp:extent cx="19050" cy="9525"/>
+                  <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                    <pic:pic><pic:blipFill><a:blip r:embed="{rid}"/></pic:blipFill></pic:pic>
+                  </a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#
+            )
+        };
+        let body = format!(
+            r#"{empty}{page}{two_images}{editable}{before}{mixed}{section}"#,
+            empty = r#"<w:p/>"#,
+            page = r#"<w:p><w:pPr><w:jc w:val="left"/></w:pPr><w:r><w:br w:type="page"/></w:r></w:p>"#,
+            two_images = format!("<w:p>{}{}</w:p>", drawing("rId1"), drawing("rId2")),
+            editable = r#"<w:p><w:pPr><w:pStyle w:val="a9"/></w:pPr><w:r><w:t>文字</w:t></w:r></w:p>"#,
+            before = r#"<w:p><w:pPr><w:pageBreakBefore/></w:pPr><w:r><w:t>段前分页</w:t></w:r></w:p>"#,
+            mixed = r#"<w:p><w:r><w:t>前</w:t><w:br w:type="page"/><w:t>后</w:t></w:r></w:p>"#,
+            section = r#"<w:p><w:pPr><w:sectPr><w:type w:val="continuous"/></w:sectPr></w:pPr><w:r><w:t>分节</w:t></w:r></w:p>"#,
+        );
+        let blocks = blocks_of(&docx_with(&body, &[("word/_rels/document.xml.rels", &rels)]));
+
+        // 空段落也要成块（前端靠它撑段间距）
+        let empty = paragraph_of(&blocks[0]);
+        assert_eq!(empty.text, "");
+        assert!(empty.runs.is_empty());
+        // 只含分页符的段落 → 分页块
+        assert!(matches!(blocks[1], Block::PageBreak), "实际 {:?}", blocks[1]);
+        // 只有图片的段落 → 一张图一个块
+        assert!(matches!(blocks[2], Block::Image(_)));
+        assert!(matches!(blocks[3], Block::Image(_)));
+        assert_eq!(
+            match &blocks[2] {
+                Block::Image(image) => (image.width_px, image.height_px),
+                _ => unreachable!(),
+            },
+            (2.0, 1.0),
+            "19050 EMU = 2px"
+        );
+        // 普通段落
+        assert_eq!(paragraph_of(&blocks[4]).text, "文字");
+        // 段前分页标记
+        assert!(paragraph_of(&blocks[5]).page_break_before);
+        // 段落内混排分页符：保留成一段，但标记出来（内容不丢）
+        let mixed = paragraph_of(&blocks[6]);
+        assert!(mixed.page_break, "混排分页符要标记");
+        assert_eq!(mixed.text, "前\n后");
+        // 分节符
+        let section = paragraph_of(&blocks[7]);
+        assert_eq!(section.section_break.as_deref(), Some("continuous"));
+    }
+
+    /* ------------------------------ 损坏输入不崩 ------------------------------ */
+
+    #[test]
+    fn broken_xml_never_panics() {
+        // 1) 结束标签不匹配 + 裸 & + 未闭合标签
+        let body = r#"<w:p><w:r><w:t>甲 & 乙</w:t></w:r></w:p><w:p><w:r><w:t>未闭合"#;
+        let blocks = blocks_of(&docx_with(body, &[]));
+        assert!(!blocks.is_empty(), "损坏的 XML 也要尽量读出内容");
+        let text: String = blocks
+            .iter()
+            .map(block_plain_text)
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("甲 & 乙"), "裸 & 不该整篇崩：{text:?}");
+
+        // 2) 完全没有正文节点
+        let err = parse_document(&docx_with("", &[]).len().to_string().into_bytes(), false);
+        assert!(err.is_err(), "非 zip 字节应返回 Err 而不是 panic");
+
+        // 3) 有 body 但空 → 空块列表
+        let empty = blocks_of(&docx_with("", &[]));
+        assert!(empty.is_empty());
+
+        // 4) styles.xml / numbering.xml 是垃圾 → 不影响正文
+        let blocks = blocks_of(&docx_with(
+            r#"<w:p><w:pPr><w:pStyle w:val="没有这个样式"/><w:numPr><w:numId w:val="99"/></w:numPr></w:pPr>
+               <w:r><w:t>正文</w:t></w:r></w:p>"#,
+            &[
+                ("word/styles.xml", "<<<这不是 XML"),
+                ("word/numbering.xml", "<w:numbering><w:abstractNum 半截"),
+            ],
+        ));
+        assert_eq!(paragraph_of(&blocks[0]).text, "正文");
+        // 编号级别查不到时用兜底定义（"1."），而不是让前缀变空
+        let list = paragraph_of(&blocks[0]).list.clone().expect("仍应有列表信息");
+        assert_eq!(list.prefix, "1.");
+
+        // 5) 属性里带非法实体
+        let blocks = blocks_of(&docx_with(
+            r#"<w:p><w:pPr><w:jc w:val="a&b"/></w:pPr><w:r><w:t>属性异常</w:t></w:r></w:p>"#,
+            &[],
+        ));
+        assert_eq!(paragraph_of(&blocks[0]).text, "属性异常");
+    }
+
+    #[test]
+    fn table_and_cell_counts_are_consistent_for_odd_input() {
+        // 空表格、没有 tblGrid、单元格里什么都没有
+        let body = r#"<w:tbl/><w:tbl><w:tr/></w:tbl><w:tbl><w:tr><w:tc/></w:tr></w:tbl>"#;
+        let blocks = blocks_of(&docx_with(body, &[]));
+        assert_eq!(blocks.len(), 3);
+        for block in &blocks {
+            let table = table_of(block);
+            assert!(table.columns.is_empty());
+        }
+        assert!(table_of(&blocks[1]).rows[0].cells.is_empty());
+        assert_eq!(table_of(&blocks[2]).rows[0].cells.len(), 1);
+        assert_eq!(table_of(&blocks[2]).rows[0].cells[0].grid_span, 1);
+    }
+
+    #[test]
+    fn decodes_utf16_and_gbk_like_bytes_without_panicking() {
+        // UTF-16LE + BOM
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "中文".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(decode_part_bytes(&utf16), "中文");
+
+        // UTF-16BE + BOM
+        let mut utf16 = vec![0xFE, 0xFF];
+        for unit in "AB".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_be_bytes());
+        }
+        assert_eq!(decode_part_bytes(&utf16), "AB");
+
+        // 非法 UTF-8 也不 panic（UTF-16 里的孤立代理项 → 替换字符）
+        assert_eq!(decode_part_bytes(&[0xFF, 0xFE, 0x00, 0xD8]), "\u{FFFD}");
+        assert_eq!(decode_part_bytes(&[0x41, 0xFF, 0x42]), "A\u{FFFD}B");
+        assert_eq!(decode_part_bytes(b"<w:p/>"), "<w:p/>");
+    }
+
+    /* ------------------------------ 命令：窗口化与查找 ------------------------------ */
+
+    #[test]
+    fn document_blocks_windows_and_clamps_out_of_range() {
+        let mut body = String::new();
+        for index in 0..12 {
+            body.push_str(&format!("<w:p><w:r><w:t>第{index}段</w:t></w:r></w:p>"));
+        }
+        let doc = TempDocx::new("window", &docx_with(&body, &[]));
+        let path = doc.path();
+
+        let page = document_blocks(path.clone(), 3, 4).expect("取块应成功");
+        assert_eq!(page.total, 12);
+        assert_eq!(page.from, 3);
+        assert_eq!(page.blocks.len(), 4);
+        assert_eq!(paragraph_of(&page.blocks[0]).text, "第3段");
+        assert!(!page.encrypted);
+
+        // 越界：from 超出总数 → 空窗口而不是报错
+        let page = document_blocks(path.clone(), 999, 10).expect("越界不应报错");
+        assert_eq!(page.from, 12);
+        assert!(page.blocks.is_empty());
+
+        // count 超上限 → 夹到 MAX_BLOCK_WINDOW（这里文档更小，所以就是全部）
+        let page = document_blocks(path.clone(), 0, usize::MAX).expect("超大 count 不应报错");
+        assert_eq!(page.blocks.len(), 12);
+
+        // count = 0 → 空窗口
+        let page = document_blocks(path.clone(), 0, 0).expect("count=0 不应报错");
+        assert!(page.blocks.is_empty());
+        assert_eq!(page.total, 12);
+
+        // 文件不存在 → Err（不是 panic）
+        let missing = document_blocks(doc.path().replace(".docx", "-不存在.docx"), 0, 10);
+        assert!(missing.is_err());
+    }
+
+    #[test]
+    fn document_find_is_block_level_case_insensitive_and_capped() {
+        let body = r#"
+            <w:p><w:r><w:t>Hello World</w:t></w:r></w:p>
+            <w:p><w:r><w:t>第二段里有 hello 两次：hello</w:t></w:r></w:p>
+            <w:tbl><w:tr><w:tc><w:p><w:r><w:t>表格 hello</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#;
+        let doc = TempDocx::new("find", &docx_with(body, &[]));
+        let path = doc.path();
+
+        let hits = document_find(path.clone(), "hello".to_string(), false).expect("查找应成功");
+        assert_eq!(hits.len(), 3, "每个块最多一条命中（第二段里的两次 hello 只算一条）");
+        assert_eq!(
+            hits.iter().map(|hit| hit.block).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(hits[1].text.contains("hello"));
+        assert!(
+            hits[1].text.matches("hello").count() >= 1,
+            "片段要包含命中处：{}",
+            hits[1].text
+        );
+
+        let hits = document_find(path.clone(), "hello".to_string(), true).expect("查找应成功");
+        assert_eq!(
+            hits.iter().map(|hit| hit.block).collect::<Vec<_>>(),
+            vec![1, 2],
+            "区分大小写时只命中「hello」小写的两处（第一段是 Hello）"
+        );
+
+        // 表格是整表一块：命中定位到表格那一块
+        let hits = document_find(path.clone(), "表格 hello".to_string(), false).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].block, 2);
+
+        // 空查询 / 查不到
+        assert!(document_find(path.clone(), "   ".to_string(), false).unwrap().is_empty());
+        assert!(document_find(path, "不存在的词".to_string(), false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn document_find_caps_hits_at_five_hundred() {
+        let mut body = String::new();
+        for index in 0..600 {
+            body.push_str(&format!("<w:p><w:r><w:t>命中 {index}</w:t></w:r></w:p>"));
+        }
+        let doc = TempDocx::new("findcap", &docx_with(&body, &[]));
+        let hits = document_find(doc.path(), "命中".to_string(), false).unwrap();
+        assert_eq!(hits.len(), MAX_FIND_HITS, "命中上限 {MAX_FIND_HITS} 条");
+        assert_eq!(hits[0].block, 0);
+        assert_eq!(hits[MAX_FIND_HITS - 1].block, MAX_FIND_HITS - 1);
+    }
+
+    #[test]
+    fn excerpt_keeps_context_around_match() {
+        let text = "abcdefghij".repeat(20);
+        let snippet = excerpt(&text, 100, 3);
+        assert!(snippet.starts_with('…') && snippet.ends_with('…'));
+        assert!(snippet.contains("abc"), "片段里应包含命中处内容");
+        let short = excerpt("短文本", 0, 1);
+        assert_eq!(short, "短文本", "短文本不加省略号");
+    }
+
+    /* ------------------------------ 给前端的 JSON 形状（契约冻结） ------------------------------ */
+
+    /// 前端会照着这些字段名写 TS 类型，所以把它们钉死在测试里：
+    /// 块用 `kind` 判别（`paragraph` / `table` / `image` / `pageBreak` / `unsupported`），
+    /// 字段名一律 camelCase。
+    #[test]
+    fn serializes_blocks_with_frontend_friendly_field_names() {
+        let body = r#"
+            <w:p><w:pPr><w:ind w:left="420"/></w:pPr>
+              <w:r><w:rPr><w:rFonts w:eastAsia="宋体"/><w:sz w:val="24"/><w:b/></w:rPr>
+                <w:t>文字</w:t></w:r></w:p>
+            <w:p><w:r><w:br w:type="page"/></w:r></w:p>
+            <w:tbl><w:tblGrid><w:gridCol w:w="1500"/></w:tblGrid>
+              <w:tr><w:tc><w:tcPr><w:gridSpan w:val="1"/></w:tcPr><w:p/></w:tc></w:tr></w:tbl>"#;
+        let parsed = parse(&docx_with(body, &[]));
+        let page = BlockPage {
+            total: parsed.blocks.len(),
+            from: 0,
+            blocks: parsed.blocks.clone(),
+            encrypted: true,
+        };
+        let json = serde_json::to_value(&page).expect("应能序列化成 JSON");
+
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["from"], 0);
+        assert_eq!(json["encrypted"], true);
+
+        assert_eq!(json["blocks"][0]["kind"], "paragraph");
+        assert_eq!(json["blocks"][0]["text"], "文字");
+        assert_eq!(json["blocks"][0]["indentLeftPt"], 21.0);
+        assert_eq!(json["blocks"][0]["runs"][0]["bold"], true);
+        assert_eq!(json["blocks"][0]["runs"][0]["fontEastAsia"], "宋体");
+        assert_eq!(json["blocks"][0]["runs"][0]["sizePt"], 12.0);
+        assert_eq!(json["blocks"][1]["kind"], "pageBreak");
+        assert_eq!(json["blocks"][2]["kind"], "table");
+        assert_eq!(json["blocks"][2]["columns"][0], 100.0);
+        assert_eq!(json["blocks"][2]["rows"][0]["cells"][0]["gridSpan"], 1);
+        assert_eq!(json["blocks"][2]["rows"][0]["cells"][0]["vMerge"], "none");
+        assert!(json["blocks"][2]["rows"][0]["cells"][0]["borders"]["top"].is_boolean());
+
+        // 占位块：label + detail 都要在
+        let json = serde_json::to_value(unsupported("测试占位", "中文说明")).expect("应能序列化");
+        assert_eq!(json["kind"], "unsupported");
+        assert_eq!(json["label"], "测试占位");
+        assert_eq!(json["detail"], "中文说明");
+
+        // 图片块：媒体路径 + px 尺寸
+        let json = serde_json::to_value(Block::Image(ImageBlock {
+            media: "word/media/a.png".to_string(),
+            name: Some("图片 1".to_string()),
+            alt: None,
+            width_px: 10.0,
+            height_px: 5.0,
+        }))
+        .expect("应能序列化");
+        assert_eq!(json["kind"], "image");
+        assert_eq!(json["media"], "word/media/a.png");
+        assert_eq!(json["widthPx"], 10.0);
+        assert_eq!(json["heightPx"], 5.0);
+        assert!(json["alt"].is_null());
+
+        // 列表信息：前缀文本 + 有序标记
+        let numbered = parse(&docx_with(
+            r#"<w:p><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>项</w:t></w:r></w:p>"#,
+            &[(
+                "word/numbering.xml",
+                r#"<?xml version="1.0"?><w:numbering>
+                     <w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0">
+                       <w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>
+                     <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+            )],
+        ));
+        let json = serde_json::to_value(&numbered.blocks[0]).expect("应能序列化");
+        assert_eq!(json["kind"], "paragraph");
+        assert_eq!(json["list"]["prefix"], "1.");
+        assert_eq!(json["list"]["ordered"], true);
+        assert_eq!(json["list"]["numId"], 1);
+        assert_eq!(json["list"]["level"], 0);
+
+        // 查找命中的形状
+        let json = serde_json::to_value(FindHit {
+            block: 7,
+            text: "…上下文…".to_string(),
+        })
+        .expect("应能序列化");
+        assert_eq!(json["block"], 7);
+        assert_eq!(json["text"], "…上下文…");
+    }
+
+    /* ------------------------------ 图片：document_media（data URL） ------------------------------ */
+
+    /// 1×1 透明 PNG（67 字节的最小合法 PNG）——base64 见 [`TINY_PNG_BASE64`]
+    const TINY_PNG: [u8; 67] = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+        0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+        0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+        0x42, 0x60, 0x82,
+    ];
+    /// 上面那张 PNG 的 base64（用 PowerShell 的 `[Convert]::ToBase64String` 独立算出来的，
+    /// 所以这条断言是"跟外部实现对答案"，而不是自己跟自己对）
+    const TINY_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==";
+    /// PNG 魔数（89 50 4E 47 0D 0A 1A 0A）
+    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+    /// 一个只有段落的正文 + 一张图片部件的最小 docx
+    fn docx_with_png() -> Vec<u8> {
+        docx_parts_bytes(vec![
+            (
+                "word/document.xml".to_string(),
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?><w:document {NS}><w:body>{}</w:body></w:document>"#,
+                    r#"<w:p><w:r><w:t>带图</w:t></w:r></w:p>"#
+                )
+                .into_bytes(),
+            ),
+            ("word/media/pixel.png".to_string(), TINY_PNG.to_vec()),
+        ])
+    }
+
+    #[test]
+    fn document_media_returns_data_url_with_exact_bytes() {
+        let doc = TempDocx::new("media-png", &docx_with_png());
+        let url = document_media(doc.path(), "word/media/pixel.png".to_string())
+            .expect("应能取到图片");
+
+        let payload = url
+            .strip_prefix("data:image/png;base64,")
+            .unwrap_or_else(|| panic!("应是 PNG 的 data URL：{}", &url[..40.min(url.len())]));
+        assert_eq!(payload, TINY_PNG_BASE64, "编码结果应与外部独立算出的 base64 一致");
+
+        // 解码回来，确认字节一模一样（前端拿到的是原图）
+        let decoded = file::base64_decode(payload).expect("应能解码 data URL");
+        assert_eq!(decoded, TINY_PNG.to_vec());
+        assert_eq!(decoded[0..8], PNG_MAGIC, "PNG 魔数");
+    }
+
+    #[test]
+    fn document_media_rejects_traversal_and_paths_outside_media() {
+        let doc = TempDocx::new(
+            "media-bad",
+            &docx_with(r#"<w:p><w:r><w:t>x</w:t></w:r></w:p>"#, &[]),
+        );
+        for (bad, expect) in [
+            ("../word/document.xml", ".."),
+            ("word/media/../../word/document.xml", ".."),
+            ("..\\word\\document.xml", ".."),
+            ("/etc/passwd", "绝对路径"),
+            ("C:\\Windows\\win.ini", "绝对路径"),
+            ("//server/share/a.png", "绝对路径"),
+            ("word/document.xml", "只允许"),
+            ("word/media/", "空段"),
+            ("word/media/./a.png", "空段"),
+            ("  ", "为空"),
+        ] {
+            let result = document_media(doc.path(), bad.to_string());
+            let error = match result {
+                Ok(url) => panic!("{bad:?} 必须被拒绝，却返回了 {}", &url[..40.min(url.len())]),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains(expect) || error.contains("不合法") || error.contains("只允许"),
+                "{bad:?} 的报错要说清原因（期望含 {expect:?}）：{error}"
+            );
+        }
+
+        // 合法名字能通过校验（这里包里没有这个部件，所以错误是"包里没有"）
+        let error = document_media(doc.path(), "word/media/pixel.png".to_string()).unwrap_err();
+        assert!(error.contains("包里没有"), "不存在的图片要有可读报错：{error}");
+        assert!(
+            error.contains("链接到文件"),
+            "要提示可能是外部链接图片：{error}"
+        );
+    }
+
+    #[test]
+    fn document_media_reports_broken_input_cleanly() {
+        // 1) 空图片部件
+        let files = docx_parts_bytes(vec![
+            (
+                "word/document.xml".to_string(),
+                format!(r#"<?xml version="1.0"?><w:document {NS}><w:body/></w:document>"#).into_bytes(),
+            ),
+            ("word/media/empty.png".to_string(), Vec::new()),
+        ]);
+        let doc = TempDocx::new("media-empty", &files);
+        let error = document_media(doc.path(), "word/media/empty.png".to_string()).unwrap_err();
+        assert!(error.contains("空文件"), "{error}");
+
+        // 2) 不是 docx（也不是 zip）
+        let dir = std::env::temp_dir().join("masteredit-docx-tests");
+        std::fs::create_dir_all(&dir).expect("建临时目录失败");
+        let bad = dir.join(format!("media-notzip-{}.docx", std::process::id()));
+        std::fs::write(&bad, b"not a zip").expect("写文件失败");
+        let error =
+            document_media(bad.to_string_lossy().into_owned(), "word/media/a.png".to_string())
+                .unwrap_err();
+        let _ = std::fs::remove_file(&bad);
+        assert!(error.contains("不是有效的 .docx"), "{error}");
+
+        // 3) 文件不存在
+        let missing = dir.join("media-不存在.docx");
+        let error =
+            document_media(missing.to_string_lossy().into_owned(), "word/media/a.png".to_string())
+                .unwrap_err();
+        assert!(!error.is_empty(), "应给出可读错误：{error}");
+
+        // 4) 超限保护（不真造 32MB：直接验证错误话术）
+        let error = too_large_media("word/media/big.png", 40 * 1024 * 1024);
+        assert!(error.contains("太大"), "{error}");
+        assert!(error.contains("40.0 MB"), "要说清多大：{error}");
+        assert!(error.contains("Word / WPS"), "要给出替代办法：{error}");
+        assert_eq!(human_size(512), "512 字节");
+        assert_eq!(human_size(2048), "2 KB");
+        assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[test]
+    fn media_mime_covers_common_word_formats() {
+        for (name, mime) in [
+            ("word/media/a.png", "image/png"),
+            ("word/media/a.JPG", "image/jpeg"),
+            ("word/media/a.jpeg", "image/jpeg"),
+            ("word/media/a.gif", "image/gif"),
+            ("word/media/a.bmp", "image/bmp"),
+            ("word/media/a.webp", "image/webp"),
+            ("word/media/a.svg", "image/svg+xml"),
+            ("word/media/a.tif", "image/tiff"),
+            ("word/media/a.tiff", "image/tiff"),
+            ("word/media/a.ico", "image/x-icon"),
+            ("word/media/a.emf", "image/emf"),
+            ("word/media/a.wmf", "image/wmf"),
+            ("word/media/a.bin", "application/octet-stream"),
+            ("word/media/noext", "application/octet-stream"),
+        ] {
+            assert_eq!(media_mime(name), mime, "{name}");
+        }
+    }
+
+    #[test]
+    fn document_media_reads_real_sample_png_if_present() {
+        let sample = std::env::var("MASTEREDIT_DOCX_SAMPLE")
+            .unwrap_or_else(|_| r"C:\Users\master\Documents\7.20-24周报.docx".to_string());
+        if !Path::new(&sample).exists() {
+            eprintln!("跳过：样本不存在 {sample}");
+            return;
+        }
+
+        // 1) 块模型给出的 media 名必须能直接喂给 document_media（这条把两个命令接起来了：
+        //    也验证了 rels 里的 Target 归一化后的名字与 zip 里的部件名一致）
+        let page = document_blocks(sample.clone(), 0, MAX_BLOCK_WINDOW).expect("取块应成功");
+        let media: Vec<String> = page
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Image(image) => Some(image.media.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(media.len(), 2, "样本里两张图");
+        for name in &media {
+            let url = document_media(sample.clone(), name.clone())
+                .unwrap_or_else(|error| panic!("{name} 应能取到：{error}"));
+            let payload = url
+                .strip_prefix("data:image/png;base64,")
+                .unwrap_or_else(|| panic!("{name} 应是 PNG"));
+            let decoded = file::base64_decode(payload).expect("应能解码");
+            assert_eq!(decoded[0..8], PNG_MAGIC, "{name} 应是 PNG 魔数");
+            assert!(decoded.len() > 1024, "{name} 不该是空图");
+        }
+
+        // 2) 顺带量一下"每张图都重新解密 + 解包"的代价（前端是按需逐张取的）
+        let start = std::time::Instant::now();
+        for _ in 0..5 {
+            document_media(sample.clone(), media[0].clone()).expect("应能取到");
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "真实样本取图：5 次共 {:?}（平均 {:?}/张）",
+            elapsed,
+            elapsed / 5
+        );
+    }
+
+    /// **给前端的 vMerge 契约**（前端算 rowspan 就按这套走）：
+    /// `vMerge = "continue"` 的单元格**仍然出现在 `rows[i].cells` 里，不会被省略**，
+    /// 所以前端按"本行网格列"（前面单元格的 `gridSpan` 累加）往上找最近的 `restart` 即可配对。
+    /// 这个测试就用前端将要写的那套逻辑算一遍 rowspan，证明契约够用。
+    #[test]
+    fn frontend_can_compute_rowspan_from_v_merge_contract() {
+        let body = r#"
+            <w:tbl>
+              <w:tblGrid><w:gridCol w:w="1000"/><w:gridCol w:w="1000"/><w:gridCol w:w="1000"/></w:tblGrid>
+              <w:tr>
+                <w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc>
+                <w:tc><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc>
+              </w:tr>
+              <w:tr>
+                <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>
+                <w:tc><w:p><w:r><w:t>D</w:t></w:r></w:p></w:tc>
+                <w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>E</w:t></w:r></w:p></w:tc>
+              </w:tr>
+              <w:tr>
+                <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>
+                <w:tc><w:p><w:r><w:t>F</w:t></w:r></w:p></w:tc>
+                <w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p/></w:tc>
+              </w:tr>
+            </w:tbl>"#;
+        let blocks = blocks_of(&docx_with(body, &[]));
+        let table = table_of(&blocks[0]);
+
+        // 前端第一步：把每个单元格铺到网格列上（(起始列, 跨列数, 纵向合并状态)）
+        let mut layout: Vec<Vec<(usize, usize, VMerge)>> = Vec::new();
+        for row in &table.rows {
+            let mut column = 0usize;
+            let mut cells = Vec::new();
+            for cell in &row.cells {
+                cells.push((column, cell.grid_span, cell.v_merge));
+                column += cell.grid_span;
+            }
+            layout.push(cells);
+        }
+
+        // continue 单元格必须都在（否则前端无法按列配对，表格会错列）
+        assert_eq!(
+            layout,
+            vec![
+                vec![
+                    (0, 1, VMerge::Restart),
+                    (1, 1, VMerge::None),
+                    (2, 1, VMerge::None)
+                ],
+                vec![
+                    (0, 1, VMerge::Continue),
+                    (1, 1, VMerge::None),
+                    (2, 1, VMerge::Restart)
+                ],
+                vec![
+                    (0, 1, VMerge::Continue),
+                    (1, 1, VMerge::None),
+                    (2, 1, VMerge::Continue)
+                ],
+            ]
+        );
+
+        // 前端第二步：每个 restart 往下数连续的 continue → rowspan
+        let mut rowspans: Vec<((usize, usize), usize)> = Vec::new();
+        for (row_index, row) in layout.iter().enumerate() {
+            for &(column, span, merge) in row {
+                if merge != VMerge::Restart {
+                    continue;
+                }
+                let mut rowspan = 1usize;
+                let mut probe = row_index + 1;
+                while probe < layout.len() {
+                    let continued = layout[probe]
+                        .iter()
+                        .any(|&(cell_column, cell_span, cell_merge)| {
+                            cell_column == column
+                                && cell_span == span
+                                && cell_merge == VMerge::Continue
+                        });
+                    if !continued {
+                        break;
+                    }
+                    rowspan += 1;
+                    probe += 1;
+                }
+                rowspans.push(((row_index, column), rowspan));
+            }
+        }
+        assert_eq!(
+            rowspans,
+            vec![((0, 0), 3), ((1, 2), 2)],
+            "第一列竖跨 3 行；第三列从第 2 行起竖跨 2 行"
+        );
+    }
+
+    /// **字符单位的缩进**（只写 `*Chars` 的生成器不能丢首行缩进）：
+    /// 1 字符 = 本段**最终生效的字号**；显式 twips 存在时以 twips 为准。
+    #[test]
+    fn resolves_character_unit_indents_against_effective_font_size() {
+        // docDefaults 字号 21 半磅（10.5pt）；样式 Big 给 48 半磅（24pt）——用来证明
+        // 折算用的是"样式链算完之后"的字号，而不是某个固定值
+        let styles = format!(
+            r#"<?xml version="1.0"?><w:styles {NS}>
+              <w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="21"/></w:rPr></w:rPrDefault></w:docDefaults>
+              <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+              <w:style w:type="paragraph" w:styleId="Big"><w:name w:val="Big"/><w:basedOn w:val="Normal"/>
+                <w:rPr><w:sz w:val="48"/></w:rPr></w:style>
+            </w:styles>"#
+        );
+        let body = r#"
+            <w:p><w:pPr><w:ind w:firstLineChars="200"/></w:pPr><w:r><w:t>两字符首行</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="Big"/><w:ind w:firstLineChars="200"/></w:pPr>
+              <w:r><w:t>大字两字符</w:t></w:r></w:p>
+            <w:p><w:pPr><w:ind w:firstLineChars="200" w:firstLine="999"/></w:pPr>
+              <w:r><w:t>两者都写</w:t></w:r></w:p>
+            <w:p><w:pPr><w:ind w:hangingChars="200"/></w:pPr><w:r><w:t>悬挂两字符</w:t></w:r></w:p>
+            <w:p><w:pPr><w:ind w:leftChars="150" w:rightChars="50"/></w:pPr>
+              <w:r><w:t>左右字符</w:t></w:r></w:p>
+            <w:p><w:r><w:t>没有缩进</w:t></w:r></w:p>"#;
+        let blocks = blocks_of(&docx_with(
+            body,
+            &[("word/styles.xml", &styles)],
+        ));
+
+        // 1) 只写 Chars：10.5pt × 2 字符 = 21pt
+        let first = paragraph_of(&blocks[0]);
+        assert_eq!(first.runs[0].size_pt, Some(10.5), "字号来自 docDefaults");
+        assert_eq!(
+            first.indent_first_line_pt,
+            Some(21.0),
+            "firstLineChars=200 → 2 字符 × 10.5pt"
+        );
+        assert_eq!(first.indent_left_pt, None, "没写 leftChars 就不要凭空造一个");
+
+        // 2) 字号来自样式链：24pt × 2 = 48pt（证明用的是最终生效字号）
+        let big = paragraph_of(&blocks[1]);
+        assert_eq!(big.runs[0].size_pt, Some(24.0));
+        assert_eq!(big.indent_first_line_pt, Some(48.0), "同 200 Chars，字号变了值就变");
+
+        // 3) 同时有 twips 与 Chars：以 twips 为准（Word 写文档时两者都写，观感按 twips）
+        let both = paragraph_of(&blocks[2]);
+        assert!(
+            (both.indent_first_line_pt.unwrap() - 49.95).abs() < 0.01,
+            "999 twips = 49.95pt，实际 {:?}",
+            both.indent_first_line_pt
+        );
+
+        // 4) hangingChars → 负的首行缩进
+        assert_eq!(paragraph_of(&blocks[3]).indent_first_line_pt, Some(-21.0));
+
+        // 5) leftChars / rightChars
+        let sides = paragraph_of(&blocks[4]);
+        assert_eq!(sides.indent_left_pt, Some(15.75), "1.5 字符 × 10.5pt");
+        assert_eq!(sides.indent_right_pt, Some(5.25), "0.5 字符 × 10.5pt");
+
+        // 6) 普通段落不凭空有缩进
+        let plain = paragraph_of(&blocks[5]);
+        assert_eq!(plain.indent_left_pt, None);
+        assert_eq!(plain.indent_first_line_pt, None);
+    }
+
+    /// 字符单位缩进在**编号级别**上也要生效（有的生成器把「2 字符」写在 numbering.xml 里）
+    #[test]
+    fn resolves_character_unit_indents_from_numbering_level() {
+        let numbering = format!(
+            r#"<?xml version="1.0"?><w:numbering {NS}>
+              <w:abstractNum w:abstractNumId="0">
+                <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>
+                  <w:pPr><w:ind w:leftChars="200" w:hangingChars="200"/></w:pPr></w:lvl>
+              </w:abstractNum>
+              <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+            </w:numbering>"#
+        );
+        let styles = format!(
+            r#"<?xml version="1.0"?><w:styles {NS}>
+              <w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="24"/></w:rPr></w:rPrDefault></w:docDefaults>
+            </w:styles>"#
+        );
+        let body = r#"<w:p><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>
+            <w:r><w:t>列表项</w:t></w:r></w:p>"#;
+        let blocks = blocks_of(&docx_with(
+            body,
+            &[
+                ("word/numbering.xml", &numbering),
+                ("word/styles.xml", &styles),
+            ],
+        ));
+        let paragraph = paragraph_of(&blocks[0]);
+        assert_eq!(paragraph.runs[0].size_pt, Some(12.0), "docDefaults 24 半磅 = 12pt");
+        assert_eq!(
+            paragraph.indent_left_pt,
+            Some(24.0),
+            "编号级别的 leftChars=200 → 2 字符 × 12pt"
+        );
+        assert_eq!(paragraph.indent_first_line_pt, Some(-24.0), "hangingChars → 负值");
+    }
+
+    /// **自动段间距**（`w:beforeAutospacing` / `w:afterAutospacing`）：
+    /// Word 显示为 Auto，约 14pt；docDefaults 里的 `before="0"` 不能把它吃掉；
+    /// 段落自己写了显式值时以显式值为准。
+    #[test]
+    fn applies_automatic_paragraph_spacing() {
+        // docDefaults 明确写了 before=0/after=0（现实文档很常见），用来验证 Auto 不被它盖掉
+        let styles = format!(
+            r#"<?xml version="1.0"?><w:styles {NS}>
+              <w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="21"/></w:rPr></w:rPrDefault>
+                <w:pPrDefault><w:pPr><w:spacing w:before="0" w:after="0"/></w:pPr></w:pPrDefault>
+              </w:docDefaults>
+              <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+              <w:style w:type="paragraph" w:styleId="Auto"><w:name w:val="Auto"/>
+                <w:pPr><w:spacing w:beforeAutospacing="1"/></w:pPr></w:style>
+            </w:styles>"#
+        );
+        let body = r#"
+            <w:p><w:pPr><w:spacing w:beforeAutospacing="1" w:afterAutospacing="1"/></w:pPr>
+              <w:r><w:t>自动间距</w:t></w:r></w:p>
+            <w:p><w:pPr><w:spacing w:before="120" w:beforeAutospacing="1"/></w:pPr>
+              <w:r><w:t>显式覆盖</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="Auto"/></w:pPr><w:r><w:t>样式里的自动</w:t></w:r></w:p>
+            <w:p><w:r><w:t>普通段落</w:t></w:r></w:p>"#;
+        let blocks = blocks_of(&docx_with(body, &[("word/styles.xml", &styles)]));
+
+        // 1) 段落自己开了自动：段前段后都是 Auto（≈14pt），docDefaults 的 0 不算数
+        let auto = paragraph_of(&blocks[0]);
+        assert_eq!(auto.space_before_pt, Some(AUTO_SPACE_PT));
+        assert_eq!(auto.space_after_pt, Some(AUTO_SPACE_PT));
+
+        // 2) 显式 before="120"（6pt）压过自动；after 没开自动 → 仍取 docDefaults 的 0
+        let explicit = paragraph_of(&blocks[1]);
+        assert_eq!(explicit.space_before_pt, Some(6.0), "显式 twips 优先");
+        assert_eq!(explicit.space_after_pt, Some(0.0), "没开自动就按 docDefaults");
+
+        // 3) 自动开关写在样式里一样生效（层叠带过来）
+        let from_style = paragraph_of(&blocks[2]);
+        assert_eq!(from_style.space_before_pt, Some(AUTO_SPACE_PT));
+        assert_eq!(from_style.space_after_pt, Some(0.0));
+
+        // 4) 没开自动的段落不受影响
+        let plain = paragraph_of(&blocks[3]);
+        assert_eq!(plain.space_before_pt, Some(0.0));
+        assert_eq!(plain.space_after_pt, Some(0.0));
+    }
+
+    /* ------------------------------ 真实语料库（存在才跑） ------------------------------ */
+
+    /// 拿真实语料库（默认是 Z 盘上的每周汇报目录）跑一遍块模型：
+    /// 每个文件都必须能解析成块、每个块都必须能序列化给前端。
+    /// 目录不存在时跳过（别的机器 / CI 上没有这个目录）。
+    ///
+    /// 注意：Word 打开文档时会生成 `~$xxx.docx` **临时锁文件**（不是 zip，也不是文档），
+    /// 这里直接跳过 —— 它们不是"解析失败"，是根本不该被当成文档。
+    #[test]
+    fn parses_real_docx_corpus_without_panicking() {
+        fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("docx"))
+                    && !path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with("~$"))
+                {
+                    out.push(path);
+                }
+            }
+            out.sort();
+        }
+        let dir = std::env::var("MASTEREDIT_DOCX_CORPUS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(r"Z:\D\mywork\05_会议汇报\每周汇报\2026"));
+        if !dir.exists() {
+            eprintln!("跳过：语料库目录不存在 {}", dir.display());
+            return;
+        }
+        let mut files = Vec::new();
+        collect(&dir, &mut files);
+        if files.is_empty() {
+            eprintln!("跳过：目录里没有 .docx");
+            return;
+        }
+
+        let mut total_blocks = 0usize;
+        let mut total_tables = 0usize;
+        let mut total_images = 0usize;
+        let mut total_numbered = 0usize;
+        let mut total_unsupported = 0usize;
+        let mut merged_cells = 0usize;
+        let mut nested_tables = 0usize;
+        let mut labels: HashMap<String, usize> = HashMap::new();
+
+        for path in &files {
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let text = path.to_string_lossy().into_owned();
+            let parsed = load_document(&text)
+                .unwrap_or_else(|error| panic!("{label}: 块模型解析失败：{error}"));
+
+            // 每个块都必须能序列化给前端（前端接的就是这个形状）
+            for block in &parsed.blocks {
+                serde_json::to_value(block)
+                    .unwrap_or_else(|error| panic!("{label}: 块无法序列化：{error}"));
+            }
+            // 顶层窗口也必须能取（夹取逻辑不 panic）
+            let page = document_blocks(text.clone(), 0, MAX_BLOCK_WINDOW)
+                .unwrap_or_else(|error| panic!("{label}: document_blocks 失败：{error}"));
+            assert_eq!(page.total, parsed.blocks.len(), "{label}: 窗口总数应与块数一致");
+            // 查找也不该 panic（顺带证明索引可用）
+            let _ = document_find(text, "的".to_string(), false)
+                .unwrap_or_else(|error| panic!("{label}: document_find 失败：{error}"));
+
+            /// 递归数表格：返回（表格总数, 其中嵌套表格数），顺带统计合并单元格
+            fn count_tables(blocks: &[Block], merged: &mut usize) -> (usize, usize) {
+                let mut tables = 0usize;
+                let mut nested = 0usize;
+                for block in blocks {
+                    if let Block::Table(table) = block {
+                        tables += 1;
+                        for row in &table.rows {
+                            for cell in &row.cells {
+                                if cell.grid_span > 1 || cell.v_merge != VMerge::None {
+                                    *merged += 1;
+                                }
+                                let (inner, inner_nested) = count_tables(&cell.blocks, merged);
+                                tables += inner;
+                                nested += inner + inner_nested;
+                            }
+                        }
+                    }
+                }
+                (tables, nested)
+            }
+            let (tables, nested) = count_tables(&parsed.blocks, &mut merged_cells);
+            total_tables += tables;
+            total_blocks += parsed.blocks.len();
+            nested_tables += nested;
+            total_images += parsed
+                .blocks
+                .iter()
+                .filter(|block| matches!(block, Block::Image(_)))
+                .count();
+            total_numbered += parsed
+                .blocks
+                .iter()
+                .filter(|block| matches!(block, Block::Paragraph(p) if p.list.is_some()))
+                .count();
+            for block in &parsed.blocks {
+                if let Block::Unsupported { label, .. } = block {
+                    total_unsupported += 1;
+                    *labels.entry(label.clone()).or_insert(0) += 1;
+                }
+            }
+            eprintln!(
+                "  [OK]   {label:<30} 块 {:>4} · 段落统计 {:>4} · 表 {:>2} · 图 {:>3} · 合并格 {:>3}",
+                parsed.blocks.len(),
+                parsed.paragraph_count,
+                tables,
+                parsed
+                    .blocks
+                    .iter()
+                    .filter(|block| matches!(block, Block::Image(_)))
+                    .count(),
+                merged_cells
+            );
+        }
+
+        let mut sorted: Vec<(String, usize)> = labels.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!(
+            "\n语料库块模型统计：{} 个文件；顶层块 {}、表格 {}（嵌套 {}）、图片 {}、编号段落 {}、合并单元格 {}、占位块 {}",
+            files.len(),
+            total_blocks,
+            total_tables,
+            nested_tables,
+            total_images,
+            total_numbered,
+            merged_cells,
+            total_unsupported
+        );
+        for (label, count) in &sorted {
+            eprintln!("  占位类型 {count:>3} × {label}");
+        }
+        assert!(!files.is_empty());
+    }
+
+    /* ------------------------------ 真实样本（存在才跑） ------------------------------ */
+
+    /// 真实样本：亿赛通加密的周报。断言块模型与 `document_info` 的统计对得上，
+    /// 并且样式链、编号、表格、图片都真的解析出来了。样本不存在时静默跳过。
+    #[test]
+    fn parses_real_encrypted_sample_if_present() {
+        let sample = std::env::var("MASTEREDIT_DOCX_SAMPLE")
+            .unwrap_or_else(|_| r"C:\Users\master\Documents\7.20-24周报.docx".to_string());
+        let path = Path::new(&sample);
+        if !path.exists() {
+            eprintln!("跳过：样本不存在 {sample}");
+            return;
+        }
+        let path_string = sample.clone();
+        let info = document_info(path_string.clone()).expect("document_info 应成功");
+        let parsed = parse_document(
+            &read_document_bytes(path).expect("应能读取样本").0,
+            true,
+        )
+        .expect("块模型解析应成功");
+
+        // 1) 段落数与既有统计一致（`w:p` 总数，含表格单元格内的）
+        assert_eq!(
+            parsed.paragraph_count, info.paragraphs,
+            "块模型数出来的段落数应与 document_info 一致"
+        );
+        assert_eq!(info.paragraphs, 319);
+
+        // 2) 表格
+        let tables: Vec<&TableBlock> = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Table(table) => Some(table),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tables.len(), 2, "样本里应有 2 个表格");
+        assert_eq!(tables.len(), info.tables);
+        assert_eq!(tables[0].rows.len(), 20);
+        assert_eq!(tables[1].rows.len(), 7);
+        assert_eq!(tables[0].columns.len(), 8);
+        assert_eq!(tables[1].columns.len(), 7);
+        assert!(tables[0].rows[0].header);
+        assert_eq!(tables[0].rows[0].cells[1].text, "论文名称");
+        assert_eq!(
+            tables[0].rows[0].cells[1].blocks.iter().map(block_plain_text).collect::<Vec<_>>(),
+            vec!["论文名称".to_string()]
+        );
+
+        // 3) 图片：2 张，路径来自 rels，尺寸由 EMU 换算
+        let images: Vec<&ImageBlock> = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Image(image) => Some(image),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].media, "word/media/image1.png");
+        assert_eq!(images[1].media, "word/media/image2.png");
+        assert_eq!(images[0].name.as_deref(), Some("图片 1"));
+        assert!((images[0].width_px - 378.15).abs() < 1.0, "{}", images[0].width_px);
+        assert!((images[0].height_px - 242.42).abs() < 1.0, "{}", images[0].height_px);
+
+        // 4) 样式链：标题 4（styleId=4）应拿到「宋体 / 12pt / 加粗」
+        let heading = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Paragraph(paragraph) if paragraph.style_id.as_deref() == Some("4") => {
+                    Some(paragraph)
+                }
+                _ => None,
+            })
+            .next()
+            .expect("样本里应有标题 4 的段落");
+        assert_eq!(heading.style.as_deref(), Some("heading 4"));
+        assert_eq!(heading.outline_level, Some(3), "标题 4 的大纲级别是 3");
+        let run = heading.runs.first().expect("标题段应有文字");
+        assert_eq!(run.font_east_asia.as_deref(), Some("宋体"), "样式里的 eastAsia 字体");
+        assert_eq!(run.size_pt, Some(12.0), "样式里的 sz=24 半磅");
+        assert!(run.bold);
+
+        // 5) 主题字体：document.xml / styles.xml 里**一次都没有"等线"**（只有 theme1.xml 有），
+        //    所以能把 run 的字体解析成"等线"就证明主题字体链真的打通了
+        //    （WPS 习惯把算好的字体名直接写进 rFonts，那些 run 拿到的是"宋体"）。
+        let all_runs = || {
+            parsed
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    Block::Paragraph(paragraph) => Some(paragraph.runs.iter()),
+                    _ => None,
+                })
+                .flatten()
+        };
+        let from_theme = all_runs()
+            .find(|run| run.font.as_deref() == Some("等线"))
+            .expect("应有 run 的西文字体来自主题（docDefaults 只写了 asciiTheme）");
+        assert_eq!(from_theme.font_east_asia.as_deref(), Some("等线"), "a:ea 为空 → Hans 字体");
+        assert_eq!(from_theme.size_pt, Some(10.5), "docDefaults 的 sz=21 半磅 → 10.5pt");
+
+        let explicit = all_runs()
+            .find(|run| run.font.as_deref() == Some("宋体"))
+            .expect("样本里大量 run 显式写了字体名");
+        assert_eq!(explicit.font_east_asia.as_deref(), Some("宋体"));
+        // 这些 run 通常自带 sz（标题/正文各有各的），所以这里只断言字体来源，不断言字号
+        assert!(explicit.size_pt.is_some(), "显式写了字体的 run 一般也写了字号");
+
+        // 5.1) 段落的直接格式：样本里有 37 处 line=400 exact → 20pt 固定行距
+        let exact = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Paragraph(paragraph) => paragraph.line_spacing.as_ref(),
+                _ => None,
+            })
+            .find(|line| line.kind == "exact")
+            .expect("样本里有固定行距");
+        assert!((exact.value - 20.0).abs() < 0.01, "400 twip = 20pt");
+
+        // 6) 编号：16 个编号段落，前缀按各级格式算出（含中文数字与全角括号）
+        let lists: Vec<ListInfo> = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Paragraph(paragraph) => paragraph.list.clone(),
+                _ => None,
+            })
+            .collect();
+        let prefixes: Vec<String> = lists.iter().map(|list| list.prefix.clone()).collect();
+        eprintln!("样本编号前缀：{prefixes:?}");
+        assert_eq!(lists.len(), 16, "样本里应有 16 个编号段落");
+        assert_eq!(
+            prefixes,
+            vec![
+                "一、", "1、", "2、", "二、", "1、", "2、", "（1）", "（2）", "（3）", "（1）", "（2）",
+                "（3）", "（1）", "（2）", "（3）", "（4）"
+            ],
+            "多级/多套编号的前缀文本"
+        );
+        assert!(lists.iter().all(|list| list.ordered), "样本里都是有序编号");
+
+        // 7) 分页符：2 个独立分页块；占位块：这个文档不应有
+        let page_breaks = parsed
+            .blocks
+            .iter()
+            .filter(|block| matches!(block, Block::PageBreak))
+            .count();
+        assert_eq!(page_breaks, 2);
+        let unsupported: Vec<&str> = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Unsupported { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(unsupported.is_empty(), "这个样本没有不支持的对象：{unsupported:?}");
+
+        // 8) 命令行窗口与查找在真实文档上也能用
+        let page = document_blocks(path_string.clone(), 0, 5).expect("窗口取块应成功");
+        assert_eq!(page.total, parsed.blocks.len());
+        assert_eq!(page.blocks.len(), 5);
+        assert!(page.encrypted, "样本是亿赛通加密的");
+        let hits = document_find(path_string, "数据集".to_string(), false).expect("查找应成功");
+        assert!(!hits.is_empty(), "样本里应有「数据集」的命中");
+        assert!(hits[0].block < page.total);
+
+        // 9) 缓存：同一文件再取一次应命中缓存（结果一致）
+        let again = document_blocks(sample, 0, 5).expect("再取一次应成功");
+        assert_eq!(again.total, page.total);
+
+        let paragraph_blocks = parsed
+            .blocks
+            .iter()
+            .filter(|block| matches!(block, Block::Paragraph(_)))
+            .count();
+        eprintln!(
+            "真实样本：块总数 {}（段落 {} / 表格 {} / 图片 {} / 分页 {} / 占位 {}），编号段落 {}，第一段前缀 {:?}",
+            parsed.blocks.len(),
+            paragraph_blocks,
+            tables.len(),
+            images.len(),
+            page_breaks,
+            unsupported.len(),
+            lists.len(),
+            prefixes.first()
+        );
+    }
+}

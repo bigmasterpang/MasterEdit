@@ -3,7 +3,13 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { createDoc, docFromPayload, getActiveDoc, getDocById, useAppStore } from "../stores/appStore";
 import { askConfirm, askUnsaved, showMessage } from "../stores/dialogStore";
-import type { BinaryPayload, FilePayload, SheetSaveResult, SpreadsheetInfo } from "../types";
+import type {
+  BinaryPayload,
+  DocumentInfo,
+  FilePayload,
+  SheetSaveResult,
+  SpreadsheetInfo,
+} from "../types";
 import { loadPdfAnnotations, savePdfAnnotations } from "./persist";
 import {
   EMPTY_DOC_PLACEHOLDER,
@@ -13,6 +19,7 @@ import {
 import {
   fileName,
   isDelimitedPath,
+  isDocumentPath,
   isMarkdownPath,
   isOpenablePath,
   isPdfPath,
@@ -119,6 +126,29 @@ export async function openPath(path: string, targetPane?: 0 | 1): Promise<boolea
   }
 
   try {
+    // Word 文档（.docx）：只读查看，交给 Rust 侧解析 OOXML；不进入文本管线（否则会显示乱码）
+    if (isDocumentPath(path)) {
+      const info = await invoke<DocumentInfo>("document_info", { path });
+      const doc = createDoc({
+        filePath: path,
+        docType: "document",
+        pane: effectivePane,
+        content: "",
+        savedContent: "",
+        isDirty: false,
+        // DOCX 一律只读：需要编辑时用工具栏「打开方式」交给 Word / WPS
+        readOnly: true,
+        encrypted: info.encrypted,
+        modifiedAt: Date.now(),
+        size: info.parts.reduce((total, part) => total + part.size, 0),
+      });
+      useAppStore.getState().addDoc(doc);
+      void addRecentFile(path);
+      // 用户很可能用「打开方式」交给 Word 改完再回来：监听外部改动，自动重新解析
+      void watchFile(path);
+      return true;
+    }
+
     // 电子表格（xlsx/xls/xlsb/ods）：交给 Rust 侧 calamine 解析，只读查看，不读文本内容
     if (isSpreadsheetPath(path)) {
       const info = await invoke<SpreadsheetInfo>("spreadsheet_info", { path });

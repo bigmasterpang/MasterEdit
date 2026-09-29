@@ -72,6 +72,25 @@ export interface SheetMeta {
 }
 
 /** 后端 spreadsheet_info 返回：文件信息 + 工作表列表 */
+/**
+ * Word 文档（.docx）的包信息：只读查看用
+ * （DOCX 不做编辑，需要编辑时用工具栏「打开方式」交给 Word / WPS）
+ */
+export interface DocumentInfo {
+  /** 是否为亿赛通等透明加密文档（后端已在内存中解密） */
+  encrypted: boolean;
+  /** 是否可编辑 —— DOCX 目前一律 false */
+  editable: boolean;
+  /** 包内部件（名称 + 原始大小），按大小降序 */
+  parts: Array<{ name: string; size: number }>;
+  /** 段落数（初步统计） */
+  paragraphs: number;
+  /** 表格数 */
+  tables: number;
+  /** 图片数（word/media/ 下的文件数） */
+  images: number;
+}
+
 export interface SpreadsheetInfo {
   path: string;
   sheets: SheetMeta[];
@@ -227,7 +246,7 @@ export interface DocState {
   /** 当前文档独立缩放字号（未设置时跟随全局默认字号，互不影响双栏） */
   fontSize?: number;
   /** 新建文档类型：markdown / blank / pdf / spreadsheet（xlsx 可轻量编辑，xls/xlsb/ods 只读查看） */
-  docType?: "markdown" | "blank" | "pdf" | "spreadsheet";
+  docType?: "markdown" | "blank" | "pdf" | "spreadsheet" | "document";
   /** 表格待提交的单元格编辑（未保存前只存在于内存，保存时一次性写回） */
   sheetEdits?: SheetEdit[];
   /** 表格首次保存前是否已经确认过「重写工作簿」的提示（每个文档一次） */
@@ -347,4 +366,154 @@ export interface ConfirmRequest {
   confirmText?: string;
   cancelText?: string;
   danger?: boolean;
+}
+
+/* ------------------------------------------------------------------ */
+/* Word 文档（.docx）只读渲染的块模型                                   */
+/* 与 Rust `commands/office_docx.rs` 的序列化结构一一对应（camelCase，    */
+/* 单位已折算成 pt / px）。渲染见 `src/components/Docx/`。              */
+/* ------------------------------------------------------------------ */
+
+/** 文本片段：布尔值都是"样式继承链算完后的最终值" */
+export interface DocRun {
+  text: string;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  strike: boolean;
+  /** 西文字体（`w:rFonts/@w:ascii`） */
+  font: string | null;
+  /** 中日韩字体（`w:rFonts/@w:eastAsia`）—— 中文优先用它 */
+  fontEastAsia: string | null;
+  /** 字号（pt） */
+  sizePt: number | null;
+  /** 文字颜色（RRGGBB） */
+  color: string | null;
+  /** 高亮 / 底纹（RRGGBB） */
+  highlight: string | null;
+  /** 上标 / 下标 */
+  vertAlign: "superscript" | "subscript" | null;
+  /** 字符样式 id */
+  styleId: string | null;
+}
+
+/** 行距：multiple = 倍数；exact / atLeast = pt */
+export interface DocLineSpacing {
+  kind: string;
+  value: number;
+}
+
+/** 列表信息（前缀文本由后端算好，前端只负责显示与缩进） */
+export interface DocListInfo {
+  numId: number;
+  /** 层级（0 起） */
+  level: number;
+  ordered: boolean;
+  /** 该段应显示的前缀，如 `一、` / `1.` / `（1）` / `•` */
+  prefix: string;
+  /** `w:numFmt` 原值 */
+  format: string;
+  /** 标记与正文的间隔：tab / space / nothing */
+  suffix: string;
+}
+
+export interface DocParagraph {
+  /** 段落样式名（如「heading 4」） */
+  style: string | null;
+  styleId: string | null;
+  runs: DocRun[];
+  /** 段落纯文本（`\n` = 软换行、`\t` = 制表符） */
+  text: string;
+  /** left / center / right / both / distribute */
+  align: string | null;
+  indentLeftPt: number | null;
+  indentRightPt: number | null;
+  /** 首行缩进（pt，**负值 = 悬挂缩进**） */
+  indentFirstLinePt: number | null;
+  spaceBeforePt: number | null;
+  spaceAfterPt: number | null;
+  lineSpacing: DocLineSpacing | null;
+  list: DocListInfo | null;
+  /** 大纲级别 0..8（标题）；大纲侧栏只用它 */
+  outlineLevel: number | null;
+  pageBreakBefore: boolean;
+  /** 段落内部含分页符 */
+  pageBreak: boolean;
+  /** 分节符类型（nextPage / continuous / evenPage / oddPage） */
+  sectionBreak: string | null;
+}
+
+/** 纵向合并：restart = 起点，continue = 延续（不重复输出 `<td>`） */
+export type DocVMerge = "none" | "restart" | "continue";
+
+export interface DocCellBorders {
+  top: boolean;
+  left: boolean;
+  bottom: boolean;
+  right: boolean;
+}
+
+export interface DocTableCell {
+  /** 单元格内的块（多个段落，甚至嵌套表格） */
+  blocks: DocBlock[];
+  /** 单元格纯文本（各段以 `\n` 连接） */
+  text: string;
+  gridSpan: number;
+  vMerge: DocVMerge;
+  widthPx: number | null;
+  /** 底纹（RRGGBB） */
+  shading: string | null;
+  /** 垂直对齐：top / center / bottom */
+  vAlign: string | null;
+  borders: DocCellBorders;
+}
+
+export interface DocTableRow {
+  cells: DocTableCell[];
+  /** 行高（px）；`hRule="auto"` 时是最小高度 */
+  heightPx: number | null;
+  /** `w:tblHeader`：跨页重复的表头行 */
+  header: boolean;
+}
+
+export interface DocTable {
+  rows: DocTableRow[];
+  /** 列宽（px，来自 `w:tblGrid`） */
+  columns: number[];
+  /** 表格总宽（px） */
+  widthPx: number | null;
+  align: string | null;
+  borders: boolean;
+  styleId: string | null;
+}
+
+export interface DocImage {
+  /** 包内路径，如 `word/media/image1.png` */
+  media: string;
+  name: string | null;
+  alt: string | null;
+  widthPx: number;
+  heightPx: number;
+}
+
+/** 一个文档块：JSON 里带 `kind` 判别字段 */
+export type DocBlock =
+  | ({ kind: "paragraph" } & DocParagraph)
+  | ({ kind: "table" } & DocTable)
+  | ({ kind: "image" } & DocImage)
+  | { kind: "pageBreak" }
+  | { kind: "unsupported"; label: string; detail: string };
+
+/** `document_blocks` 的返回：窗口化的顶层块 + 真实块总数 */
+export interface DocBlockPage {
+  total: number;
+  from: number;
+  blocks: DocBlock[];
+  encrypted: boolean;
+}
+
+/** `document_find` 的一处命中（块级：一个块最多一条，`block` 是顶层块下标） */
+export interface DocFindHit {
+  block: number;
+  text: string;
 }

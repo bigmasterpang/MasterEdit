@@ -1,4 +1,5 @@
 pub mod esafenet;
+pub mod office_docx;
 pub mod open_with;
 pub mod file;
 pub mod textcodec;

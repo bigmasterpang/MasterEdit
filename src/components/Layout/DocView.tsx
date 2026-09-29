@@ -9,12 +9,13 @@ import { Icon } from "../common/Icon";
 
 const PdfViewer = lazy(() => import("../PDF/PdfViewer").then((m) => ({ default: m.PdfViewer })));
 // 表格视图（CSV 表格 / Excel 只读）按需加载：不打开表格文档就不进入首屏包
+const DocxView = lazy(() => import("../Docx/DocxView").then((m) => ({ default: m.DocxView })));
 const SheetView = lazy(() => import("../Sheet/SheetView").then((m) => ({ default: m.SheetView })));
 const SheetSplit = lazy(() => import("./SheetSplit").then((m) => ({ default: m.SheetSplit })));
 import { useMarkdown, type MarkdownResult } from "../../hooks/useMarkdown";
 import { useAppStore, getDocById } from "../../stores/appStore";
 import { useSettingsStore } from "../../stores/settingsStore";
-import { isDelimitedDoc, isMarkdownDoc, isPdfDoc, isSpreadsheetDoc } from "../../utils/filePath";
+import { isDelimitedDoc, isDocumentDoc, isMarkdownDoc, isPdfDoc, isSpreadsheetDoc } from "../../utils/filePath";
 import { REALTIME_PREVIEW_LIMIT } from "../../utils/constants";
 import { useTabDragStore } from "../../stores/tabDragStore";
 
@@ -142,6 +143,18 @@ export function DocView({ docId, pane, isDark, previewRef }: DocViewProps) {
             }
           >
             <PdfViewer key={doc.id} docId={doc.id} pane={pane} isDark={isDark} />
+          </Suspense>
+        ) : isDocumentDoc(doc) ? (
+          /* Word 文档（.docx）：只读查看（编辑交给 Word / WPS，见工具栏「打开方式」） */
+          <Suspense
+            fallback={
+              <div className="flex h-full flex-col items-center justify-center gap-2 text-muted">
+                <Icon name="loader" size={24} className="animate-spin text-accent" />
+                <div className="text-[12px]">加载 Word 文档模块…</div>
+              </div>
+            }
+          >
+            <DocxView key={doc.id} docId={doc.id} />
           </Suspense>
         ) : isSheet ? (
           <Suspense

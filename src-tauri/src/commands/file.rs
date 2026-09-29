@@ -256,7 +256,8 @@ pub async fn read_file_as_base64(path: String) -> Result<String, String> {
 const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// 无依赖 base64 编码（标准字母表，带 padding）。
-fn base64_encode(input: &[u8]) -> String {
+/// `pub(crate)`：docx 图片转 data URL（`office_docx::document_media`）复用同一份实现。
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -280,7 +281,8 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 /// 解码标准 base64（接受换行/空白，忽略非法字符）。
-fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+/// `pub(crate)`：docx 图片测试用来校验 data URL 里的字节。
+pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     let cleaned: Vec<u8> = input
         .bytes()
         .filter(|b| !b.is_ascii_whitespace())

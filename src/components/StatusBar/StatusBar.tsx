@@ -22,6 +22,7 @@ const KIND_LABEL = {
   pdf: "PDF",
   delimited: "CSV 表格",
   spreadsheet: "Excel 表格",
+  document: "Word 文档",
 } as const;
 
 /** 原始字数：源码中的字符数（不含空白），预览字数：渲染后可见字符数 */

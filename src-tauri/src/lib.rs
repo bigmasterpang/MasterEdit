@@ -1,4 +1,5 @@
-mod commands;
+// 对集成测试（tests/docx_corpus.rs 等）可见：语料库完备性测试要直接调用解析命令
+pub mod commands;
 
 use commands::{file, image, recent, watch};
 use std::sync::Mutex;
@@ -176,6 +177,12 @@ pub fn run() {
             #[cfg(windows)]
             commands::pdf::print_to_pdf,
             commands::open_with::open_with_app,
+            commands::office_docx::document_info,
+            commands::office_docx::document_xml,
+            // DOCX 块模型：窗口化取块 + 块级查找 + 图片 data URL（解析结果在 Rust 侧按文件缓存）
+            commands::office_docx::document_blocks,
+            commands::office_docx::document_find,
+            commands::office_docx::document_media,
             #[cfg(windows)]
             commands::update::check_update,
             #[cfg(windows)]
