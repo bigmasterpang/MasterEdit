@@ -2089,7 +2089,7 @@ function WorkbookSheet({ docId }: { docId: string }) {
               : undefined
           : undefined
       }
-      findBar={<SheetFindBar api={findApi} supportsRegex={true} />}
+      findBar={<SheetFindBar api={findApi} supportsRegex={false} />}
       readOnly={!editable}
       encrypted={info.encrypted}
       hint={
