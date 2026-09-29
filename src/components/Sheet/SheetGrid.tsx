@@ -109,6 +109,35 @@ const MAX_MANUAL_ROW_H = 1200;
 const RESIZE_HIT = 6;
 /** 拖拽填充柄（Excel 的小方块）的边长（px） */
 const FILL_HANDLE = 7;
+/** 拖拽时指针离容器边缘多少 px 内开始自动滚动（选区拖拽与填充拖拽共用，见 edgeScrollStep） */
+const AUTO_SCROLL_EDGE = 24;
+
+/**
+ * 拖拽会话的「贴边自动滚动」：指针靠近滚动容器边缘时给出本帧的滚动增量（选区拖拽与填充拖拽共用）。
+ * 垂直步长取「当前第一可见行」的高度：换行后一行可能远高于 ROW_H，固定 24px 会让人以为拖到边缘几乎不动
+ * （未开启换行时它就是 ROW_H，行为与以前一致）。没有真实布局（首帧 / 无头环境）时返回 0，不滚动。
+ */
+function edgeScrollStep(
+  el: HTMLElement,
+  geom: {
+    stickyH: number;
+    headerOffset: number;
+    rowIndex: { heightOf: (row: number) => number; virtualAt: (y: number) => number };
+  },
+  clientX: number,
+  clientY: number,
+): { dx: number; dy: number } {
+  const rect = el.getBoundingClientRect();
+  if (rect.bottom - rect.top <= 0) return { dx: 0, dy: 0 };
+  const stepH = Math.max(ROW_H, geom.rowIndex.heightOf(geom.rowIndex.virtualAt(el.scrollTop) + geom.headerOffset));
+  let dy = 0;
+  let dx = 0;
+  if (clientY < rect.top + geom.stickyH + AUTO_SCROLL_EDGE) dy = -stepH;
+  else if (clientY > rect.bottom - AUTO_SCROLL_EDGE) dy = stepH;
+  if (clientX < rect.left + GUTTER_W + AUTO_SCROLL_EDGE) dx = -AUTO_SCROLL_STEP_X;
+  else if (clientX > rect.right - AUTO_SCROLL_EDGE) dx = AUTO_SCROLL_STEP_X;
+  return { dx, dy };
+}
 
 /**
  * 拖拽填充的目标区域：从 source 出发，按指针位置**单向**扩展（Excel 语义）。
@@ -3067,33 +3096,66 @@ export function SheetGrid({
   }, [onFillRange, editable, empty, sel]);
   /** 拖拽中的虚线预览（null = 没在拖）；source 固定，target 随指针单向扩展 */
   const [fillPreview, setFillPreview] = useState<{ source: SheetRange; target: SheetRange } | null>(null);
-  /** 会话里的权威状态：目标区域同步写在 ref 里，松手时不依赖「预览已经渲染过」 */
-  const fillDragRef = useRef<{ source: SheetRange; target: SheetRange } | null>(null);
+  /**
+   * 会话里的权威状态：目标区域同步写在 ref 里，松手时不依赖「预览已经渲染过」；
+   * clientX/clientY 记最后一次有效指针位置 —— 自动滚动与「松手时指针在容器外」都靠它。
+   */
+  const fillDragRef = useRef<{ source: SheetRange; target: SheetRange; clientX: number; clientY: number } | null>(null);
 
   /** 按下填充柄：建立会话（**不改选区、不改内容、不进入编辑**） */
   const beginFillDrag = useCallback((row: number, col: number) => {
     const source = rangeRef.current ?? singleRange(row, col);
-    fillDragRef.current = { source, target: source };
+    fillDragRef.current = { source, target: source, clientX: 0, clientY: 0 };
     setFillPreview({ source, target: source });
   }, []);
 
   useEffect(() => {
-    const onMove = (event: MouseEvent) => {
+    /** 指针位置 → 目标区域（滚动后也要重算：指针下的格子变了） */
+    const applyFillPointer = (clientX: number, clientY: number) => {
       const session = fillDragRef.current;
       if (!session) return;
-      const point = pointToCellRef.current(event.clientX, event.clientY);
+      session.clientX = clientX;
+      session.clientY = clientY;
+      const point = pointToCellRef.current(clientX, clientY);
       if (!point) return;
       const target = extendFillTarget(session.source, point);
       session.target = target;
       // 目标没变就不 setState（拖动期间每一帧都渲染太浪费）
       setFillPreview((prev) => (prev && sameRange(prev.target, target) ? prev : { source: session.source, target }));
     };
+
+    /* 贴边自动滚动：与选区拖拽同一套步长/边缘判定；滚动后重算目标 → 预览与最终回调都跟着长 */
+    let raf: number | null = null;
+    const schedule = () => {
+      if (raf === null) raf = window.requestAnimationFrame(tick);
+    };
+    const tick = () => {
+      raf = null;
+      const session = fillDragRef.current;
+      const el = scrollerRef.current;
+      if (!session || !el) return;
+      const { dx, dy } = edgeScrollStep(el, geomRef.current, session.clientX, session.clientY);
+      if (dx === 0 && dy === 0) return;
+      const beforeTop = el.scrollTop;
+      const beforeLeft = el.scrollLeft;
+      el.scrollTop = beforeTop + dy;
+      el.scrollLeft = beforeLeft + dx;
+      if (el.scrollTop === beforeTop && el.scrollLeft === beforeLeft) return; // 已经到边（工作表末尾）
+      applyFillPointer(session.clientX, session.clientY);
+      schedule();
+    };
+
+    const onMove = (event: MouseEvent) => {
+      if (!fillDragRef.current) return;
+      applyFillPointer(event.clientX, event.clientY);
+      schedule(); // 指针贴边时由它起自动滚动循环；离开边缘后 tick 自己返回
+    };
     const onUp = () => {
       const session = fillDragRef.current;
       fillDragRef.current = null;
       setFillPreview(null);
       if (!session) return;
-      // 拖回原选区（没有扩展）→ 不回调
+      // 拖回原选区（没有扩展）→ 不回调；指针在容器外时按最后一次有效位置算出的 target 回调
       if (sameRange(session.source, session.target)) return;
       callbacksRef.current.onFillRange?.(session.source, session.target);
     };
@@ -3110,6 +3172,7 @@ export function SheetGrid({
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       window.removeEventListener("keydown", onKeyDown, true);
+      if (raf !== null) window.cancelAnimationFrame(raf);
     };
   }, []);
 
@@ -3149,7 +3212,6 @@ export function SheetGrid({
     };
 
     let raf: number | null = null;
-    const EDGE = 24;
     const schedule = () => {
       if (raf === null) raf = window.requestAnimationFrame(tick);
     };
@@ -3158,18 +3220,7 @@ export function SheetGrid({
       const drag = dragRef.current;
       const el = scrollerRef.current;
       if (!drag || !el) return;
-      const rect = el.getBoundingClientRect();
-      if (rect.bottom - rect.top <= 0) return; // 没有真实布局（首帧 / 无头环境）时不自动滚动
-      let dy = 0;
-      let dx = 0;
-      // 垂直自动滚动步长取「当前第一可见行」的高度：换行后一行可能远高于 ROW_H，
-      // 固定 24px 会让人以为拖到边缘几乎不动（未开启换行时它就是 ROW_H，行为与以前一致）
-      const geom = geomRef.current;
-      const stepH = Math.max(ROW_H, geom.rowIndex.heightOf(geom.rowIndex.virtualAt(el.scrollTop) + geom.headerOffset));
-      if (drag.clientY < rect.top + geom.stickyH + EDGE) dy = -stepH;
-      else if (drag.clientY > rect.bottom - EDGE) dy = stepH;
-      if (drag.clientX < rect.left + GUTTER_W + EDGE) dx = -AUTO_SCROLL_STEP_X;
-      else if (drag.clientX > rect.right - EDGE) dx = AUTO_SCROLL_STEP_X;
+      const { dx, dy } = edgeScrollStep(el, geomRef.current, drag.clientX, drag.clientY);
       if (dx === 0 && dy === 0) return;
       const beforeTop = el.scrollTop;
       const beforeLeft = el.scrollLeft;

@@ -1608,7 +1608,16 @@ function WorkbookSheet({ docId }: { docId: string }) {
            */
           const restored = useBefore ? cell.before : cell.after;
           list = list.filter((edit) => editKey(edit.sheet, edit.row, edit.col) !== cell.key);
-          if (restored) list = [...list, restored];
+          /**
+           * 撤销时如果恢复出来的值就等于**文件里的原值**，就不该再留在待提交列表里 ——
+           * 否则界面明明回到了原样，文档却一直提示「有未保存改动」，再按 Ctrl+S 还会写一次相同的值
+           * （拖拽填充后撤销最容易碰到：填了一大片、撤销后仍显示未保存）。
+           * 行还没加载时拿不到文件原值，保守起见仍然放回去（多一条无副作用的编辑，不影响正确性）。
+           */
+          const fileCell = restored ? rowsRef.current.get(restored.row)?.[restored.col] : undefined;
+          const fileText = fileCell ? (fileCell.f ?? fileCell.v) : null;
+          const sameAsFile = restored !== null && fileText !== null && restored.value === fileText;
+          if (restored && !(useBefore && sameAsFile)) list = [...list, restored];
         }
         commitHistoryStep<SheetEdit>(docId, direction, step);
         useAppStore.getState().patchDoc(docId, { sheetEdits: list, isDirty: list.length > 0 });
