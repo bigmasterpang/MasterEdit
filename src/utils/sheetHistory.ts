@@ -115,10 +115,6 @@ export function sheetHistory<T>(docId: string): {
   return slotOf(docId) as unknown as { undo: Array<HistoryStep<T>>; redo: Array<HistoryStep<T>> };
 }
 
-/** 当前布局版本（新建单元格步骤时记下它） */
-export function currentLayoutVersion(docId: string): number {
-  return slotOf(docId).layoutOps.length;
-}
 
 /** 记录一步单元格编辑（任何新操作都会清空重做栈） */
 export function pushCellStep<T>(docId: string, cells: Array<HistoryCell<T>>): void {

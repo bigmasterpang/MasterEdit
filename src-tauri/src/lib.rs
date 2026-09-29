@@ -175,6 +175,7 @@ pub fn run() {
             watch::unwatch_file,
             #[cfg(windows)]
             commands::pdf::print_to_pdf,
+            commands::open_with::open_with_app,
             #[cfg(windows)]
             commands::update::check_update,
             #[cfg(windows)]

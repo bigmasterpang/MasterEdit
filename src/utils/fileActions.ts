@@ -74,14 +74,6 @@ export async function removeRecentFile(path: string): Promise<void> {
   }
 }
 
-export async function clearRecentFiles(): Promise<void> {
-  try {
-    const list = await invoke<string[]>("clear_recent_files");
-    useAppStore.getState().setRecentFiles(list);
-  } catch (error) {
-    console.error("清空最近文件失败", error);
-  }
-}
 
 /* ------------------------------ 文件监听 ------------------------------ */
 
@@ -758,4 +750,46 @@ export async function openExternal(url: string): Promise<void> {
   } catch (error) {
     await showMessage("无法打开链接", `${url}\n\n${String(error)}`);
   }
+}
+
+/* ------------------------- 调用本地其它应用打开 ------------------------- */
+
+/**
+ * 调用本地其它应用打开**磁盘上**的文件。
+ *
+ * - `default`：系统默认关联程序（等同在资源管理器里双击）
+ * - `choose`：弹出 Windows 的「打开方式」对话框，临时挑一个程序
+ *
+ * 传的是原始路径：企业加密文档由系统驱动在目标程序里透明解密，
+ * 我们**不会**为了给外部程序看而写明文临时文件。
+ */
+export async function openWithExternalApp(
+  path: string,
+  mode: "default" | "choose" = "default",
+): Promise<void> {
+  try {
+    await invoke("open_with_app", { path, mode });
+  } catch (error) {
+    await showMessage("无法打开", String(error));
+  }
+}
+
+/** 用其它应用打开**当前文档**；有未保存改动时先说明"外部打开的是磁盘版本" */
+export async function openActiveDocWithExternalApp(
+  mode: "default" | "choose" = "default",
+): Promise<void> {
+  const doc = getActiveDoc();
+  if (!doc?.filePath) {
+    await showMessage("无法打开", "该文档还没有保存到磁盘，请先保存后再用其它应用打开。");
+    return;
+  }
+  if (doc.isDirty) {
+    const ok = await askConfirm({
+      title: "文档有未保存的改动",
+      message: "外部应用打开的是磁盘上的版本，未保存的改动不会包含在内。要继续吗？",
+      confirmText: "仍然打开",
+    });
+    if (!ok) return;
+  }
+  await openWithExternalApp(doc.filePath, mode);
 }

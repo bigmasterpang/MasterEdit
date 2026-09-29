@@ -1,4 +1,5 @@
 pub mod esafenet;
+pub mod open_with;
 pub mod file;
 pub mod textcodec;
 pub mod image;

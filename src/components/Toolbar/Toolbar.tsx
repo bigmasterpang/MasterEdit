@@ -37,6 +37,7 @@ import { exportDocxFile } from "../../utils/exportDocx";
 import { exportPdfFile } from "../../utils/exportPdf";
 import {
   newDocument,
+  openActiveDocWithExternalApp,
   openFileDialog,
   saveActive,
   saveActiveAs,
@@ -310,6 +311,27 @@ export function Toolbar({ previewRef, isDark }: ToolbarProps) {
         label="另存为 (Ctrl+Shift+S)"
         disabled={!hasDoc}
         onClick={() => void saveActiveAs()}
+      />
+      {/* 用本地其它应用打开当前文档（Excel / CSV 需要完整编辑能力时最顺手；加密文档由系统驱动透明解密） */}
+      <DropdownMenu
+        icon="external-link"
+        label="打开方式"
+        title="用本地其它应用打开当前文档（打开的是磁盘上的版本）"
+        disabled={!doc?.filePath}
+        groups={[
+          {
+            items: [
+              {
+                label: "用系统默认程序打开",
+                onClick: () => void openActiveDocWithExternalApp("default"),
+              },
+              {
+                label: "选择其它应用…",
+                onClick: () => void openActiveDocWithExternalApp("choose"),
+              },
+            ],
+          },
+        ]}
       />
 
       <Divider />

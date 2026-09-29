@@ -275,12 +275,6 @@ export function toggleHighlight(): void {
 export function toggleUnderline(): void {
   toggleWrap("++", "下划线");
 }
-export function insertLink(): void {
-  wrapSelection("[", "](https://)", "链接文字");
-}
-export function insertImage(): void {
-  wrapSelection("![", "](assets/image.png)", "图片描述");
-}
 
 /* ------------------------------ 块级结构 ------------------------------ */
 
@@ -572,32 +566,6 @@ export function deleteLines(): void {
   });
 }
 
-/** 切换当前行的任务勾选状态 */
-export function toggleTaskAtCursor(): void {
-  withEditorView((view) => {
-    const { state } = view;
-    const changes: ChangeSpec[] = [];
-    for (const line of selectedLines(state)) {
-      const text = line.text;
-      const task = TASK_RE.exec(text);
-      if (task) {
-        const checked = task[3].toLowerCase() === "x";
-        const next = text.replace(TASK_RE, `$1$2 [${checked ? " " : "x"}] `);
-        changes.push({ from: line.from, to: line.to, insert: next });
-      } else {
-        const stripped = stripMarkers(text);
-        const indent = /^\s*/.exec(stripped)?.[0] ?? "";
-        changes.push({
-          from: line.from,
-          to: line.to,
-          insert: `${indent}- [ ] ${stripped.slice(indent.length)}`,
-        });
-      }
-    }
-    applyChanges(view, changes);
-    view.focus();
-  });
-}
 
 /** 大小写转换 */
 export function transformCase(kind: "upper" | "lower" | "title"): void {
@@ -623,9 +591,6 @@ export function transformCase(kind: "upper" | "lower" | "title"): void {
 
 /* ------------------------------ 视图辅助 ------------------------------ */
 
-export function focusEditor(): void {
-  withEditorView((view) => view.focus());
-}
 
 /** 跳转到指定行（0 起） */
 export function scrollToLine(line: number): void {

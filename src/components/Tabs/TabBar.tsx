@@ -11,6 +11,7 @@ import {
   closeOtherDocsWithConfirm,
   closeRightDocsWithConfirm,
   newDocument,
+  openActiveDocWithExternalApp,
   openFileDialog,
   reloadDocFromDisk,
   saveDoc,
@@ -149,6 +150,12 @@ export function TabBar({ pane = 0 }: Props) {
                     await showMessage("无法打开", String(error));
                   });
                 },
+              },
+              {
+                label: "选择其它应用打开…",
+                icon: "external-link" as IconName,
+                // 弹出 Windows「打开方式」对话框，临时挑一个程序（例如专门用 WPS 打开这个表）
+                onClick: () => void openActiveDocWithExternalApp("choose"),
               },
               {
                 label: "在文件资源管理器中显示",

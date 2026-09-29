@@ -146,9 +146,6 @@ export function docKindOf(p: string | null | undefined): DocKind {
   return ext === "" ? "text" : "code";
 }
 
-export function isTextPath(p: string): boolean {
-  return TEXT_EXTENSIONS.includes(extName(p));
-}
 
 /**
  * 文本类文档「自动只读」的体积阈值。
@@ -175,10 +172,6 @@ export function isExternalUrl(src: string): boolean {
   return /^(https?:|mailto:|tel:|data:|asset:|blob:|#)/i.test(src.trim());
 }
 
-/** 是否是绝对本地路径（C:\ 或 \\server 或 /） */
-export function isAbsoluteLocalPath(src: string): boolean {
-  return /^[a-zA-Z]:[\\/]/.test(src) || src.startsWith("\\\\") || src.startsWith("/");
-}
 
 /** 拼接目录与相对路径 */
 export function joinPath(dir: string, rel: string): string {
@@ -216,18 +209,4 @@ export function resolveLocalImagePath(
   return joinPath(dir, decoded);
 }
 
-/** 相对路径（用于状态栏/提示展示） */
-export function relativeToDoc(docPath: string | null, target: string): string {
-  if (!docPath) return target;
-  const dir = normalizeSlashes(dirName(docPath)).toLowerCase();
-  const t = normalizeSlashes(target);
-  if (dir && t.toLowerCase().startsWith(dir + "\\")) {
-    return t.slice(dir.length + 1);
-  }
-  return target;
-}
 
-/** 读取用于展示的编码名 */
-export function encodingLabel(): string {
-  return "UTF-8";
-}

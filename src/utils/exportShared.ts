@@ -49,12 +49,6 @@ export async function inlineLocalImages(root: HTMLElement): Promise<number> {
   return count;
 }
 
-/** 读取图片为 dataURL（导出 DOCX 时使用） */
-export async function imageToDataUrl(src: string): Promise<string | null> {
-  if (src.startsWith("data:")) return src;
-  if (/^https?:/i.test(src)) return null; // 远程图片不做内联，避免跨域问题
-  return null;
-}
 
 /** 读取图片二进制与尺寸（用于 DOCX 内嵌图片） */
 export async function loadImageBinary(

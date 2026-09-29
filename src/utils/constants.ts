@@ -2,7 +2,6 @@ export const APP_NAME = "MasterEdit";
 /** 作者信息 */
 export const AUTHOR_NAME = "Master Wang";
 export const AUTHOR_NAME_CN = "王大师";
-export const AUTHOR_TITLE = "Master Wang（王大师）";
 export const PROJECT_URL = "https://github.com/bigmasterpang/MasterEdit";
 
 /** 可打开为 Markdown 的扩展名 */
@@ -117,8 +116,6 @@ export const MIN_AUTOSAVE_INTERVAL = 5;
 export const MIN_FONT_SIZE = 11;
 export const MAX_FONT_SIZE = 24;
 
-/** 最近文件上限 */
-export const RECENT_LIMIT = 10;
 
 /** 空文档默认内容 */
 export const EMPTY_DOC_PLACEHOLDER = `# 未命名文档

@@ -489,60 +489,21 @@ export function useSheetFind(options: UseSheetFindOptions): SheetFindApi {
   );
 }
 
-/** 兼容旧接线（state + 回调）的入参；新接线请直接传 `api` */
-interface LegacySheetFindBarProps {
-  state: SheetFindState;
-  onQueryChange: (value: string) => void;
-  onRun: () => void;
-  onNext: (delta: number) => void;
-  onClose: () => void;
-}
-
 export interface SheetFindBarProps {
-  /** `useSheetFind` 的返回值（新接线方式） */
-  api?: SheetFindApi;
+  /** `useSheetFind` 的返回值 */
+  api: SheetFindApi;
   /** 当前文档是否支持正则：xlsx 传 false（`.*` 置灰 + tooltip 说明） */
   supportsRegex?: boolean;
-  /** @deprecated 旧接线的 props；只传 state + 回调时渲染原来的内联查找栏 */
-  state?: SheetFindState;
-  /** @deprecated 见 state */
-  onQueryChange?: (value: string) => void;
-  /** @deprecated 见 state */
-  onRun?: () => void;
-  /** @deprecated 见 state */
-  onNext?: (delta: number) => void;
-  /** @deprecated 见 state */
-  onClose?: () => void;
 }
 
 /**
- * 查找 / 替换栏。
- * - 传 `api` → 渲染**浮动面板**（fixed 定位：不占布局高度，也不会被网格的 overflow 裁掉）；
- * - 只传旧的 state + 回调 → 渲染原来的内联一行（等 SheetView 接线完成即可删掉这条分支）。
+ * 查找 / 替换栏：渲染**浮动面板**（fixed 定位，不占布局高度，也不会被网格的 overflow 裁掉）。
  *
  * 注意：面板用 `position: fixed`。若某个祖先带 `transform` / `filter` / `contain: paint`，
  * fixed 会退化成相对该祖先定位并被它裁剪 —— 请把面板挂在没有这些属性的层级上。
  */
-export function SheetFindBar({
-  api,
-  supportsRegex = true,
-  state,
-  onQueryChange,
-  onRun,
-  onNext,
-  onClose,
-}: SheetFindBarProps) {
-  if (api) return <SheetFindPanel api={api} supportsRegex={supportsRegex} />;
-  if (!state || !onQueryChange || !onRun || !onNext || !onClose) return null;
-  return (
-    <LegacySheetFindBar
-      state={state}
-      onQueryChange={onQueryChange}
-      onRun={onRun}
-      onNext={onNext}
-      onClose={onClose}
-    />
-  );
+export function SheetFindBar({ api, supportsRegex = true }: SheetFindBarProps) {
+  return <SheetFindPanel api={api} supportsRegex={supportsRegex} />;
 }
 
 /** 浮动查找 / 替换面板 */
@@ -788,79 +749,5 @@ export function SheetFindPanel({ api, supportsRegex = true }: { api: SheetFindAp
         </>
       ) : null}
     </div>
-  );
-}
-
-/**
- * @deprecated 旧的内联查找栏（挂在内容栏同一行右侧）。保留只为让 SheetView 的旧接线继续编译，
- * 接线换成 `api` 之后可以删掉这一整个组件与 `SheetFindBar` 里的兼容分支。
- */
-function LegacySheetFindBar({ state, onQueryChange, onRun, onNext, onClose }: LegacySheetFindBarProps) {
-  const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (state.open) inputRef.current?.focus();
-  }, [state.open]);
-
-  if (!state.open) return null;
-  const total = state.hits.length;
-  const current = state.index >= 0 ? state.index + 1 : 0;
-  const stale = state.query.trim() !== state.resultQuery;
-
-  return (
-    <span className="flex shrink-0 items-center gap-1 text-[12px]">
-      <Icon name="search" size={13} className="shrink-0 text-muted" />
-      <input
-        ref={inputRef}
-        value={state.query}
-        onChange={(event) => onQueryChange(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") {
-            event.preventDefault();
-            // 改过查询词（或还没有结果）就重新查找，否则在结果之间移动
-            if (stale || total === 0) onRun();
-            else onNext(event.shiftKey ? -1 : 1);
-          } else if (event.key === "Escape") {
-            event.preventDefault();
-            onClose();
-          }
-        }}
-        placeholder="查找…（Enter 查找 / 下一个）"
-        spellCheck={false}
-        className="w-[190px] shrink-0 rounded border border-line bg-app px-1.5 py-0.5 text-[12px] text-fg outline-none focus:border-accent"
-      />
-      <span className="w-[74px] shrink-0 text-[11px] text-faint">
-        {state.busy
-          ? "查找中…"
-          : total > 0
-            ? `${current}/${total}${state.capped ? "+" : ""}${stale ? " *" : ""}`
-            : state.query
-              ? "无结果"
-              : ""}
-      </span>
-      <button
-        type="button"
-        onClick={() => onNext(-1)}
-        title="上一个 (Shift+F3)"
-        className="rounded px-1 text-muted hover:bg-hover hover:text-fg"
-      >
-        ↑
-      </button>
-      <button
-        type="button"
-        onClick={() => onNext(1)}
-        title="下一个 (F3)"
-        className="rounded px-1 text-muted hover:bg-hover hover:text-fg"
-      >
-        ↓
-      </button>
-      <button
-        type="button"
-        onClick={onClose}
-        title="关闭 (Esc)"
-        className="rounded px-1 text-muted hover:bg-hover hover:text-fg"
-      >
-        ✕
-      </button>
-    </span>
   );
 }

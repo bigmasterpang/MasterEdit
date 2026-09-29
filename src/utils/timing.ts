@@ -18,39 +18,6 @@ export function debounce<A extends unknown[]>(
   return wrapped;
 }
 
-/** 节流：按时间间隔执行（默认使用 rAF 合并到下一帧） */
-export function throttle<A extends unknown[]>(
-  fn: (...args: A) => void,
-  wait: number,
-): (...args: A) => void {
-  let last = 0;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  let pending: A | null = null;
-
-  return (...args: A) => {
-    const now = Date.now();
-    const remaining = wait - (now - last);
-    pending = args;
-    if (remaining <= 0) {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      last = now;
-      fn(...args);
-      pending = null;
-    } else if (timer === null) {
-      timer = setTimeout(() => {
-        timer = null;
-        last = Date.now();
-        if (pending) {
-          fn(...pending);
-          pending = null;
-        }
-      }, remaining);
-    }
-  };
-}
 
 /** 统计字数：中文按字计，西文按词计 */
 export function countWords(text: string): number {

@@ -39,19 +39,3 @@ export function useTheme(): boolean {
   return isDark;
 }
 
-/** 监听系统主题（供预览中的 Mermaid 主题切换使用） */
-export function useIsDark(): boolean {
-  const theme = useSettingsStore((s) => s.theme);
-  const [systemDark, setSystemDark] = useState(() =>
-    typeof window !== "undefined"
-      ? window.matchMedia("(prefers-color-scheme: dark)").matches
-      : false,
-  );
-  useEffect(() => {
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const onChange = (e: MediaQueryListEvent) => setSystemDark(e.matches);
-    mq.addEventListener("change", onChange);
-    return () => mq.removeEventListener("change", onChange);
-  }, []);
-  return theme === "dark" || (theme === "system" && systemDark);
-}

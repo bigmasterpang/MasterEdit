@@ -603,10 +603,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }),
 }));
 
-/** 当前活动文档（无文档时为 null） */
-export function useActiveDoc(): DocState | null {
-  return useAppStore((s) => s.docs.find((d) => d.id === s.activeId) ?? null);
-}
 
 /** 非响应式地读取当前文档 */
 export function getActiveDoc(): DocState | null {
