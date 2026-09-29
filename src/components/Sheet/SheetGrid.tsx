@@ -107,6 +107,30 @@ const MIN_MANUAL_ROW_H = ROW_H;
 const MAX_MANUAL_ROW_H = 1200;
 /** 列/行边界的命中区厚度（px）：贴边拖动才不费劲，又不至于挡住正常点选 */
 const RESIZE_HIT = 6;
+/** 拖拽填充柄（Excel 的小方块）的边长（px） */
+const FILL_HANDLE = 7;
+
+/**
+ * 拖拽填充的目标区域：从 source 出发，按指针位置**单向**扩展（Excel 语义）。
+ * 只扩行或只扩列，取超出的格数更多的那一维；指针落在 source 内部时原样返回（没有扩展）。
+ */
+export function extendFillTarget(source: SheetRange, point: { row: number; col: number }): SheetRange {
+  const down = Math.max(0, point.row - source.endRow);
+  const up = Math.max(0, source.startRow - point.row);
+  const right = Math.max(0, point.col - source.endCol);
+  const left = Math.max(0, source.startCol - point.col);
+  const vertical = Math.max(down, up);
+  const horizontal = Math.max(right, left);
+  if (vertical === 0 && horizontal === 0) return source;
+  if (vertical >= horizontal) {
+    return down >= up
+      ? { ...source, endRow: source.endRow + down }
+      : { ...source, startRow: source.startRow - up };
+  }
+  return right >= left
+    ? { ...source, endCol: source.endCol + right }
+    : { ...source, startCol: source.startCol - left };
+}
 
 type GetCell = (row: number, col: number) => SheetCell | undefined;
 
@@ -256,6 +280,13 @@ export interface SheetGridProps {
    * 目标落在冻结区里时不滚动（与 ensureVisible 的既有语义一致）；不传时行为与改动前一致。
    */
   scrollTarget?: { row: number; col: number; token: number } | null;
+  /**
+   * 拖拽自动填充（Excel 的填充柄）完成时回调：
+   * `source` 是原选区（提供规律样本），`target` 是填充后的完整区域（**一定包含 source**，
+   * 且只朝行方向或列方向单向扩展）。规律推断与写入由父组件负责（见 utils/fillSeries.ts）。
+   * **不传这个回调就完全不渲染填充柄**（DOM 与改动前逐字节一致）。
+   */
+  onFillRange?: (source: SheetRange, target: SheetRange) => void;
 }
 
 /** 公式补全匹配器（从 props 里派生，保证与 props 签名永远一致） */
@@ -858,8 +889,11 @@ interface SheetCellEditorProps {
   onPickCancel: () => void;
   /** 文本是否以 = 开头变化时通知网格 */
   onFormulaModeChange: (active: boolean) => void;
-  /** 正在编辑的这格是查找命中：编辑框改用命中提示底色（否则「正在编辑的命中格」完全看不出是命中） */
-  hitTint?: boolean;
+  /**
+   * 正在编辑的这格是不是查找命中：编辑框是不透明的，底色不换就完全看不出命中。
+   * `current` = 当前命中（面板上的「当前/总数」），用更重的底色 + 2px 高对比描边。
+   */
+  hitTint?: "none" | "hit" | "current";
 }
 
 /** 候选面板状态：字段与 FormulaSuggestPanel 期望的 state 一致（外加一个等价性 key） */
@@ -896,7 +930,7 @@ function SheetCellEditor({
   readPicking,
   onPickCancel,
   onFormulaModeChange,
-  hitTint = false,
+  hitTint = "none",
 }: SheetCellEditorProps): JSX.Element {
   const inputRef = useRef<HTMLInputElement>(null);
   /** Enter / Esc / blur 可能在一个提交里接连发生，用它保证一次编辑只提交或取消失败一次 */
@@ -1094,9 +1128,14 @@ function SheetCellEditor({
         spellCheck={false}
         autoComplete="off"
         aria-label={`编辑 ${columnLabel(col)}${row + 1}`}
-        className={`absolute top-0 z-[3] truncate border-r border-b border-line px-1.5 text-[12px] text-fg outline-none! ring-2 ring-inset ring-accent ${
-          // 正在编辑的命中格：底色换成命中提示色（编辑框本来是不透明的 bg-app，会把命中提示整个盖住）
-          hitTint ? "bg-warning/25" : "bg-app"
+        className={`absolute top-0 z-[3] truncate border-r border-b border-line px-1.5 text-[12px] text-fg outline-none! ${
+          // 正在编辑的命中格：底色换成命中提示色（编辑框本来是不透明的 bg-app，会把命中提示整个盖住）；
+          // 当前命中还要把 accent 描边让给 2px 高对比描边，否则「停在编辑中的那一条」看不出来
+          hitTint === "current"
+            ? "bg-warning/40 ring-2 ring-inset ring-fg"
+            : hitTint === "hit"
+              ? "bg-warning/25 ring-2 ring-inset ring-accent"
+              : "bg-app ring-2 ring-inset ring-accent"
         }`}
         // 可变行高：编辑框跟行一起长高，但 <input> 始终单行，文本按 ROW_H 行高在框内顶部对齐
         style={{ left, width, height, lineHeight: `${ROW_H}px` }}
@@ -1193,6 +1232,13 @@ interface SheetRowProps {
   hitKeys: ReadonlySet<string>;
   /** 当前定位到的那条命中（`"row,col"`；空串 = 没有） */
   currentHitKey: string;
+  /**
+   * 本行是不是选区的最后一行（拖拽填充柄就挂在这一行的右下角）；-1 表示本行没有填充柄。
+   * 值 = 选区右下角的列号（可能落在冻结列里 → 手柄要放进冻结块）。
+   */
+  fillHandleCol: number;
+  /** 按下填充柄：起手一次拖拽填充会话（移动/松手在 window 上） */
+  onFillHandleDown: (row: number, col: number, clientX: number, clientY: number) => void;
 }
 
 /**
@@ -1239,6 +1285,8 @@ const SheetRow = memo(function SheetRow({
   showRowDivider,
   hitKeys,
   currentHitKey,
+  fillHandleCol,
+  onFillHandleDown,
 }: SheetRowProps): JSX.Element {
   /**
    * 生成一格。冻结列与滚动列共用这一段（只是放进不同的容器），所以样式/事件/选区逻辑只有一处。
@@ -1263,28 +1311,32 @@ const SheetRow = memo(function SheetRow({
     /**
      * 查找命中提示：一层比选区更浅的底色（warning 系浅色，与蓝色的选区/活动格一眼可分）。
      * **命中一律有底色**（包括落在选区里的）—— 用户在「范围=选区」里查找时，命中全都在选区底色上，
-     * 不给底色就等于「搜了看不见」。为了在蓝色选区底上仍然明显，选区内/活动格的命中用更强一档的
-     * `bg-warning/40`，普通命中 `bg-warning/15`，当前命中再叠一圈细描边。
-     * 注意：活动格自己已有 `ring-2 ring-accent`，此时**不加** warning 描边（否则两个 ring 会互相盖）。
+     * 不给底色就等于「搜了看不见」。强度分档：
+     * - 普通命中：`bg-warning/15`；选区里的命中：`bg-warning/40`（蓝色底上要更重才看得出来）
+     * - **当前命中**（面板上的「当前/总数」）：`bg-warning/60` + **2px 中性高对比描边**（`ring-2 ring-fg`），
+     *   一眼就能看到现在停在哪一条 —— 用户反馈过「当前命中只有一个很细的外框，不够明显」。
+     *   描边用中性色而不是 warning 实色：浅色主题 warning 是深琥珀、深色主题是亮琥珀，
+     *   铺在琥珀底色上会糊成一片；中性色在两种主题下都和底色、选区蓝拉开对比。
      */
     const cellKey = `${row},${col}`;
     const isHit = hitKeys.size > 0 && hitKeys.has(cellKey);
     const isCurrentHit = isHit && cellKey === currentHitKey;
     // 注意：无选区时下面拼出的 class 与改造前逐字节一致（只读路径的硬要求）；
-    // 命中格的活动格底色让给命中色（同一个 background-color 只能有一个，靠 CSS 顺序决胜负太脆）
+    // 命中格的活动格底色让给命中色（同一个 background-color 只能有一个，靠 CSS 顺序决胜负太脆）；
+    // 当前命中连活动格的 accent 描边也让位 —— 2px 高对比描边必须完整可见
     const activeClass = isActive && !coveredByEditor
       ? anchorInSelection
-        ? " z-[1] ring-1 ring-inset ring-accent"
-        : ` z-[1] ring-2 ring-inset ring-accent${isHit ? "" : " bg-accent-soft"}`
+        ? ` z-[1]${isCurrentHit ? "" : " ring-1 ring-inset ring-accent"}`
+        : ` z-[1]${isCurrentHit ? "" : " ring-2 ring-inset ring-accent"}${isHit ? "" : " bg-accent-soft"}`
       : "";
     const fillClass = fill && !isHit ? " bg-accent/10" : "";
     const hitInSelection = isHit && (fill || isActive);
     const hitClass = !isHit
       ? ""
-      : hitInSelection
-        ? ` bg-warning/40${isCurrentHit && !isActive ? " ring-1 ring-inset ring-warning/70" : ""}`
-        : isCurrentHit
-          ? " bg-warning/30 ring-1 ring-inset ring-warning/60"
+      : isCurrentHit
+        ? " bg-warning/60 ring-2 ring-inset ring-fg"
+        : hitInSelection
+          ? " bg-warning/40"
           : " bg-warning/15";
     // 冻结行的底色与浅填充 / 命中底色互斥（都是 background-color，留一个才不会看运气）：
     // 表头行用 bg-panel（与改动前一致），普通冻结行用 bg-app（不透明，挡住下面滚过去的行）
@@ -1455,10 +1507,50 @@ const SheetRow = memo(function SheetRow({
       readPicking={editor.readPicking}
       onPickCancel={editor.cancelPick}
       onFormulaModeChange={editor.notifyFormulaMode}
-      hitTint={hitKeys.size > 0 && hitKeys.has(`${row},${editingCol}`)}
+      hitTint={
+        hitKeys.size > 0 && hitKeys.has(`${row},${editingCol}`)
+          ? `${row},${editingCol}` === currentHitKey
+            ? "current"
+            : "hit"
+          : "none"
+      }
     />
   ) : null;
   const editorInFrozen = editorEl !== null && frozenCols > 0 && editingCol < frozenCols;
+  /**
+   * 拖拽填充柄（Excel 的小方块）：贴在选区右下角的格子角上，鼠标移上去是 crosshair。
+   * 用中性深色方块（Excel 同款观感）：它既不能和琥珀色命中混淆，也不能和蓝色选区混淆。
+   * 手柄放在**本行内部**（而不是独立图层）：冻结行会跟着 sticky、冻结列会跟着冻结块走，
+   * 滚动、换行、虚拟化都不需要额外换算。列落在冻结列里时放进冻结块（与编辑框同一套处理）。
+   */
+  const fillHandle =
+    fillHandleCol >= 0 ? (
+      <div
+        role="presentation"
+        aria-hidden="true"
+        data-fill-handle="true"
+        title="拖动以按规律填充（Esc 取消）"
+        onMouseDown={(event) => {
+          // 不触发选区拖拽 / 不进入编辑：手柄自己的会话完全独立
+          event.preventDefault();
+          event.stopPropagation();
+          onFillHandleDown(row, fillHandleCol, event.clientX, event.clientY);
+        }}
+        onDoubleClick={(event) => event.stopPropagation()}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        }}
+        className="absolute z-[4] cursor-crosshair border border-app bg-fg"
+        style={{
+          left: Math.max(0, colOffsets[fillHandleCol] + colWidths[fillHandleCol] - FILL_HANDLE - 1),
+          top: Math.max(0, height - FILL_HANDLE - 1),
+          width: FILL_HANDLE,
+          height: FILL_HANDLE,
+        }}
+      />
+    ) : null;
+  const fillHandleInFrozen = fillHandle !== null && frozenCols > 0 && fillHandleCol < frozenCols;
   /** 冻结行与滚动区之间的分隔线：比普通网格线略明显（2px 强调色），只画在最后一个冻结行下边缘 */
   const rowDivider = showRowDivider ? (
     <div
@@ -1497,6 +1589,7 @@ const SheetRow = memo(function SheetRow({
           {frozenCells}
           {frozenFrames}
           {editorInFrozen ? editorEl : null}
+          {fillHandleInFrozen ? fillHandle : null}
           {showColDivider ? (
             <div
               aria-hidden="true"
@@ -1515,6 +1608,7 @@ const SheetRow = memo(function SheetRow({
       {cells}
       {scrollFrames}
       {editorInFrozen ? null : editorEl}
+      {fillHandleInFrozen ? null : fillHandle}
       {rowDivider}
     </div>
   );
@@ -1564,6 +1658,7 @@ export function SheetGrid({
   findHits,
   currentHit,
   scrollTarget,
+  onFillRange,
 }: SheetGridProps): JSX.Element {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const [scroll, setScroll] = useState({ top: 0, left: 0 });
@@ -1604,6 +1699,7 @@ export function SheetGrid({
     onRowResize,
     onRowsResize,
     onColumnsResize,
+    onFillRange,
     /** selection 是否受控（父组件传了具体值或 null） */
     selectionControlled: selection !== undefined,
     /** 列宽 / 行高是否受控（父组件传了 columnWidths / rowHeights，见 applyColumnWidth 注释） */
@@ -1629,6 +1725,7 @@ export function SheetGrid({
     onRowResize,
     onRowsResize,
     onColumnsResize,
+    onFillRange,
     selectionControlled: selection !== undefined,
     controlledColumns: columnWidths !== undefined,
     controlledRows: rowHeights !== undefined,
@@ -2918,13 +3015,11 @@ export function SheetGrid({
   );
 
   /**
-   * 拖拽会话的 window 级监听：指针可能跑到网格之外（甚至划过表头），
-   * 所以 mousemove / mouseup 挂在 window 上且**只挂一次**，内部靠 dragRef / geomRef 读最新状态，
-   * 不随渲染重建监听器。指针贴到视口边缘时按帧自动滚动；滚动量不再变化（已经到边）就停，避免空转。
+   * client 坐标 → 数据行列（换算到内容坐标；指针落在冻结区里时按冻结区自己的坐标算）。
+   * 选区拖拽与拖拽填充共用同一个换算，只有一处实现。
    */
-  useEffect(() => {
-    /** client 坐标 → 数据行列（换算到内容坐标；指针落在冻结区里时按冻结区自己的坐标算） */
-    const pointToCell = (clientX: number, clientY: number): { row: number; col: number } | null => {
+  const pointToCell = useCallback(
+    (clientX: number, clientY: number): { row: number; col: number } | null => {
       const el = scrollerRef.current;
       const geom = geomRef.current;
       if (!el || geom.rows === 0 || geom.cols === 0) return null;
@@ -2953,12 +3048,81 @@ export function SheetGrid({
       // 用行高索引换算：可高行的区域也能落在正确的行上（未开启换行时等价于原来的 y / ROW_H）
       const row = clampIndex(geom.rowIndex.virtualAt(y - geom.stickyH) + geom.headerOffset, geom.rows - 1);
       return { row, col };
-    };
+    },
+    [],
+  );
+  /** 供「只挂一次监听器」的会话读最新实现 */
+  const pointToCellRef = useRef(pointToCell);
+  pointToCellRef.current = pointToCell;
 
+  /* ------------------ 拖拽自动填充（Excel 的填充柄） ------------------ */
+
+  /**
+   * 选区右下角的填充柄：只在**可编辑**且父组件接了 `onFillRange` 时显示
+   * （只读网格不显示，避免误操作；不传回调时完全不渲染 → DOM 逐字节一致）。
+   */
+  const fillCorner = useMemo(() => {
+    if (!onFillRange || !editable || empty || !sel) return null;
+    return { row: sel.endRow, col: sel.endCol };
+  }, [onFillRange, editable, empty, sel]);
+  /** 拖拽中的虚线预览（null = 没在拖）；source 固定，target 随指针单向扩展 */
+  const [fillPreview, setFillPreview] = useState<{ source: SheetRange; target: SheetRange } | null>(null);
+  /** 会话里的权威状态：目标区域同步写在 ref 里，松手时不依赖「预览已经渲染过」 */
+  const fillDragRef = useRef<{ source: SheetRange; target: SheetRange } | null>(null);
+
+  /** 按下填充柄：建立会话（**不改选区、不改内容、不进入编辑**） */
+  const beginFillDrag = useCallback((row: number, col: number) => {
+    const source = rangeRef.current ?? singleRange(row, col);
+    fillDragRef.current = { source, target: source };
+    setFillPreview({ source, target: source });
+  }, []);
+
+  useEffect(() => {
+    const onMove = (event: MouseEvent) => {
+      const session = fillDragRef.current;
+      if (!session) return;
+      const point = pointToCellRef.current(event.clientX, event.clientY);
+      if (!point) return;
+      const target = extendFillTarget(session.source, point);
+      session.target = target;
+      // 目标没变就不 setState（拖动期间每一帧都渲染太浪费）
+      setFillPreview((prev) => (prev && sameRange(prev.target, target) ? prev : { source: session.source, target }));
+    };
+    const onUp = () => {
+      const session = fillDragRef.current;
+      fillDragRef.current = null;
+      setFillPreview(null);
+      if (!session) return;
+      // 拖回原选区（没有扩展）→ 不回调
+      if (sameRange(session.source, session.target)) return;
+      callbacksRef.current.onFillRange?.(session.source, session.target);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      // 拖拽期间按 Esc 取消：不回调
+      if (event.key !== "Escape" || !fillDragRef.current) return;
+      fillDragRef.current = null;
+      setFillPreview(null);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, []);
+
+  /**
+   * 拖拽会话的 window 级监听：指针可能跑到网格之外（甚至划过表头），
+   * 所以 mousemove / mouseup 挂在 window 上且**只挂一次**，内部靠 dragRef / geomRef 读最新状态，
+   * 不随渲染重建监听器。指针贴到视口边缘时按帧自动滚动；滚动量不再变化（已经到边）就停，避免空转。
+   */
+  useEffect(() => {
     /** 指针位置 → 新选区；还在同一格时不 setState、不回调（拖拽期间的主要开销都在这里省掉） */
     const applyPointer = (clientX: number, clientY: number) => {
       const drag = dragRef.current;
-      const point = drag ? pointToCell(clientX, clientY) : null;
+      const point = drag ? pointToCellRef.current(clientX, clientY) : null;
       if (!drag || !point) return;
       drag.clientX = clientX;
       drag.clientY = clientY;
@@ -3378,6 +3542,7 @@ export function SheetGrid({
       showColDivider,
       hitKeys,
       currentHitKey,
+      onFillHandleDown: beginFillDrag,
     }),
     [
       colOffsets,
@@ -3396,6 +3561,7 @@ export function SheetGrid({
       showColDivider,
       hitKeys,
       currentHitKey,
+      beginFillDrag,
     ],
   );
 
@@ -3588,6 +3754,7 @@ export function SheetGrid({
               editingCol={editing !== null && editing.row === row ? editing.col : -1}
               editingText={editing !== null && editing.row === row ? editing.text : ""}
               editingCaret={editing !== null && editing.row === row ? editing.caret : "end"}
+              fillHandleCol={fillCorner && fillCorner.row === row ? fillCorner.col : -1}
               {...selectionSliceOf(row)}
             />
           );
@@ -3649,9 +3816,39 @@ export function SheetGrid({
               editingCol={editing !== null && editing.row === row ? editing.col : -1}
               editingText={editing !== null && editing.row === row ? editing.text : ""}
               editingCaret={editing !== null && editing.row === row ? editing.caret : "end"}
+              fillHandleCol={fillCorner && fillCorner.row === row ? fillCorner.col : -1}
               {...selectionSliceOf(row)}
             />
           ))}
+          {/* 拖拽填充的虚线预览：从原选区延伸到指针所在的整行/整列（只扩一个方向）。
+              放在行之后、pointer-events-none —— 只看不拦，也不改选区与内容。 */}
+          {fillPreview && !sameRange(fillPreview.source, fillPreview.target)
+            ? (() => {
+                const target = fillPreview.target;
+                const lastCol = Math.max(0, Math.min(cols - 1, target.endCol));
+                const firstCol = Math.max(0, Math.min(cols - 1, target.startCol));
+                // 冻结行不在内容坐标系里（topOf 会是负数），预览从正文第一行起算
+                const firstRow = Math.max(headerOffset, Math.min(rows - 1, target.startRow));
+                const lastRow = Math.max(headerOffset, Math.min(rows - 1, target.endRow));
+                const left = colOffsets[firstCol];
+                const right = colOffsets[lastCol] + colWidths[lastCol];
+                const top = Math.max(0, rowIndex.topOf(firstRow));
+                const bottom = rowIndex.topOf(lastRow) + rowIndex.heightOf(lastRow);
+                return (
+                  <div
+                    aria-hidden="true"
+                    data-fill-preview="true"
+                    className="pointer-events-none absolute z-[2] border-2 border-dashed border-accent"
+                    style={{
+                      left,
+                      top,
+                      width: Math.max(1, right - left),
+                      height: Math.max(1, bottom - top),
+                    }}
+                  />
+                );
+              })()
+            : null}
         </div>
       </div>
 

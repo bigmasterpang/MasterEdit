@@ -9,6 +9,7 @@ import {
   insertDelimitedRow,
 } from "../../utils/delimitedOps";
 import { applyCellEditsToDelimited } from "../../utils/sheetEdits";
+import { fillSeries } from "../../utils/fillSeries";
 import {
   commitHistoryStep,
   mapCellBatch,
@@ -713,6 +714,65 @@ function DelimitedSheet({ docId }: { docId: string }) {
     [applyStructure, table.delimiter],
   );
 
+  /**
+   * 拖拽填充（Excel 的填充柄）：按原选区的样本推断规律，**只填新增部分**，整批一个撤销步。
+   * 纵向填充时每一列各自推规律，横向填充时每一行各自推规律（与 Excel 一致）。
+   */
+  const fillRange = useCallback(
+    (source: SheetRange, target: SheetRange) => {
+      if (readOnly) return;
+      const textAt = (row: number, col: number) => table.rowAt(row)?.[col]?.v ?? "";
+      const edits: Array<{ row: number; col: number; before: string; after: string }> = [];
+      const vertical = target.endRow !== source.endRow || target.startRow !== source.startRow;
+      if (vertical) {
+        for (let col = source.startCol; col <= source.endCol; col += 1) {
+          const samples: string[] = [];
+          for (let row = source.startRow; row <= source.endRow; row += 1) samples.push(textAt(row, col));
+          if (target.endRow > source.endRow) {
+            const values = fillSeries(samples, target.endRow - source.endRow, "down");
+            values.forEach((value, index) => {
+              const row = source.endRow + 1 + index;
+              edits.push({ row, col, before: textAt(row, col), after: value });
+            });
+          } else {
+            const values = fillSeries(samples, source.startRow - target.startRow, "up");
+            values.forEach((value, index) => {
+              const row = target.startRow + index;
+              edits.push({ row, col, before: textAt(row, col), after: value });
+            });
+          }
+        }
+      } else {
+        for (let row = source.startRow; row <= source.endRow; row += 1) {
+          const samples: string[] = [];
+          for (let col = source.startCol; col <= source.endCol; col += 1) samples.push(textAt(row, col));
+          if (target.endCol > source.endCol) {
+            const values = fillSeries(samples, target.endCol - source.endCol, "right");
+            values.forEach((value, index) => {
+              const col = source.endCol + 1 + index;
+              edits.push({ row, col, before: textAt(row, col), after: value });
+            });
+          } else {
+            const values = fillSeries(samples, source.startCol - target.startCol, "left");
+            values.forEach((value, index) => {
+              const col = target.startCol + index;
+              edits.push({ row, col, before: textAt(row, col), after: value });
+            });
+          }
+        }
+      }
+      if (edits.length === 0) return;
+      if (!writeCells(edits.map(({ row, col, after }) => ({ row, col, value: after })))) return;
+      pushCellStep<string>(
+        docId,
+        edits.map((item) => ({ key: `${item.row},${item.col}`, before: item.before, after: item.after })),
+      );
+      setHistoryVersion((value) => value + 1);
+      setSelection(target);
+    },
+    [docId, readOnly, table, writeCells],
+  );
+
   const stepEdit = useCallback(
     (direction: "undo" | "redo"): boolean => {
       const step = popHistoryStep<string>(docId, direction);
@@ -1069,6 +1129,7 @@ function DelimitedSheet({ docId }: { docId: string }) {
         onColumnResize={handleColumnResize}
         onRowResize={handleRowResize}
         onColumnsResize={handleColumnsResize}
+        onFillRange={fillRange}
         freezeRows={freezeRows}
         freezeCols={freezeCols}
         findHits={findApi.state.hits}
@@ -1388,8 +1449,67 @@ function WorkbookSheet({ docId }: { docId: string }) {
   );
 
   /**
+   * 拖拽填充（Excel 的填充柄）：按原选区样本推规律，只填**新增部分**，整批一个撤销步。
+   * 读的是「公式原文优先」的文本（`f ?? v`），这样公式样本能走相对引用平移那条分支。
+   */
+  const fillRange = useCallback(
+    (source: SheetRange, target: SheetRange) => {
+      if (!editable || !sheetName) return;
+      const textAt = (row: number, col: number) => {
+        const pending = sheetEdits.find(
+          (edit) => edit.sheet === sheetName && edit.row === row && edit.col === col,
+        );
+        if (pending) return pending.value;
+        const cell = rowsRef.current.get(row)?.[col];
+        return cell?.f ?? cell?.v ?? "";
+      };
+      const edits: Array<{ row: number; col: number; kind: SheetEditKind; value: string }> = [];
+      const push = (row: number, col: number, value: string) => {
+        const cell = rowsRef.current.get(row)?.[col];
+        const kind = inferEditKind(value, cell?.t);
+        edits.push({ row, col, kind, value: kind === "formula" ? value.trim() : value });
+      };
+      const vertical = target.endRow !== source.endRow || target.startRow !== source.startRow;
+      if (vertical) {
+        for (let col = source.startCol; col <= source.endCol; col += 1) {
+          const samples: string[] = [];
+          for (let row = source.startRow; row <= source.endRow; row += 1) samples.push(textAt(row, col));
+          if (target.endRow > source.endRow) {
+            fillSeries(samples, target.endRow - source.endRow, "down").forEach((value, index) =>
+              push(source.endRow + 1 + index, col, value),
+            );
+          } else {
+            fillSeries(samples, source.startRow - target.startRow, "up").forEach((value, index) =>
+              push(target.startRow + index, col, value),
+            );
+          }
+        }
+      } else {
+        for (let row = source.startRow; row <= source.endRow; row += 1) {
+          const samples: string[] = [];
+          for (let col = source.startCol; col <= source.endCol; col += 1) samples.push(textAt(row, col));
+          if (target.endCol > source.endCol) {
+            fillSeries(samples, target.endCol - source.endCol, "right").forEach((value, index) =>
+              push(row, source.endCol + 1 + index, value),
+            );
+          } else {
+            fillSeries(samples, source.startCol - target.startCol, "left").forEach((value, index) =>
+              push(row, target.startCol + index, value),
+            );
+          }
+        }
+      }
+      if (edits.length === 0) return;
+      applyEdits(edits);
+      setSelection(target);
+    },
+    [applyEdits, editable, sheetEdits, sheetName],
+  );
+
+  /**
    * 撤销/重做一整步；历史按文档保存，切标签/切视图/保存之后都依然有效。
-   * 步骤分两类：单元格编辑在前端改回值；结构操作交给 Rust 影子的快照栈（spreadsheet_undo/redo）。
+   * 步骤分四类：单元格编辑在前端改回值；结构操作交给 Rust 影子的快照栈；布局（列宽行高）改文档状态；
+   * 内容步骤（CSV 行列结构操作）换回整段文本。
    *
    * 用循环而不是单次：后端只为「真的改变了工作簿」的结构操作压快照，空操作（例如在空表上插入行）
    * 在前端栈里可能留下一个没有对应快照的「幽灵步」。遇到就丢掉它继续找下一个，
@@ -2383,6 +2503,7 @@ function WorkbookSheet({ docId }: { docId: string }) {
         onColumnResize={handleColumnResize}
         onRowResize={handleRowResize}
         onColumnsResize={handleColumnsResize}
+        onFillRange={fillRange}
         freezeRows={freezeRows}
         freezeCols={freezeCols}
         findHits={findApi.state.hits}
