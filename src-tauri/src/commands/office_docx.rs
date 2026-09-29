@@ -22,6 +22,12 @@
 //! 一个具体字体名都没有 —— 所以必须连 `word/theme/theme1.xml` 的 `a:fontScheme` 一起解析，
 //! 否则整篇文档的字体都是空的（"等线"这个词在这份文档的 document.xml / styles.xml 里
 //! 一次都没出现，只在 theme1.xml 里有）。
+//!
+//! **已知保真度缺口**（有意不做，详见 `docs/plan-docx.md` 的"已知取舍"）：
+//! - `w:contextualSpacing`（同样式段落之间不加空）未实现 —— 它是**渲染规则**而不是数值，
+//!   要让前端遵守就得新增契约字段（`Block`/`ParagraphBlock` 加标志），收益相对有限，
+//!   所以本版不导出；段落间距按 XML 里的实际数值渲染。
+//! - 浮动图片按内联显示、不做环绕排版；文本框 / SmartArt / 图表 / OLE / OMML 只给占位块。
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
@@ -554,14 +560,15 @@ impl RunProps {
 
 /// 段落级属性（长度统一换算成 pt）
 ///
-/// 有两类设置**不能**在解析 `w:pPr` 时就算完，必须等整条层叠链走完：
+/// 有三类设置**不能**在解析 `w:pPr` 时就算完，必须等整条层叠链走完：
 /// - **字符单位**的缩进（`w:firstLineChars` / `w:leftChars` / `w:hangingChars`）：
 ///   1 字符 = 本段**最终生效的字号**，字号要等样式链算完才知道；
+/// - **行单位**的段间距（`w:beforeLines` / `w:afterLines`）：1 行 = 本段最终行距折出的单行高度；
 /// - **自动段间距**（`w:beforeAutospacing` / `w:afterAutospacing`）：开了「自动」时段前/段后
 ///   要盖掉样式与 docDefaults 里那些常常是 0 的具体值。
 ///
-/// 所以这两类先用 `Option` 原样带过来，层叠结束后由 [`ParaProps::resolve_char_indents`] /
-/// [`ParaProps::resolve_autospacing`] 定稿。
+/// 所以这三类先用 `Option` 原样带过来，层叠结束后由 [`ParaProps::resolve_char_indents`] /
+/// [`ParaProps::resolve_spacing`] 定稿。
 #[derive(Debug, Clone, Default)]
 struct ParaProps {
     align: Option<String>,
@@ -578,6 +585,10 @@ struct ParaProps {
     right_chars: Option<f32>,
     /// `w:firstLineChars`（正）或 `-w:hangingChars`（负）
     first_line_chars: Option<f32>,
+    /// `w:beforeLines`（单位：百分之一行，200 = 2 行）
+    before_lines: Option<f32>,
+    /// `w:afterLines`
+    after_lines: Option<f32>,
     /// `w:beforeAutospacing`（自动段前间距）
     auto_before: Option<bool>,
     /// `w:afterAutospacing`（自动段后间距）
@@ -591,28 +602,76 @@ impl ParaProps {
                 *slot = lower.clone();
             }
         }
+        /// 「同一个属性的两种写法」的层叠：**层优先，同层内 twips 优先**。
+        ///
+        /// `w:ind` 的 twips 与 `Chars`、`w:spacing` 的 twips 与 `Lines` 都是**同一个属性的
+        /// 两种编码**（Word/WPS 写文档时会在同一层把两种一起写下，这时用 twips —— 那是它
+        /// 排版用的值）。但**跨层**必须让"更靠内层的写法整组胜出"：OOXML 里直接格式本来就
+        /// 优先于样式，与用哪种单位写无关 —— 所以这里按"组"来填，而不是逐字段填。
+        fn fill_pair(
+            own_twips: &mut Option<f32>,
+            own_units: &mut Option<f32>,
+            lower_twips: &Option<f32>,
+            lower_units: &Option<f32>,
+        ) {
+            if own_twips.is_none() && own_units.is_none() {
+                if lower_twips.is_some() {
+                    *own_twips = *lower_twips;
+                } else {
+                    *own_units = *lower_units;
+                }
+            }
+        }
         fill(&mut self.align, &lower.align);
-        fill(&mut self.indent_left_pt, &lower.indent_left_pt);
-        fill(&mut self.indent_right_pt, &lower.indent_right_pt);
-        fill(&mut self.first_line_pt, &lower.first_line_pt);
-        fill(&mut self.space_before_pt, &lower.space_before_pt);
-        fill(&mut self.space_after_pt, &lower.space_after_pt);
         fill(&mut self.line, &lower.line);
         fill(&mut self.outline_level, &lower.outline_level);
-        fill(&mut self.left_chars, &lower.left_chars);
-        fill(&mut self.right_chars, &lower.right_chars);
-        fill(&mut self.first_line_chars, &lower.first_line_chars);
         fill(&mut self.auto_before, &lower.auto_before);
         fill(&mut self.auto_after, &lower.auto_after);
+        // 缩进：twips 与 Chars 是一组
+        fill_pair(
+            &mut self.indent_left_pt,
+            &mut self.left_chars,
+            &lower.indent_left_pt,
+            &lower.left_chars,
+        );
+        fill_pair(
+            &mut self.indent_right_pt,
+            &mut self.right_chars,
+            &lower.indent_right_pt,
+            &lower.right_chars,
+        );
+        fill_pair(
+            &mut self.first_line_pt,
+            &mut self.first_line_chars,
+            &lower.first_line_pt,
+            &lower.first_line_chars,
+        );
+        // 段间距：twips 与 Lines 是一组
+        fill_pair(
+            &mut self.space_before_pt,
+            &mut self.before_lines,
+            &lower.space_before_pt,
+            &lower.before_lines,
+        );
+        fill_pair(
+            &mut self.space_after_pt,
+            &mut self.after_lines,
+            &lower.space_after_pt,
+            &lower.after_lines,
+        );
     }
 
     /// 把「字符单位」的缩进折算成 pt（用该段**最终生效的字号**）。
     ///
+    /// 优先级（从高到低，与 [`ParaProps::resolve_spacing`] 同一套语义）：
+    /// 1. 段落自己写的 twips（`w:left` / `w:firstLine` / `w:hanging`）
+    /// 2. 段落自己写的 Chars（`w:leftChars` / `w:firstLineChars` / `w:hangingChars`）
+    /// 3. 层叠结果（编号级别 → 段落样式 → docDefaults）
+    ///
+    /// 前两级在 [`ParaProps::apply_over`] 里就已经分好（组内 twips 优先、跨层按层），
+    /// 走到这里每一组最多只剩一个值，所以只需把 Chars 折算出来。
     /// 为什么必须等层叠结束：Word / WPS 里「首行缩进 2 字符」是相对本段字号的 ——
     /// 同一份 XML 在 10.5pt 段落里是 21pt、在 24pt 段落里是 48pt。
-    /// 优先用显式 twips（Word 写文档时会把 Chars 折算成 twips 一起写下来，
-    /// 两者都有时以 twips 为准），只有缺 twips 时才用 Chars 折算 ——
-    /// 有些生成器**只写 Chars**，不折算就会把首行缩进整段丢掉。
     fn resolve_char_indents(&mut self, font_size_pt: f32) {
         let per_char = |chars: f32| chars / 100.0 * font_size_pt;
         if self.indent_left_pt.is_none() {
@@ -632,18 +691,54 @@ impl ParaProps {
         }
     }
 
-    /// 自动段间距定稿（`w:beforeAutospacing` / `w:afterAutospacing`）。
+    /// 段前/段后定稿。优先级（从高到低，与 [`ParaProps::resolve_char_indents`] 同一套语义）：
+    /// 1. 段落自己写的 twips（`w:before` / `w:after`）
+    /// 2. 段落自己写的行单位（`w:beforeLines` / `w:afterLines`）→ 百分之一行 × 行高基准
+    /// 3. 自动段间距（`w:beforeAutospacing` / `w:afterAutospacing` → [`AUTO_SPACE_PT`]）
+    /// 4. 层叠结果（编号级别 → 段落样式 → docDefaults）
     ///
-    /// Word 里勾上「自动」时，段落对话框的段前/段后显示为 **Auto**：它会**忽略样式与
-    /// docDefaults 里的具体值**（那些值常常是 0，照搬就会比 Word 紧一大截），
-    /// 实际排版约为 [`AUTO_SPACE_PT`]。但段落自己显式写了 `w:before` / `w:after` 时以显式值为准
-    /// （Word 在用户手填数值时会把这个开关关掉，所以两者同时存在属异常文档，按显式值处理更稳）。
-    fn resolve_autospacing(&mut self, explicit_before: bool, explicit_after: bool) {
-        if self.auto_before == Some(true) && !explicit_before {
-            self.space_before_pt = Some(AUTO_SPACE_PT);
+    /// 前两级在 [`ParaProps::apply_over`] 里已经按"层优先、同层内 twips 优先"分好；
+    /// 这里只处理 2 的折算，以及 **Auto 为什么能压过第 4 级**：现实文档的 docDefaults 常写
+    /// `w:before="0" w:after="0"`，照搬就会比 Word 紧一大截 —— Word 里勾了「自动」，
+    /// 段落对话框显示的是 Auto，样式里的具体值并不参与。段落自己写了值（第 1、2 级）时
+    /// 才让位（`explicit_before` / `explicit_after` 就是"段落自己写死了 twips"）。
+    ///
+    /// 为什么行单位也要等层叠结束：`beforeLines` 是「几行」，1 行 = 本段最终行距折出的
+    /// 单行高度（字号与行距都要等样式链算完）。
+    fn resolve_spacing(&mut self, font_size_pt: f32, explicit_before: bool, explicit_after: bool) {
+        let line_height_pt = self.line_height_pt(font_size_pt);
+        if !explicit_before {
+            self.space_before_pt = self
+                .before_lines
+                .map(|lines| lines / 100.0 * line_height_pt)
+                .or_else(|| (self.auto_before == Some(true)).then_some(AUTO_SPACE_PT))
+                .or(self.space_before_pt);
         }
-        if self.auto_after == Some(true) && !explicit_after {
-            self.space_after_pt = Some(AUTO_SPACE_PT);
+        if !explicit_after {
+            self.space_after_pt = self
+                .after_lines
+                .map(|lines| lines / 100.0 * line_height_pt)
+                .or_else(|| (self.auto_after == Some(true)).then_some(AUTO_SPACE_PT))
+                .or(self.space_after_pt);
+        }
+    }
+
+    /// 「行高基准」：`beforeLines` / `afterLines` 折算成 pt 时用的单行高度。
+    /// - `exact` / `atLeast` → 行距自己的 pt 值；
+    /// - `multiple` → 字号 × [`SINGLE_LINE_FACTOR`] × 倍数；
+    /// - 没写行距 → 字号 × [`SINGLE_LINE_FACTOR`]（单倍行距）。
+    fn line_height_pt(&self, font_size_pt: f32) -> f32 {
+        let single = font_size_pt * SINGLE_LINE_FACTOR;
+        let height = match &self.line {
+            Some(spacing) if spacing.kind != "multiple" => spacing.value,
+            Some(spacing) => single * spacing.value,
+            None => single,
+        };
+        // 损坏/异常的 XML 可能给出 0 或负的行距，别让它把段间距也变成 0
+        if height > 0.0 {
+            height
+        } else {
+            single
         }
     }
 }
@@ -684,6 +779,10 @@ const MAX_STYLE_DEPTH: usize = 10;
 /// 「自动段间距」（`w:beforeAutospacing` / `w:afterAutospacing`）的取值。
 /// Word 勾上「自动」后段前/段后显示为 Auto，实际约 14pt（≈0.49cm）；想调只改这一处。
 const AUTO_SPACE_PT: f32 = 14.0;
+
+/// 单倍行距折算出行高的经验系数（`w:beforeLines` / `w:afterLines` 的「1 行」基准）。
+/// 字号 × 1.2 是 Word 单倍行距在常见中文字体下的典型值。
+const SINGLE_LINE_FACTOR: f32 = 1.2;
 
 /// 文档里完全查不到字号时的兜底（中文文档的默认五号字 = 10.5pt）。
 /// 只有「字符单位缩进」需要它：1 字符 = 1 个字号。
@@ -951,8 +1050,11 @@ fn parse_para_props(node: &XmlNode) -> ParaProps {
     if let Some(spacing) = node.child("spacing") {
         props.space_before_pt = twips_to_pt(spacing.attr_local("before"));
         props.space_after_pt = twips_to_pt(spacing.attr_local("after"));
+        // 行单位（百分之一行）：层叠结束后按最终行高折算（缺 twips 时才生效）
+        props.before_lines = number(spacing.attr_local("beforeLines"));
+        props.after_lines = number(spacing.attr_local("afterLines"));
         // 自动段间距：`w:beforeAutospacing` / `w:afterAutospacing` 是 w:spacing 的**属性**；
-        // 先记开关，层叠结束后定稿（见 ParaProps::resolve_autospacing）
+        // 先记开关，层叠结束后定稿（见 ParaProps::resolve_spacing）
         props.auto_before = attr_on_off(spacing, "beforeAutospacing");
         props.auto_after = attr_on_off(spacing, "afterAutospacing");
         if let Some(line) = number(spacing.attr_local("line")) {
@@ -1703,8 +1805,8 @@ impl<'a> DocBuilder<'a> {
             .map(|half| half / 2.0)
             .unwrap_or(DEFAULT_FONT_SIZE_PT);
         ppr.resolve_char_indents(font_size_pt);
-        // 2) 自动段间距（Auto）：盖掉样式/docDefaults 里那些常常是 0 的具体值
-        ppr.resolve_autospacing(explicit_before, explicit_after);
+        // 2) 段前/段后：显式 twips → 行单位折算 → 自动间距（Auto）→ 层叠值
+        ppr.resolve_spacing(font_size_pt, explicit_before, explicit_after);
 
         // ---- 行内内容 ----
         let mut content = ParagraphContent::default();
@@ -4339,6 +4441,155 @@ mod tests {
         let plain = paragraph_of(&blocks[3]);
         assert_eq!(plain.space_before_pt, Some(0.0));
         assert_eq!(plain.space_after_pt, Some(0.0));
+    }
+
+    /// **行单位的段间距**（`w:beforeLines` / `w:afterLines`，百分之一行）：Word/WPS 会跟
+    /// twips 一起写，但别的生成器可能只写它 —— 不折算段前/段后就会偏紧。
+    /// 折算口径：1 行 = 该段最终行距折出的单行高度（见 `line_height_pt`）。
+    #[test]
+    fn resolves_line_unit_paragraph_spacing() {
+        // 样式：docDefaults 12pt 字号、**不给行距**（用单倍行距基准 = 12 × 1.2 = 14.4pt）
+        let styles = format!(
+            r#"<?xml version="1.0"?><w:styles {NS}>
+              <w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="24"/></w:rPr></w:rPrDefault>
+                <w:pPrDefault><w:pPr><w:spacing w:before="0" w:after="0"/></w:pPr></w:pPrDefault>
+              </w:docDefaults>
+              <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+            </w:styles>"#
+        );
+        let body = r#"
+            <w:p><w:pPr><w:spacing w:beforeLines="200"/></w:pPr><w:r><w:t>两行段前</w:t></w:r></w:p>
+            <w:p><w:pPr><w:spacing w:beforeLines="200" w:before="120"/></w:pPr>
+              <w:r><w:t>twips 优先</w:t></w:r></w:p>
+            <w:p><w:pPr><w:spacing w:line="400" w:lineRule="exact" w:afterLines="150"/></w:pPr>
+              <w:r><w:t>固定行距 20pt</w:t></w:r></w:p>
+            <w:p><w:pPr><w:spacing w:line="480" w:lineRule="auto" w:beforeLines="100"/></w:pPr>
+              <w:r><w:t>两倍行距</w:t></w:r></w:p>
+            <w:p><w:r><w:t>什么都没写</w:t></w:r></w:p>"#;
+        let blocks = blocks_of(&docx_with(body, &[("word/styles.xml", &styles)]));
+
+        // ① 只写 beforeLines=200、字号 12pt、无行距 → 2 × (12 × 1.2) = 28.8
+        let two_lines = paragraph_of(&blocks[0]);
+        assert_eq!(two_lines.runs[0].size_pt, Some(12.0));
+        assert!(
+            (two_lines.space_before_pt.unwrap() - 28.8).abs() < 0.001,
+            "2 行 × 14.4pt = 28.8，实际 {:?}",
+            two_lines.space_before_pt
+        );
+
+        // ② 同时有 before="120"（6pt）→ twips 优先
+        let explicit = paragraph_of(&blocks[1]);
+        assert_eq!(explicit.space_before_pt, Some(6.0), "段落显式 twips 压过行单位");
+
+        // ③ 固定行距 20pt + afterLines=150 → 1.5 × 20 = 30.0
+        let exact = paragraph_of(&blocks[2]);
+        assert_eq!(exact.line_spacing.as_ref().map(|line| line.kind.as_str()), Some("exact"));
+        assert!(
+            (exact.space_after_pt.unwrap() - 30.0).abs() < 0.001,
+            "1.5 行 × 20pt = 30.0，实际 {:?}",
+            exact.space_after_pt
+        );
+
+        // ④ 两倍行距（line=480 auto）+ beforeLines=100 → 1 × (12 × 1.2 × 2) = 28.8
+        let double = paragraph_of(&blocks[3]);
+        assert!(
+            (double.space_before_pt.unwrap() - 28.8).abs() < 0.001,
+            "1 行 × 28.8pt = 28.8，实际 {:?}",
+            double.space_before_pt
+        );
+
+        // ⑤ 什么都没写 → 沿用层叠值（docDefaults 的 0），不要变 null
+        let plain = paragraph_of(&blocks[4]);
+        assert_eq!(plain.space_before_pt, Some(0.0));
+        assert_eq!(plain.space_after_pt, Some(0.0));
+    }
+
+    /// 行单位与自动段间距同时出现时的优先级：显式 twips > 行单位 > Auto > 层叠
+    #[test]
+    fn line_units_outrank_autospacing() {
+        let styles = format!(
+            r#"<?xml version="1.0"?><w:styles {NS}>
+              <w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="24"/></w:rPr></w:rPrDefault>
+                <w:pPrDefault><w:pPr><w:spacing w:before="0" w:after="0"/></w:pPr></w:pPrDefault>
+              </w:docDefaults>
+            </w:styles>"#
+        );
+        let body = r#"
+            <w:p><w:pPr><w:spacing w:beforeLines="100" w:beforeAutospacing="1" w:afterAutospacing="1"/></w:pPr>
+              <w:r><w:t>行单位压过自动</w:t></w:r></w:p>"#;
+        let blocks = blocks_of(&docx_with(body, &[("word/styles.xml", &styles)]));
+        let paragraph = paragraph_of(&blocks[0]);
+        assert!(
+            (paragraph.space_before_pt.unwrap() - 14.4).abs() < 0.001,
+            "段前按 1 行 = 14.4pt（行单位优先），实际 {:?}",
+            paragraph.space_before_pt
+        );
+        assert_eq!(
+            paragraph.space_after_pt,
+            Some(AUTO_SPACE_PT),
+            "段后没写行单位 → 落到 Auto（14pt）"
+        );
+    }
+
+    /// **层优先**：OOXML 里直接格式本就压过样式，与"用 twips 还是 Chars/Lines 写"无关。
+    /// 样式里给 twips、段落里只给 Chars/Lines 时，按**段落**的写法算。
+    #[test]
+    fn paragraph_units_outrank_style_twips() {
+        // 字号 12pt（docDefaults sz=24）；样式 StyleTwips 给 twips 缩进与段前，
+        // 样式 StyleChars 给 Chars 缩进 —— 都挑与段落折算结果不同的数值，便于区分
+        let styles = format!(
+            r#"<?xml version="1.0"?><w:styles {NS}>
+              <w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="24"/></w:rPr></w:rPrDefault>
+                <w:pPrDefault><w:pPr><w:spacing w:before="0" w:after="0"/></w:pPr></w:pPrDefault>
+              </w:docDefaults>
+              <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+              <w:style w:type="paragraph" w:styleId="StyleTwips"><w:name w:val="StyleTwips"/>
+                <w:basedOn w:val="Normal"/>
+                <w:pPr><w:ind w:left="720" w:firstLine="240"/><w:spacing w:before="240"/></w:pPr></w:style>
+              <w:style w:type="paragraph" w:styleId="StyleChars"><w:name w:val="StyleChars"/>
+                <w:basedOn w:val="Normal"/>
+                <w:pPr><w:ind w:firstLineChars="300"/></w:pPr></w:style>
+            </w:styles>"#
+        );
+        let body = r#"
+            <w:p><w:pPr><w:pStyle w:val="StyleTwips"/>
+                <w:ind w:firstLineChars="200" w:leftChars="100"/></w:pPr>
+              <w:r><w:t>段落 Chars 压过样式 twips</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="StyleTwips"/><w:spacing w:beforeLines="100"/></w:pPr>
+              <w:r><w:t>段落 Lines 压过样式 twips</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="StyleChars"/><w:ind w:firstLine="360"/></w:pPr>
+              <w:r><w:t>段落 twips 压过样式 Chars</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="StyleTwips"/></w:pPr>
+              <w:r><w:t>段落没写就用样式</w:t></w:r></w:p>"#;
+        let blocks = blocks_of(&docx_with(body, &[("word/styles.xml", &styles)]));
+
+        // 1) 段落 Chars（1 字符 / 2 字符 × 12pt）压过样式 twips（left=720→36pt、firstLine=240→12pt）
+        let chars = paragraph_of(&blocks[0]);
+        assert_eq!(chars.runs[0].size_pt, Some(12.0));
+        assert_eq!(chars.indent_left_pt, Some(12.0), "1 字符 × 12pt（不是样式的 36pt）");
+        assert_eq!(
+            chars.indent_first_line_pt,
+            Some(24.0),
+            "2 字符 × 12pt（不是样式的 12pt）"
+        );
+
+        // 2) 段落 Lines（1 行 = 12 × 1.2 = 14.4pt）压过样式的 before="240"（12pt）
+        let lines = paragraph_of(&blocks[1]);
+        assert!(
+            (lines.space_before_pt.unwrap() - 14.4).abs() < 0.001,
+            "1 行 = 14.4pt（不是样式的 12pt），实际 {:?}",
+            lines.space_before_pt
+        );
+
+        // 3) 反方向：段落 twips（360 twips = 18pt）压过样式的 firstLineChars="300"（36pt）
+        let twips = paragraph_of(&blocks[2]);
+        assert_eq!(twips.indent_first_line_pt, Some(18.0), "段落的 twips 说了算");
+
+        // 4) 段落什么都没写 → 用样式的 twips
+        let from_style = paragraph_of(&blocks[3]);
+        assert_eq!(from_style.indent_left_pt, Some(36.0));
+        assert_eq!(from_style.indent_first_line_pt, Some(12.0));
+        assert_eq!(from_style.space_before_pt, Some(12.0));
     }
 
     /* ------------------------------ 真实语料库（存在才跑） ------------------------------ */
