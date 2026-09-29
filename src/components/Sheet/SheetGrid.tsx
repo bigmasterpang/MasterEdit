@@ -236,6 +236,20 @@ export interface SheetGridProps {
   freezeRows?: number;
   /** 冻结的列数（0 = 不冻结；1 = 冻结首列）：冻结列在水平滚动时始终可见（行号栏永远是最左边那一列） */
   freezeCols?: number;
+  /**
+   * 查找命中的单元格（0 起）：在格子上铺一层**比选区更浅**的提示底色，用于「查找命中」。
+   * 只影响渲染窗口内的格子（不额外渲染行），不改选区、不改活动单元格；与选区重叠时**选区优先**。
+   * 不传 / 空数组时 DOM 与改动前逐字节一致。
+   */
+  findHits?: ReadonlyArray<{ row: number; col: number }>;
+  /** 当前定位到的那条命中（面板上的「当前/总数」）：底色略强并加一圈细描边，与其它命中区分 */
+  currentHit?: { row: number; col: number } | null;
+  /**
+   * 请求把某格滚动到可见：**token 变化**时执行一次（同一个 token 只处理一次）。
+   * 只滚动，不改选区 / 活动单元格 / 焦点框 —— 查找跳转时用户的选区高亮必须保持不动。
+   * 目标落在冻结区里时不滚动（与 ensureVisible 的既有语义一致）；不传时行为与改动前一致。
+   */
+  scrollTarget?: { row: number; col: number; token: number } | null;
 }
 
 /** 公式补全匹配器（从 props 里派生，保证与 props 签名永远一致） */
@@ -1163,6 +1177,10 @@ interface SheetRowProps {
   panel: boolean;
   /** 冻结行与滚动区之间的分隔线（画在最后一个冻结行的下边缘） */
   showRowDivider: boolean;
+  /** 查找命中的查表（`"row,col"`）；空集合表示这次渲染没有任何命中 */
+  hitKeys: ReadonlySet<string>;
+  /** 当前定位到的那条命中（`"row,col"`；空串 = 没有） */
+  currentHitKey: string;
 }
 
 /**
@@ -1207,6 +1225,8 @@ const SheetRow = memo(function SheetRow({
   showColDivider,
   panel,
   showRowDivider,
+  hitKeys,
+  currentHitKey,
 }: SheetRowProps): JSX.Element {
   /**
    * 生成一格。冻结列与滚动列共用这一段（只是放进不同的容器），所以样式/事件/选区逻辑只有一处。
@@ -1235,12 +1255,29 @@ const SheetRow = memo(function SheetRow({
         : " z-[1] bg-accent-soft ring-2 ring-inset ring-accent"
       : "";
     const fillClass = fill ? " bg-accent/10" : "";
-    // 冻结行的底色与浅填充互斥（都是 background-color，留一个才不会看运气）：
+    /**
+     * 查找命中提示：一层比选区更浅的底色（warning 系浅色，与蓝色的选区/活动格一眼可分）。
+     * **选区优先**：格子已经是选区填充或活动格时不再加命中底色 —— 否则命中会把选区盖掉，
+     * 用户报告的就是「一查找，选区高亮就没了」。当前命中底色略强，另加一圈细描边区分。
+     */
+    const cellKey = `${row},${col}`;
+    const isHit = hitKeys.size > 0 && hitKeys.has(cellKey);
+    const hitClass =
+      isHit && !fill && !isActive && !coveredByEditor
+        ? cellKey === currentHitKey
+          ? " bg-warning/30 ring-1 ring-inset ring-warning/60"
+          : " bg-warning/15"
+        : "";
+    // 冻结行的底色与浅填充 / 命中底色互斥（都是 background-color，留一个才不会看运气）：
     // 表头行用 bg-panel（与改动前一致），普通冻结行用 bg-app（不透明，挡住下面滚过去的行）
     const frozenClass = panel
-      ? (fill ? " font-medium" : " bg-panel font-medium")
+      ? fill || hitClass
+        ? " font-medium"
+        : " bg-panel font-medium"
       : frozen
-        ? (fill ? "" : " bg-app")
+        ? fill || hitClass
+          ? ""
+          : " bg-app"
         : "";
     return (
       // 只画右边和下边：相邻单元格共用一条 1px 线，不会出现双线
@@ -1262,7 +1299,7 @@ const SheetRow = memo(function SheetRow({
         // overflow-hidden 是硬要求：折行只允许发生在**本单元格内部**，任何情况下都不能画到相邻行上。
         className={`absolute top-0 ${wrap ? "overflow-hidden whitespace-pre-wrap break-words" : "truncate"} border-r border-b border-line px-1.5 text-[12px] text-fg ${
           CELL_ALIGN[cell ? cell.t : "empty"]
-        }${activeClass}${fillClass}${frozenClass}`}
+        }${activeClass}${fillClass}${frozenClass}${hitClass}`}
         style={{ left: colOffsets[col], width: colWidths[col], height, lineHeight: `${ROW_H}px` }}
       >
         {text}
@@ -1466,6 +1503,9 @@ const SheetRow = memo(function SheetRow({
 
 /* -------------------------------- 主组件 -------------------------------- */
 
+/** 空命中集合：不传 findHits 时所有行共用它，保证 memo 的 props 引用稳定 */
+const EMPTY_HIT_KEYS: ReadonlySet<string> = new Set<string>();
+
 export function SheetGrid({
   rows,
   cols,
@@ -1501,6 +1541,9 @@ export function SheetGrid({
   onRowsResize,
   freezeRows = 0,
   freezeCols = 0,
+  findHits,
+  currentHit,
+  scrollTarget,
 }: SheetGridProps): JSX.Element {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const [scroll, setScroll] = useState({ top: 0, left: 0 });
@@ -1758,6 +1801,20 @@ export function SheetGrid({
     () => Array.from({ length: freezeColCount }, (_, col) => col),
     [freezeColCount],
   );
+
+  /**
+   * 查找命中的查表（`"row,col"` → 命中）。**不新增任何 DOM 节点**：命中只体现为格子上的一个 class，
+   * 因此天然只作用于「渲染窗口内」的格子（500 条命中也不会塞 500 个节点），
+   * 冻结行/冻结列里的命中同样由同一个 buildCell 渲染。不传命中时复用同一个空集合（引用稳定）。
+   */
+  const hitKeys = useMemo(() => {
+    if (!findHits || findHits.length === 0) return EMPTY_HIT_KEYS;
+    const set = new Set<string>();
+    for (const hit of findHits) set.add(`${hit.row},${hit.col}`);
+    return set;
+  }, [findHits]);
+  /** 当前定位到的命中（面板上的「当前/总数」）：空串表示没有 */
+  const currentHitKey = currentHit ? `${currentHit.row},${currentHit.col}` : "";
   /** 冻结行/列与滚动区之间的分隔线：只有**显式**冻结了才画（headerRow 单独使用时 DOM 与改动前一致） */
   const showRowDivider = explicitFreezeRows > 0 && scrollRows > 0;
   const showColDivider = freezeColCount > 0 && freezeColCount < cols;
@@ -2467,6 +2524,26 @@ export function SheetGrid({
     anchorRef.current = { row: next.startRow, col: next.startCol };
     setRange((prev) => (sameRange(prev, next) ? prev : next));
   }, [selection, rows, cols]);
+
+  /**
+   * 查找跳转的滚动请求：**只滚，不动任何选中状态**。
+   * 用户报告「点查找之后选区高亮就没了」—— 根因是跳转时借用了「设置活动单元格」来滚动（会移动焦点框）；
+   * 这里走独立的 token：token 变化才执行一次，选区 / 活动格 / 焦点框一概不碰。
+   * 目标落在冻结区里时不滚动（ensureVisible 的既有语义）。滚动标记为程序化：不会顺手提交正在编辑的内容。
+   */
+  const lastScrollTokenRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!scrollTarget) return;
+    if (lastScrollTokenRef.current === scrollTarget.token) return;
+    lastScrollTokenRef.current = scrollTarget.token;
+    const el = scrollerRef.current;
+    if (!el) return;
+    programmaticScrollRef.current = true;
+    ensureVisible(scrollTarget.row, scrollTarget.col);
+    window.requestAnimationFrame(() => {
+      programmaticScrollRef.current = false;
+    });
+  }, [scrollTarget, ensureVisible]);
 
 
   /* ------------------------------ 选区：状态机 ------------------------------ */
@@ -3247,6 +3324,8 @@ export function SheetGrid({
       frozenCols: freezeColCount,
       frozenWidth,
       showColDivider,
+      hitKeys,
+      currentHitKey,
     }),
     [
       colOffsets,
@@ -3263,6 +3342,8 @@ export function SheetGrid({
       freezeColCount,
       frozenWidth,
       showColDivider,
+      hitKeys,
+      currentHitKey,
     ],
   );
 

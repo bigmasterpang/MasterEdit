@@ -769,10 +769,12 @@ function DelimitedSheet({ docId }: { docId: string }) {
     [selection, table],
   );
 
+  /**
+   * 跳到某个命中：**只滚动到它并标记为当前命中，不动用户的选区与活动单元格**。
+   * 与 Excel 一致 —— 选区高亮保持，命中另用浅底色提示（用户明确要求）。
+   */
   const jumpToHit = useCallback((hit: SheetFindHit) => {
-    setActive({ row: hit.row, col: hit.col });
-    setSelection({ startRow: hit.row, startCol: hit.col, endRow: hit.row, endCol: hit.col });
-    setSummary(null);
+    setScrollTarget({ row: hit.row, col: hit.col, token: Date.now() });
   }, []);
 
   /**
@@ -807,6 +809,8 @@ function DelimitedSheet({ docId }: { docId: string }) {
   );
 
   /** 最近一次查找用的词与开关：面板的替换回调只带 ctx，这里记住产生命中的那一次 */
+  /** 查找跳转的滚动目标（token 变化即触发滚动；不动选区） */
+  const [scrollTarget, setScrollTarget] = useState<{ row: number; col: number; token: number } | null>(null);
   const lastFindRef = useRef<{ query: string; options: SheetFindOptions } | null>(null);
   const findApi = useSheetFind({
     isActiveDoc,
@@ -972,6 +976,9 @@ function DelimitedSheet({ docId }: { docId: string }) {
         onRowResize={handleRowResize}
         freezeRows={freezeRows}
         freezeCols={freezeCols}
+        findHits={findApi.state.hits}
+        currentHit={findApi.state.hits[findApi.state.index] ?? null}
+        scrollTarget={scrollTarget}
         activeCell={activeCell}
         onActiveCell={(row, col) => setActive({ row, col })}
       />
@@ -1768,13 +1775,8 @@ function WorkbookSheet({ docId }: { docId: string }) {
           return;
         }
       }
-      // 同一张表：先清空再设置，保证网格重新执行「滚动到该格」
-      setActive(null);
-      requestAnimationFrame(() => {
-        setActive({ row: hit.row, col: hit.col });
-        setSelection({ startRow: hit.row, startCol: hit.col, endRow: hit.row, endCol: hit.col });
-        setSummary(null);
-      });
+      // 同一张表：只滚动到命中并标记当前命中，不动选区与活动单元格（与 Excel 一致）
+      setScrollTarget({ row: hit.row, col: hit.col, token: Date.now() });
     },
     [info, sheetIndex],
   );
@@ -1793,6 +1795,8 @@ function WorkbookSheet({ docId }: { docId: string }) {
     return () => cancelAnimationFrame(raf);
   }, [sheetName, dim]);
 
+  /** 查找跳转的滚动目标（token 变化即触发滚动；不动选区） */
+  const [scrollTarget, setScrollTarget] = useState<{ row: number; col: number; token: number } | null>(null);
   const lastFindRef = useRef<{ query: string; options: SheetFindOptions } | null>(null);
   const findApi = useSheetFind({
     isActiveDoc,
@@ -2225,6 +2229,9 @@ function WorkbookSheet({ docId }: { docId: string }) {
         onRowResize={handleRowResize}
         freezeRows={freezeRows}
         freezeCols={freezeCols}
+        findHits={findApi.state.hits}
+        currentHit={findApi.state.hits[findApi.state.index] ?? null}
+        scrollTarget={scrollTarget}
         activeCell={active}
         onActiveCell={(row, col) => setActive({ row, col })}
       />

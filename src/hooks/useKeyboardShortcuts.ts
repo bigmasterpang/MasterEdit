@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getActiveDoc, useAppStore } from "../stores/appStore";
-import { getDocTitle, isMarkdownDoc, isSpreadsheetDoc } from "../utils/filePath";
+import { getDocTitle, isDelimitedDoc, isMarkdownDoc, isSpreadsheetDoc } from "../utils/filePath";
 import { useDialogStore } from "../stores/dialogStore";
 import { useSearchStore } from "../stores/searchStore";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -88,12 +88,13 @@ export function useKeyboardShortcuts(): void {
           break;
         }
         case "search":
-          // 表格文档用自己的查找栏（数据在 Rust / 惰性索引里，CodeMirror 的查找用不上）
-          if (isSpreadsheetDoc(getActiveDoc())) break;
+          // 表格文档用自己的查找面板（数据在 Rust / 惰性索引里，CodeMirror 的查找用不上）。
+          // CSV / TSV 也算表格：之前只排除了 xlsx，导致 CSV 下同时弹出两个搜索框。
+          if (isSpreadsheetDoc(getActiveDoc()) || isDelimitedDoc(getActiveDoc())) break;
           useSearchStore.getState().open(false);
           break;
         case "replace":
-          if (isSpreadsheetDoc(getActiveDoc())) break;
+          if (isSpreadsheetDoc(getActiveDoc()) || isDelimitedDoc(getActiveDoc())) break;
           useSearchStore.getState().open(true);
           break;
         case "closeTab": {
