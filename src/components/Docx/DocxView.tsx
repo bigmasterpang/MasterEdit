@@ -23,6 +23,7 @@ import { DocxBlocks, type DocxViewMode } from "./DocxBlocks";
 import { DocxFindBar, useDocxFind } from "./DocxFind";
 import { DocxOutline } from "./DocxOutline";
 import { useDocxBlocks } from "./useDocxBlocks";
+import { MEDIA_TIMEOUT_MS } from "./docxStyle";
 import { copyTextToClipboard } from "./docxCopy";
 import { blocksToPlainText, collectOutline, tableToTsv, type OutlineItem } from "./docxGrid";
 import type { DocxRenderContext } from "./docxRender";
@@ -110,16 +111,30 @@ export function DocxView({ docId }: { docId: string }) {
       if (cached) return Promise.resolve(cached);
       const pending = mediaPendingRef.current.get(key);
       if (pending) return pending; // 同一张图并发请求只发一次
-      const task = invoke<string>("document_media", { path: filePath, media })
-        .then((src) => {
-          mediaCacheRef.current.set(key, src);
+      /**
+       * **带超时**：后端 `document_media` 正常只要几毫秒（实测 2.4ms / 23KB）
+       * 但异常文档上可能长时间不返回。若让它一直挂着，既会卡住这张图，
+       * 也会让 `mediaPendingRef` 里那条"永远 pending"的记录挡住后续所有重试。
+       * 超时即 reject（并清掉 pending 记录）→ 组件走失败态、下次进入视口重新发请求。
+       */
+      const task = new Promise<string>((resolve, reject) => {
+        const timer = window.setTimeout(() => {
           mediaPendingRef.current.delete(key);
-          return src;
-        })
-        .catch((reason: unknown) => {
-          mediaPendingRef.current.delete(key);
-          throw reason;
-        });
+          reject(`图片读取超时（超过 ${MEDIA_TIMEOUT_MS / 1000} 秒）`);
+        }, MEDIA_TIMEOUT_MS);
+        invoke<string>("document_media", { path: filePath, media })
+          .then((src) => {
+            window.clearTimeout(timer);
+            mediaCacheRef.current.set(key, src);
+            mediaPendingRef.current.delete(key);
+            resolve(src);
+          })
+          .catch((reason: unknown) => {
+            window.clearTimeout(timer);
+            mediaPendingRef.current.delete(key);
+            reject(reason);
+          });
+      });
       mediaPendingRef.current.set(key, task);
       return task;
     },

@@ -510,7 +510,15 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
       data-docx-mode={mode}
       onScroll={onScroll}
       className="relative h-full select-text overflow-auto bg-app"
-      style={{ contain: "content" }}
+      style={{
+        contain: "content",
+        /**
+         * 兜底：**永不出现横向滚动条**。纸张是视觉单位，超宽的内容（浮动文本框等）
+         * 由纸张自己的 `overflow: clip` 收住；这里再压一层横向裁切，
+         * 保证窗口很窄、内容畸形时也不会把整个文档区顶出横向滚动。
+         */
+        overflowX: "clip",
+      }}
     >
       {isLoadingFirst ? (
         <div className="flex h-full items-center justify-center text-[12px] text-muted">
@@ -562,6 +570,12 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
                     transform: "translateX(-50%)",
                     width: `${geometry.widthPx}px`,
                     height: `${page.height}px`,
+                    /**
+                     * `overflow: clip`（不是 `hidden`）：纸张是**视觉单位**，永远不产生滚动条，
+                     * 也不因内容溢出而被撑宽；`clip` 不创建滚动容器，所以不会把纵向滚动吃掉
+                     * （纵向滚动始终由外层滚动容器负责）。
+                     */
+                    overflow: "clip",
                   }}
                 >
                   {/**

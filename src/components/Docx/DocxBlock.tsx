@@ -19,6 +19,8 @@ import {
   fieldRunMinWidthPx,
   hexColor,
   listGapPx,
+  MEDIA_RETRY_MS,
+  MEDIA_TIMEOUT_MS,
   paragraphBoxStyle,
   ptToPx,
   resolveImageBox,
@@ -208,7 +210,16 @@ type ImageState =
   | { status: "error"; message: string };
 
 /** 占位框：显示尺寸与说明文字，失败时给中文原因而不是破图 */
-function ImagePlaceholder({ block, message }: { block: DocImage; message: string }) {
+function ImagePlaceholder({
+  block,
+  message,
+  onRetry,
+}: {
+  block: DocImage;
+  message: string;
+  /** 失败态给一个「重试」入口：比"等下次进入视口"更直接（超时/后端报错都能自救） */
+  onRetry?: () => void;
+}) {
   const width = block.widthPx > 0 ? block.widthPx : 220;
   return (
     <div
@@ -228,6 +239,26 @@ function ImagePlaceholder({ block, message }: { block: DocImage; message: string
       }}
     >
       {message}
+      {onRetry ? (
+        <div style={{ marginTop: "6px" }}>
+          <button
+            type="button"
+            data-docx-image-retry="true"
+            onClick={onRetry}
+            style={{
+              border: PLACEHOLDER_BORDER,
+              borderRadius: "4px",
+              background: "transparent",
+              padding: "2px 8px",
+              fontSize: "12px",
+              color: HINT_COLOR,
+              cursor: "pointer",
+            }}
+          >
+            重试
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -244,14 +275,25 @@ const DocxImageBlock = memo(function DocxImageBlock({
   const kind = mediaKind(block.media);
   const [state, setState] = useState<ImageState>({ status: "idle" });
   const hostRef = useRef<HTMLDivElement | null>(null);
-  /** 同一个图片块只请求一次（重复渲染 / 视口反复进出都不会重发） */
+  /** 同一个图片块只请求一次（重复渲染 / 视口反复进出都不会重发）；失败/超时会清掉以便重试 */
   const requestedRef = useRef(false);
+  /** 上次发起请求的时间（失败后重试的节流，避免"每次重渲染都重试"打爆后端） */
+  const lastAttemptRef = useRef(0);
+  /** 当前这次加载效果的"发起请求"函数：失败卡片上的「重试」直接调它，不依赖观测器回调 */
+  const requestRef = useRef<(() => void) | null>(null);
   const cacheKey = ctx.mediaCacheKey(block.media);
+  /**
+   * ctx 每次渲染都是新对象（逐页带页码），**不能进依赖数组**——
+   * 否则每渲染一次就重建一个 IntersectionObserver。用 ref 取最新值即可。
+   */
+  const ctxRef = useRef(ctx);
+  ctxRef.current = ctx;
 
   useEffect(() => {
+    const renderCtx = ctxRef.current;
     if (kind !== "raster") return;
     // 命中缓存（同一张图在前面已经取过）就直接用，不再走 invoke
-    const cached = ctx.mediaCache.get(cacheKey);
+    const cached = renderCtx.mediaCache.get(cacheKey);
     if (cached) {
       setState({ status: "ready", src: cached });
       return;
@@ -259,22 +301,56 @@ const DocxImageBlock = memo(function DocxImageBlock({
     let cancelled = false;
     const request = () => {
       if (requestedRef.current) return;
+      // 已失败过一次的，重试要间隔至少 2 秒（避免观测器重建导致的请求风暴）
+      const now = Date.now();
+      if (lastAttemptRef.current > 0 && now - lastAttemptRef.current < MEDIA_RETRY_MS) return;
       requestedRef.current = true;
+      lastAttemptRef.current = now;
       setState({ status: "loading" });
-      ctx
+      /**
+       * **超时兜底（8 秒）**：后端 `document_media` 要内存解密 + 解包 + base64，
+       * 超大图或异常文档上可能长时间不返回。没有超时就会**永远停在「图片加载中…」**
+       * （用户实测 `王诚0918.docx`）。超时后走失败态（带中文原因）+ 允许再次进入视口重试。
+       */
+      let settled = false;
+      const timer = window.setTimeout(() => {
+        if (settled || cancelled) return;
+        settled = true;
+        requestedRef.current = false; // 允许重新进入视口后重试
+        setState({ status: "error", message: `图片读取超时（超过 ${MEDIA_TIMEOUT_MS / 1000} 秒）` });
+      }, MEDIA_TIMEOUT_MS);
+      renderCtx
         .loadMedia(block.media)
         .then((src) => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timer);
           if (cancelled) return;
           setState({ status: "ready", src });
         })
         .catch((reason: unknown) => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timer);
           if (cancelled) return;
-          const message = typeof reason === "string" && reason.trim() ? reason : "图片读取失败";
-          setState({ status: "error", message });
+          // 失败后**清掉"已请求"标记**：再次进入视口要能重试，不能永久卡死
+          requestedRef.current = false;
+          /**
+           * 后端给的是中文原因（字符串）就直接显示；否则把原始错误也带上 ——
+           * 只写"图片读取失败"会让用户和排查都没线索。
+           */
+          const detail =
+            typeof reason === "string" && reason.trim()
+              ? reason.trim()
+              : reason instanceof Error && reason.message
+                ? reason.message
+                : String(reason);
+          setState({ status: "error", message: `图片读取失败：${detail}` });
         });
     };
 
     const host = hostRef.current;
+    requestRef.current = request;
     // 没有 IntersectionObserver（老内核 / 测试环境）时退化成立即加载
     if (!host || typeof IntersectionObserver === "undefined") {
       request();
@@ -286,12 +362,16 @@ const DocxImageBlock = memo(function DocxImageBlock({
     // 后端每次调用都要重新解密 + 解包 + base64（实测 11.7ms/张），不能让整篇文档的图一起发请求。
     // root 必须是**文档滚动容器**：用 viewport 当 root 时，容器 overflow 会把目标裁掉，
     // 200px 预取范围等于不存在（滚动到跟前才开始取图，用户会看到"图片加载中…"）。
-    const scrollRoot = ctx.scrollRootRef.current;
+    const scrollRoot = renderCtx.scrollRootRef.current;
     const observer = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
           if (!entry.isIntersecting) continue;
-          observer.disconnect();
+          /**
+           * **不在这里 `disconnect()`**：加载成功后 `requestedRef` 会一直为 true（自然不再发请求），
+           * 而失败/超时后它被清掉 —— 保留观测器才能在"再次进入视口"时重试
+           * （用户实测要求：失败后不能永久卡死）。
+           */
           request();
         }
       },
@@ -300,9 +380,10 @@ const DocxImageBlock = memo(function DocxImageBlock({
     observer.observe(host);
     return () => {
       cancelled = true;
+      if (requestRef.current === request) requestRef.current = null;
       observer.disconnect();
     };
-  }, [block.media, cacheKey, ctx, kind]);
+  }, [block.media, cacheKey, kind]);
 
   const caption = block.alt && block.alt.trim() ? block.alt.trim() : null;
   const altText = block.alt ?? block.name ?? "";
@@ -354,7 +435,20 @@ const DocxImageBlock = memo(function DocxImageBlock({
       />
     );
   } else if (state.status === "error") {
-    content = <ImagePlaceholder block={block} message={`图片显示不了：${state.message}`} />;
+    content = (
+      <ImagePlaceholder
+        block={block}
+        message={`图片显示不了：${state.message}`}
+        onRetry={() => {
+          // 手动重试：清掉节流与"已请求"标记，然后直接再发一次（不依赖观测器回调）
+          requestedRef.current = false;
+          lastAttemptRef.current = 0;
+          const retry = requestRef.current;
+          if (retry) retry();
+          else setState({ status: "idle" });
+        }}
+      />
+    );
   } else {
     // 还没加载：按同一个盒子的尺寸占位（滚动时高度不会跳变），不请求后端
     const box = resolveImageBox(block, ctx.scale, contentWidth);
@@ -518,9 +612,17 @@ const DocxTextBoxBlock = memo(function DocxTextBoxBlock({
    */
   const maxBoxWidth = ctx.maxBlockWidth > 0 ? ctx.maxBlockWidth : contentWidth;
   const declaredWidth = ptToPx(Math.max(0, box.widthPt), scale);
-  const avail = Math.max(40, maxBoxWidth);
-  const width = round2(Math.min(avail, declaredWidth > 0 ? declaredWidth : avail));
-  const innerWidth = round2(Math.max(24, width - TEXT_BOX_PADDING * 2));
+  /**
+   * **布局宽**：夹到版心 —— 文本框不参与撑宽纸张（否则会出现横向滚动条）。
+   * **内容宽**：夹到纸张可容纳宽 —— 内容允许视觉溢出到版心外（封面日期框就是靠这个
+   * 才能把「2026-10-21发布 … 2026-10-21实施」排成一行，右端 736px 仍在 794px 的纸内）。
+   * 估算用的是内容宽，所以"估算高度 = 渲染高度"依然成立。
+   */
+  const layoutWidth = round2(Math.min(declaredWidth > 0 ? declaredWidth : contentWidth, contentWidth));
+  const contentBoxWidth = round2(
+    Math.min(declaredWidth > 0 ? declaredWidth : maxBoxWidth, maxBoxWidth),
+  );
+  const innerWidth = round2(Math.max(24, contentBoxWidth - TEXT_BOX_PADDING * 2));
   const declaredHeight = ptToPx(Math.max(0, box.heightPt), scale);
   const fill = hexColor(box.fillColor);
   const borderColor = hexColor(box.borderColor);
@@ -540,13 +642,9 @@ const DocxTextBoxBlock = memo(function DocxTextBoxBlock({
         position: floating ? "absolute" : "relative",
         left: floating ? `${round2(ptToPx(Math.max(0, box.xPt), scale))}px` : undefined,
         top: floating ? `${round2(ptToPx(Math.max(0, box.yPt), scale))}px` : undefined,
-        width: `${width}px`,
-        /**
-         * **不能再用 `maxWidth: 100%`**：外层块的宽度就是正文版心，`maxWidth: 100%`
-         * 会把"允许超出正文版心"的文本框又夹回版心（企业标准的日期框 642.67px 被夹成 622px
-         * → 日期行照样断行）。宽度上限已经用 `ctx.maxBlockWidth`（纸张可容纳宽）夹过了。
-         */
-        maxWidth: "none",
+        // 布局宽夹在版心内：**不撑宽纸张、不出横向滚动条**
+        width: `${layoutWidth}px`,
+        maxWidth: "100%",
         minHeight: `${round2(declaredHeight)}px`,
         padding: `${TEXT_BOX_PADDING}px`,
         boxSizing: "border-box",
@@ -555,7 +653,16 @@ const DocxTextBoxBlock = memo(function DocxTextBoxBlock({
         borderRadius: floating ? `${round2(3 * scale)}px` : undefined,
       }}
     >
-      {renderBlocks(box.blocks, depth, innerWidth)}
+      {/**
+       * 内容层：宽度按**纸张可容纳宽**（可以比外框宽），`overflow: visible` —— 内容完整可见、
+       * 绝不裁切；外层纸张有 `overflow: clip`，所以内容不会把纸张撑宽。
+       */}
+      <div
+        data-docx-textbox-content="true"
+        style={{ width: `${contentBoxWidth}px`, maxWidth: "none", overflow: "visible" }}
+      >
+        {renderBlocks(box.blocks, depth, innerWidth)}
+      </div>
     </div>
   );
 });

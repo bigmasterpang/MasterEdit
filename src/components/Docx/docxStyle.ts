@@ -692,6 +692,11 @@ export function resolveImageBox(
   return { width: round2(width), height: round2(Math.max(1, height)) };
 }
 
+/** 图片读取超时（ms）：超时走失败态，绝不停在「图片加载中…」（`DocxView` 与 `DocxBlock` 共用） */
+export const MEDIA_TIMEOUT_MS = 8000;
+/** 图片失败后重试的最小间隔（ms）：避免观测器重建导致请求风暴 */
+export const MEDIA_RETRY_MS = 2000;
+
 /** 文本框内边距（px）：渲染与估算共用 */
 export const TEXT_BOX_PADDING = 6;
 /** 文本框边框的默认线宽（pt） */
