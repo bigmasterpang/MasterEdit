@@ -44,7 +44,7 @@ use super::{file, office};
 /* ================================================================================== */
 
 /// 文档中的一个有序块。JSON 里带 `kind` 判别字段（`paragraph` / `table` / `image` /
-/// `pageBreak` / `unsupported`），字段名统一 camelCase，前端可以直接写成 TS 联合类型。
+/// `shape` / `pageBreak` / `unsupported`），字段名统一 camelCase，前端可以直接写成 TS 联合类型。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum Block {
@@ -54,6 +54,10 @@ pub enum Block {
     Table(TableBlock),
     /// 独立成块的图片：段落里没有文字、只有图片时，一张图一个块
     Image(ImageBlock),
+    /// 简单图形：合同/表单里用「直线 / 矩形」画的横线与方框
+    /// （VML 的 `v:line` / `v:rect` / `v:roundrect` / `v:oval` / `v:hr`，
+    ///   DrawingML 的 `wps:wsp` + `a:prstGeom`）。识别不出来的形状仍走 [`Block::Unsupported`]。
+    Shape(ShapeBlock),
     /// 显式分页符（`<w:br w:type="page"/>` 独占一段时）
     PageBreak,
     /// 无法呈现的对象 —— **绝不静默丢失**，前端显示占位卡片 + 中文说明
@@ -96,6 +100,33 @@ pub struct ParagraphBlock {
     pub page_break: bool,
     /// 分节符类型（nextPage / continuous / evenPage / oddPage）；有值时前端可画一条淡色"分页提示线"
     pub section_break: Option<String>,
+    /// 段落边框（`w:pPr/w:pBdr`）：四边都为空时整个字段是 `null`。
+    /// 合同/表单里大量用"空段落 + 下边框"画横线，这是除图形外最常见的画线方式。
+    pub borders: Option<ParagraphBorders>,
+}
+
+/// 段落边框。只包含 `w:val` 不为 `none`/`nil` 的边（明确不要边框的边不出现）。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphBorders {
+    pub top: Option<BorderSpec>,
+    pub bottom: Option<BorderSpec>,
+    pub left: Option<BorderSpec>,
+    pub right: Option<BorderSpec>,
+}
+
+/// 一条边框（`w:top` / `w:bottom` / …）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BorderSpec {
+    /// `w:val`：single / double / dashed / dotted / thick / wave …（`none`/`nil` 不会出现在这里）
+    pub style: String,
+    /// 线宽（pt）；`w:sz` 的单位是**八分之一磅**，所以 ÷8
+    pub width_pt: f64,
+    /// 颜色 RRGGBB（`w:color="auto"` → `null`，前端给默认色）
+    pub color: Option<String>,
+    /// 边框与文字的间距（pt，`w:space`；文档里没写就是 `null`）
+    pub space_pt: Option<f64>,
 }
 
 /// 行距。`multiple` 时 value 是倍数（1.0 = 单倍），`exact`/`atLeast` 时 value 是 pt。
@@ -236,6 +267,36 @@ pub struct ImageBlock {
     pub height_px: f32,
 }
 
+/// 简单图形（合同/表单里的横线、方框）。坐标与尺寸都用 **pt**。
+///
+/// 注意 `xPt` / `yPt` 的含义：Word 对内联（`wp:inline`）图形**不记录**它在段落里的水平
+/// 偏移（那是排版算出来的），所以这里给的是形状**自身声明**的偏移（DrawingML 的 `a:off`、
+/// VML style 里的 `left`/`margin-left`），拿不到就是 `0` —— 前端按"就在这个 run 的位置"处理。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeBlock {
+    /// 形状种类：line / rect / roundRect / ellipse
+    pub shape: String,
+    /// 相对段落内容区左上角的横向偏移（pt，拿不到就是 0）
+    pub x_pt: f64,
+    /// 纵向偏移（pt，同样只在形状自己声明了才有意义）
+    pub y_pt: f64,
+    /// 宽（pt）
+    pub width_pt: f64,
+    /// 高（pt）；直线的高度为 0 时按线宽（拿不到就 1pt）兜底，前端好定位
+    pub height_pt: f64,
+    /// 线宽（pt）；`a:ln@w`（EMU ÷ 12700）或 `strokeweight`
+    pub line_width_pt: Option<f64>,
+    /// 线色 RRGGBB（拿不到给 `null`，前端用默认黑）
+    pub line_color: Option<String>,
+    /// 填充色 RRGGBB（无填充 / 拿不到都是 `null`）
+    pub fill_color: Option<String>,
+    /// 虚线样式（DrawingML 的 `a:prstDash` 原值，或 VML `dashstyle` 归一化后的名字）
+    pub dash: Option<String>,
+    /// 是否竖线（仅 `line` 有意义：高 > 宽）
+    pub vertical: bool,
+}
+
 /// `document_blocks` 的返回：窗口化的块 + 总数（前端虚拟滚动用）
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -247,6 +308,31 @@ pub struct BlockPage {
     pub blocks: Vec<Block>,
     /// 是否为亿赛通等透明加密文档（已在内存中解密）
     pub encrypted: bool,
+    /// 页面几何（"一页一页"显示时前端算分页要用）；文档里没有 `w:sectPr` 时为 `None`
+    pub page: Option<PageGeometry>,
+}
+
+/// 页面几何：取自 `w:sectPr` 的 `w:pgSz` / `w:pgMar`（单位统一 pt，twip ÷ 20）。
+///
+/// 只描述**纸张与页边距**，不承诺页码/分节位置 —— 分页由前端按内容高度切。
+/// 单个属性缺失或畸形（`w:w="0"`、非数字）时按 A4 兜底，不 panic。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageGeometry {
+    /// 纸张宽（pt，`w:pgSz/@w:w`）
+    pub width_pt: f64,
+    /// 纸张高（pt，`w:pgSz/@w:h`）
+    pub height_pt: f64,
+    /// 上边距（pt，`w:pgMar/@w:top`；**可为负**，Word 允许）
+    pub margin_top_pt: f64,
+    /// 右边距（pt）
+    pub margin_right_pt: f64,
+    /// 下边距（pt）
+    pub margin_bottom_pt: f64,
+    /// 左边距（pt）
+    pub margin_left_pt: f64,
+    /// `w:pgSz/@w:orient == "landscape"`（注意：Word 写横版时会把 w/h 直接写成横向尺寸）
+    pub landscape: bool,
 }
 
 /// 一处查找命中（块级：一个块最多一条，`block` 是顶层块下标，供前端滚动定位）
@@ -593,6 +679,8 @@ struct ParaProps {
     auto_before: Option<bool>,
     /// `w:afterAutospacing`（自动段后间距）
     auto_after: Option<bool>,
+    /// `w:pBdr` 段落边框（四边都空时解析成 None）
+    borders: Option<ParagraphBorders>,
 }
 
 impl ParaProps {
@@ -627,6 +715,7 @@ impl ParaProps {
         fill(&mut self.outline_level, &lower.outline_level);
         fill(&mut self.auto_before, &lower.auto_before);
         fill(&mut self.auto_after, &lower.auto_after);
+        fill(&mut self.borders, &lower.borders);
         // 缩进：twips 与 Chars 是一组
         fill_pair(
             &mut self.indent_left_pt,
@@ -1083,7 +1172,43 @@ fn parse_para_props(node: &XmlNode) -> ParaProps {
         }
     }
 
+    // 段落边框（合同/表单里"空段落 + 下边框"就是一条横线）
+    props.borders = node.child("pBdr").and_then(parse_paragraph_borders);
+
     props
+}
+
+/// `w:pBdr` → 段落边框。`w:val` 为 `none`/`nil` 的边不产出（是"明确不要边框"）；
+/// 四边都没有就返回 `None`（前端少一层判断）。
+fn parse_paragraph_borders(node: &XmlNode) -> Option<ParagraphBorders> {
+    let side = |name: &str| -> Option<BorderSpec> {
+        let border = node.child(name)?;
+        let style = border.attr_local("val").unwrap_or("single").trim();
+        if style.is_empty() || style.eq_ignore_ascii_case("none") || style.eq_ignore_ascii_case("nil") {
+            return None;
+        }
+        Some(BorderSpec {
+            style: style.to_string(),
+            // `w:sz` 是八分之一磅
+            width_pt: number_f64(border.attr_local("sz")).unwrap_or(0.0) / 8.0,
+            // 边框颜色只把 "auto" 当没写 —— 白色是**合法的可见设置**（等于隐形线），
+            // 不能像底纹那样把 FFFFFF 也吃掉
+            color: border.attr_local("color").and_then(normalize_color_strict),
+            // `w:space` 的单位就是 pt
+            space_pt: number_f64(border.attr_local("space")),
+        })
+    };
+    let borders = ParagraphBorders {
+        top: side("top"),
+        bottom: side("bottom"),
+        left: side("left"),
+        right: side("right"),
+    };
+    if borders.top.is_none() && borders.bottom.is_none() && borders.left.is_none() && borders.right.is_none()
+    {
+        return None;
+    }
+    Some(borders)
 }
 
 /// `<w:b/>` / `<w:b w:val="0"/>` → Some(true/false)；节点不存在 → None（没表态）
@@ -1109,6 +1234,11 @@ fn number(value: Option<&str>) -> Option<f32> {
     value?.trim().parse::<f32>().ok()
 }
 
+/// f64 版（页面几何用它，避免 pt 值来回折损精度）
+fn number_f64(value: Option<&str>) -> Option<f64> {
+    value?.trim().parse::<f64>().ok()
+}
+
 fn integer(value: Option<&str>) -> Option<i64> {
     value?.trim().parse::<i64>().ok()
 }
@@ -1116,6 +1246,11 @@ fn integer(value: Option<&str>) -> Option<i64> {
 /// twip（1/20 pt）→ pt
 fn twips_to_pt(value: Option<&str>) -> Option<f32> {
     number(value).map(|twips| twips / 20.0)
+}
+
+/// twip → pt（f64 版，页面几何用）
+fn twips_to_pt_f64(twips: f64) -> f64 {
+    twips / 20.0
 }
 
 /// twip → px（96 dpi：1pt = 4/3 px）
@@ -1127,6 +1262,9 @@ fn twips_to_px(value: f32) -> f32 {
 fn emu_to_px(value: f32) -> f32 {
     value / 9525.0
 }
+
+/// 1 pt = 12700 EMU（形状几何用它）
+const EMU_PER_PT: f64 = 12700.0;
 
 /// `w:color` 值 → RRGGBB；`auto` / 非法值当没写
 fn normalize_color(value: &str) -> Option<String> {
@@ -1173,6 +1311,48 @@ fn highlight_color(name: &str) -> Option<String> {
         other => return normalize_color(other),
     };
     Some(hex.to_string())
+}
+
+/// **严格**颜色解析：只认 `#RRGGBB` / `RRGGBB` / `RGB` 与 VML 的常用具名色，
+/// 只把 `auto` 当"没写"。
+///
+/// 与 [`normalize_color`] 的区别：那个会把 `FFFFFF` 也当成"没写"（底纹的惯用写法），
+/// 还会把非十六进制字符**过滤掉**（`"black"` 会被削成 `bac` → 变成 `BBAACC`！）。
+/// 边框色与 VML 的 `strokecolor` 都用这个，避免把白线变没、把颜色名解析成怪色。
+fn normalize_color_strict(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let lowered = value.to_ascii_lowercase();
+    if let Some(hex) = match lowered.as_str() {
+        "black" | "windowtext" => Some("000000"),
+        "white" | "window" => Some("FFFFFF"),
+        "red" => Some("FF0000"),
+        "green" => Some("008000"),
+        "lime" => Some("00FF00"),
+        "blue" => Some("0000FF"),
+        "yellow" => Some("FFFF00"),
+        "gray" | "grey" => Some("808080"),
+        "silver" => Some("C0C0C0"),
+        "maroon" => Some("800000"),
+        "navy" => Some("000080"),
+        "teal" => Some("008080"),
+        "purple" => Some("800080"),
+        "olive" => Some("808000"),
+        "fuchsia" | "magenta" => Some("FF00FF"),
+        "aqua" | "cyan" => Some("00FFFF"),
+        _ => None,
+    } {
+        return Some(hex.to_string());
+    }
+    let hex = value.trim_start_matches('#');
+    let is_hex = hex.chars().all(|ch| ch.is_ascii_hexdigit()) && !hex.is_empty();
+    match (is_hex, hex.len()) {
+        (true, 6) => Some(hex.to_uppercase()),
+        (true, 3) => Some(hex.chars().flat_map(|ch| [ch, ch]).collect::<String>().to_uppercase()),
+        _ => None,
+    }
 }
 
 /* ================================================================================== */
@@ -1664,15 +1844,16 @@ const FALLBACK_IMAGE_PX: (f32, f32) = (320.0, 200.0);
 #[derive(Default)]
 struct ParagraphContent {
     runs: Vec<Run>,
-    images: Vec<ImageBlock>,
-    unsupported: Vec<Block>,
+    /// 段落里的**非文字块**（图片 / 形状 / 占位对象），按文档顺序排好。
+    /// 合成一个列表而不是分几个数组：这样"图片 - 线 - 占位"的先后顺序不会被打乱。
+    objects: Vec<Block>,
     /// 段落里出现过 `<w:br w:type="page"/>`
     page_break: bool,
 }
 
 impl ParagraphContent {
     fn is_empty(&self) -> bool {
-        self.runs.is_empty() && self.images.is_empty() && self.unsupported.is_empty() && !self.page_break
+        self.runs.is_empty() && self.objects.is_empty() && !self.page_break
     }
 }
 
@@ -1684,6 +1865,10 @@ struct DocBuilder<'a> {
     numbering_state: NumberingState,
     /// 文档里的 `w:p` 元素总数（含表格单元格内的），用于与 `document_info` 对账
     paragraph_count: usize,
+    /// 正文栏宽（pt）= 纸张宽 − 左右页边距：给"整栏宽"的对象用（`v:hr` 水平线）
+    column_width_pt: f64,
+    /// 当前段落的内容宽度（pt）= 栏宽 − 本段左右缩进（每次解析段落时更新）
+    current_width_pt: f64,
 }
 
 impl<'a> DocBuilder<'a> {
@@ -1692,7 +1877,13 @@ impl<'a> DocBuilder<'a> {
         numbering: &'a Numbering,
         theme: &'a Theme,
         rels: &'a HashMap<String, RelInfo>,
+        page: Option<&PageGeometry>,
     ) -> Self {
+        // 没有 w:sectPr 时按 A4 + 默认边距估栏宽（前端也是同一套兜底）
+        let column_width_pt = page
+            .map(|page| page.width_pt - page.margin_left_pt - page.margin_right_pt)
+            .unwrap_or(A4_WIDTH_PT - 2.0 * A4_MARGIN_PT)
+            .max(1.0);
         DocBuilder {
             styles,
             numbering,
@@ -1700,6 +1891,8 @@ impl<'a> DocBuilder<'a> {
             rels,
             numbering_state: NumberingState::default(),
             paragraph_count: 0,
+            column_width_pt,
+            current_width_pt: column_width_pt,
         }
     }
 
@@ -1807,6 +2000,11 @@ impl<'a> DocBuilder<'a> {
         ppr.resolve_char_indents(font_size_pt);
         // 2) 段前/段后：显式 twips → 行单位折算 → 自动间距（Auto）→ 层叠值
         ppr.resolve_spacing(font_size_pt, explicit_before, explicit_after);
+        // 本段可用的内容宽度（pt）：给 `v:hr` 这类"整栏宽"的形状用
+        self.current_width_pt = (self.column_width_pt
+            - ppr.indent_left_pt.unwrap_or(0.0) as f64
+            - ppr.indent_right_pt.unwrap_or(0.0) as f64)
+            .max(1.0);
 
         // ---- 行内内容 ----
         let mut content = ParagraphContent::default();
@@ -1838,9 +2036,7 @@ impl<'a> DocBuilder<'a> {
 
         // 只含分页符的段落（Word 里 Ctrl+Enter 就是这个形态）→ 独立的分页块。
         // 注意判断的是"没有可见文字"而不是"没有 run"：run 里的 `\n` 是分页符本身带来的。
-        if !has_visible_text && content.images.is_empty() && content.unsupported.is_empty()
-            && content.page_break
-        {
+        if !has_visible_text && content.objects.is_empty() && content.page_break {
             out.push(Block::PageBreak);
             return;
         }
@@ -1861,18 +2057,16 @@ impl<'a> DocBuilder<'a> {
                 page_break_before,
                 section_break,
                 list,
+                borders: ppr.borders,
                 ..ParagraphBlock::default()
             }));
             return;
         }
 
-        // 完全没有文字 run、只有图片/占位对象的段落：图片与占位各自成块
+        // 完全没有文字 run、只有图片/形状/占位对象的段落：各自成块
         // （前端按块渲染即可，不必再去解析段落内部；有换行 run 的空段落仍走下面的段落分支）
         if !has_visible_text && content.runs.is_empty() {
-            for image in content.images.drain(..) {
-                out.push(Block::Image(image));
-            }
-            for block in content.unsupported.drain(..) {
+            for block in content.objects.drain(..) {
                 out.push(block);
             }
             return;
@@ -1895,11 +2089,9 @@ impl<'a> DocBuilder<'a> {
             page_break_before,
             page_break: content.page_break,
             section_break,
+            borders: ppr.borders,
         }));
-        for image in content.images {
-            out.push(Block::Image(image));
-        }
-        for block in content.unsupported {
+        for block in content.objects {
             out.push(block);
         }
     }
@@ -1945,7 +2137,7 @@ impl<'a> DocBuilder<'a> {
                     format!("公式内容（纯文本）：{}", plain.trim())
                 };
                 content
-                    .unsupported
+                    .objects
                     .push(unsupported("数学公式（OMML，暂不支持显示）", detail));
             }
             "AlternateContent" => self.walk_alternate(node, base_rpr, char_style, content),
@@ -1960,7 +2152,7 @@ impl<'a> DocBuilder<'a> {
                     format!("文本框内容（纯文本）：{}", plain.trim())
                 };
                 content
-                    .unsupported
+                    .objects
                     .push(unsupported("文本框（暂不支持显示）", detail));
             }
             // 段落/表格/单元格属性、锚点、书签：都不是可显示内容
@@ -1995,19 +2187,15 @@ impl<'a> DocBuilder<'a> {
         char_style: Option<&str>,
         content: &mut ParagraphContent,
     ) {
-        let before = (
-            content.runs.len(),
-            content.images.len(),
-            content.unsupported.len(),
-        );
+        let before = (content.runs.len(), content.objects.len());
         if let Some(choice) = node.child("Choice") {
             for child in choice.children() {
                 self.walk_inline(child, base_rpr, char_style, content);
             }
         }
-        let produced = content.runs.len() != before.0
-            || content.images.len() != before.1
-            || content.unsupported.len() != before.2;
+        // Choice 有产出就不再看 Fallback（Word 里 Choice=DrawingML、Fallback=VML 是常态，
+        // 两条都取会同一个图形产出两个块）
+        let produced = content.runs.len() != before.0 || content.objects.len() != before.1;
         if !produced {
             if let Some(fallback) = node.child("Fallback") {
                 for child in fallback.children() {
@@ -2078,7 +2266,7 @@ impl<'a> DocBuilder<'a> {
                         format!("文本框内容（纯文本）：{}", plain.trim())
                     };
                     content
-                        .unsupported
+                        .objects
                         .push(unsupported("文本框（暂不支持显示）", detail));
                 }
                 "oMath" | "oMathPara" => {
@@ -2089,7 +2277,7 @@ impl<'a> DocBuilder<'a> {
                         format!("公式内容（纯文本）：{}", plain.trim())
                     };
                     content
-                        .unsupported
+                        .objects
                         .push(unsupported("数学公式（OMML，暂不支持显示）", detail));
                 }
                 "AlternateContent" => self.walk_alternate(child, base_rpr, char_style, content),
@@ -2115,20 +2303,20 @@ impl<'a> DocBuilder<'a> {
         }
     }
 
-    /// `w:drawing`：图片 / SmartArt / 图表 / 文本框
+    /// `w:drawing`：图片 / SmartArt / 图表 / 文本框 / 自选图形
     fn handle_drawing(&mut self, node: &XmlNode, content: &mut ParagraphContent) {
         // 先看 graphicData 的 URI：它决定这是图片还是图表/SmartArt
         if let Some(data) = node.find_descendant("graphicData") {
             if let Some(uri) = data.attr("uri") {
                 if uri.contains("diagram") {
-                    content.unsupported.push(unsupported(
+                    content.objects.push(unsupported(
                         "SmartArt 图形（暂不支持显示）",
                         "组织结构图 / 流程图等 SmartArt 需要 Word / WPS 渲染",
                     ));
                     return;
                 }
                 if uri.contains("chart") {
-                    content.unsupported.push(unsupported(
+                    content.objects.push(unsupported(
                         "图表（暂不支持显示）",
                         "文档里的统计图表需要 Word / WPS 渲染",
                     ));
@@ -2156,7 +2344,7 @@ impl<'a> DocBuilder<'a> {
                             .map(|(cx, cy)| (emu_to_px(cx), emu_to_px(cy)))
                             .unwrap_or(FALLBACK_IMAGE_PX);
                         let doc_pr = node.find_descendant("docPr");
-                        content.images.push(ImageBlock {
+                        content.objects.push(Block::Image(ImageBlock {
                             media,
                             name: doc_pr.and_then(|node| node.attr("name")).map(str::to_string),
                             alt: doc_pr
@@ -2165,16 +2353,16 @@ impl<'a> DocBuilder<'a> {
                                 .map(str::to_string),
                             width_px: width,
                             height_px: height,
-                        });
+                        }));
                     }
                     // 关系缺失 / 指向非图片：说明白，别静默丢
                     Err(reason) => content
-                        .unsupported
+                        .objects
                         .push(unsupported("图片（无法显示）", reason)),
                 }
                 return;
             }
-            content.unsupported.push(unsupported(
+            content.objects.push(unsupported(
                 "图形对象（暂不支持显示）",
                 "这段内容用了本项目还不支持的图形表示，Word / WPS 可正常显示",
             ));
@@ -2189,21 +2377,126 @@ impl<'a> DocBuilder<'a> {
                 format!("文本框内容（纯文本）：{}", plain.trim())
             };
             content
-                .unsupported
+                .objects
                 .push(unsupported("文本框（暂不支持显示）", detail));
             return;
         }
 
-        content.unsupported.push(unsupported(
+        // 自选图形（横线 / 方框）：能认出来就画，认不出来照旧给占位块
+        if let Some(shape) = self.drawing_shape(node) {
+            content.objects.push(Block::Shape(shape));
+            return;
+        }
+
+        content.objects.push(unsupported(
             "图形对象（暂不支持显示）",
             "这段内容用了本项目还不支持的图形表示，Word / WPS 可正常显示",
         ));
     }
 
-    /// `w:pict`（VML 老式图形）：图片 → 图片块；文本框 → 占位
+    /// DrawingML 自选图形（`wps:wsp` + `a:prstGeom`）→ [`ShapeBlock`]。
+    /// 返回 `None` 表示"认不出来"，调用方会给占位块（**不丢内容**）：
+    /// - 组合图形（`wpg:wgp`）：只渲染其中一部分会丢东西，整体走占位；
+    /// - 没有 `prstGeom`（自由曲线 `a:custGeom`、连接符以外的复杂图形）；
+    /// - 旋转 / 翻转过的形状（几何算不准，画歪不如不画）；
+    /// - `prst` 不在支持表里（流程图、箭头、星形…）。
+    fn drawing_shape(&self, node: &XmlNode) -> Option<ShapeBlock> {
+        if node.has_descendant("wgp") {
+            return None;
+        }
+        let wsp = node.find_descendant("wsp")?;
+        let prst = wsp.find_descendant("prstGeom")?.attr("prst")?.trim();
+        let shape = match prst {
+            "line" => "line",
+            // 直线连接符（Word 的"直线"连接符）在观感上就是一条直线
+            "straightConnector1" => "line",
+            "rect" => "rect",
+            "roundRect" => "roundRect",
+            "ellipse" => "ellipse",
+            _ => return None,
+        };
+        if let Some(xfrm) = wsp.find_descendant("xfrm") {
+            let rotated = xfrm
+                .attr("rot")
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .is_some_and(|angle| angle != 0.0);
+            if rotated || attr_is_on(xfrm, "flipH") || attr_is_on(xfrm, "flipV") {
+                return None;
+            }
+        }
+
+        // 尺寸优先用 `wp:extent`（Word 排版用的外框），退回形状自己的 `a:ext`
+        let extent = |node: &XmlNode| -> Option<(f64, f64)> {
+            let cx = number_f64(node.attr_local("cx").or_else(|| node.attr_local("w")))?;
+            let cy = number_f64(node.attr_local("cy").or_else(|| node.attr_local("h")))?;
+            Some((cx / EMU_PER_PT, cy / EMU_PER_PT))
+        };
+        let (mut width_pt, mut height_pt) = node
+            .find_descendant("extent")
+            .and_then(|node| extent(node))
+            .or_else(|| wsp.find_descendant("ext").and_then(|node| extent(node)))
+            .unwrap_or((0.0, 0.0));
+
+        let (x_pt, y_pt) = wsp
+            .find_descendant("off")
+            .map(|off| {
+                (
+                    number_f64(off.attr_local("x")).unwrap_or(0.0) / EMU_PER_PT,
+                    number_f64(off.attr_local("y")).unwrap_or(0.0) / EMU_PER_PT,
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+
+        let sp_pr = wsp.find_descendant("spPr");
+        let line = sp_pr.and_then(|sp| sp.child("ln"));
+        let line_width_pt = line
+            .and_then(|ln| number_f64(ln.attr("w")))
+            .filter(|value| *value > 0.0)
+            .map(|emu| emu / EMU_PER_PT);
+        let line_color = line
+            .and_then(|ln| ln.find_descendant("srgbClr").or_else(|| ln.find_descendant("sysClr")))
+            .and_then(|color| color.attr("val").or_else(|| color.attr("lastClr")))
+            .and_then(normalize_color_strict);
+        let dash = line
+            .and_then(|ln| ln.find_descendant("prstDash"))
+            .and_then(|dash| dash.attr("val"))
+            .filter(|value| !value.eq_ignore_ascii_case("solid"))
+            .map(str::to_string);
+        let fill_color = sp_pr
+            .and_then(|sp| sp.child("solidFill"))
+            .and_then(|fill| fill.find_descendant("srgbClr").or_else(|| fill.find_descendant("sysClr")))
+            .and_then(|color| color.attr("val").or_else(|| color.attr("lastClr")))
+            .and_then(normalize_color_strict);
+
+        // 直线：某一维为 0 时用线宽（拿不到就 1pt）兜底，前端才好定位与命中
+        if shape == "line" {
+            let fallback = line_width_pt.unwrap_or(1.0);
+            if height_pt <= 0.0 {
+                height_pt = fallback;
+            }
+            if width_pt <= 0.0 {
+                width_pt = fallback;
+            }
+        }
+
+        Some(ShapeBlock {
+            shape: shape.to_string(),
+            x_pt,
+            y_pt,
+            width_pt,
+            height_pt,
+            line_width_pt,
+            line_color,
+            fill_color,
+            dash,
+            vertical: shape == "line" && height_pt > width_pt,
+        })
+    }
+
+    /// `w:pict`（VML 老式图形）：图片 → 图片块；文本框 → 占位；线/框 → [`Block::Shape`]
     fn handle_pict(&mut self, node: &XmlNode, content: &mut ParagraphContent) {
         if let Some(image) = self.vml_image(node) {
-            content.images.push(image);
+            content.objects.push(Block::Image(image));
             return;
         }
         if node.has_descendant("textbox") || node.has_descendant("txbxContent") {
@@ -2214,14 +2507,117 @@ impl<'a> DocBuilder<'a> {
                 format!("文本框内容（纯文本）：{}", plain.trim())
             };
             content
-                .unsupported
+                .objects
                 .push(unsupported("文本框（暂不支持显示）", detail));
             return;
         }
-        content.unsupported.push(unsupported(
-            "图形对象（VML，暂不支持显示）",
-            "这段内容用了老式 VML 图形，Word / WPS 可正常显示",
-        ));
+        // 逐个**直接子形状**处理：一个 w:pict 里可能画了好几条线；
+        // v:group 不拆（只画其中一部分会丢内容），交给占位块
+        for child in node.children() {
+            if let Some(shape) = self.vml_shape(child) {
+                content.objects.push(Block::Shape(shape));
+            } else {
+                content.objects.push(unsupported(
+                    "图形对象（VML，暂不支持显示）",
+                    "这段内容用了老式 VML 图形（组合图形或本项目还不支持的形状），Word / WPS 可正常显示",
+                ));
+            }
+        }
+    }
+
+    /// VML 形状（`v:line` / `v:rect` / `v:roundrect` / `v:oval` / `v:hr`）→ [`ShapeBlock`]。
+    /// 认不出来（`v:group`、`v:shape`、`v:polyline`…）返回 `None`。
+    fn vml_shape(&self, node: &XmlNode) -> Option<ShapeBlock> {
+        let (shape, is_line) = match node.local() {
+            "line" => ("line", true),
+            "rect" => ("rect", false),
+            "roundrect" => ("roundRect", false),
+            "oval" => ("ellipse", false),
+            "hr" => {
+                // Word 的「水平线」：没有尺寸信息，就是整栏宽的一条细线
+                return Some(ShapeBlock {
+                    shape: "line".to_string(),
+                    width_pt: self.current_width_pt,
+                    height_pt: 1.0,
+                    vertical: false,
+                    ..ShapeBlock::default()
+                });
+            }
+            _ => return None,
+        };
+
+        let style = node.attr("style").unwrap_or_default();
+        let (width, height, unit_pt) = vml_style_size(style);
+        let mut width_pt = width.unwrap_or(0.0);
+        let mut height_pt = height.unwrap_or(0.0);
+        // 偏移：VML 写在 style 的 margin-left / margin-top（或 left / top）里
+        let x_pt = vml_style_length(style, &["margin-left", "left"]).unwrap_or(0.0);
+        let y_pt = vml_style_length(style, &["margin-top", "top"]).unwrap_or(0.0);
+
+        // 直线：端点（`from` / `to`）用来判方向；坐标空间见 parse_vml_point
+        let mut vertical = false;
+        if is_line {
+            let from = node.attr("from").and_then(parse_vml_point);
+            let to = node.attr("to").and_then(parse_vml_point);
+            if let (Some(from), Some(to)) = (from, to) {
+                let coordsize = node
+                    .attr_local("coordsize")
+                    .and_then(|value| parse_vml_point(value).map(|point| (point.0, point.1)));
+                let begin = resolve_vml_point(from, coordsize, (width_pt, height_pt), unit_pt);
+                let end = resolve_vml_point(to, coordsize, (width_pt, height_pt), unit_pt);
+                let dx = (end.0 - begin.0).abs();
+                let dy = (end.1 - begin.1).abs();
+                // 样式没给尺寸时，用两端点的包围盒
+                if width_pt <= 0.0 && dx > 0.0 {
+                    width_pt = dx;
+                }
+                if height_pt <= 0.0 && dy > 0.0 {
+                    height_pt = dy;
+                }
+                vertical = dy > dx;
+            }
+        }
+
+        let stroke_width = node
+            .attr_local("strokeweight")
+            .and_then(parse_style_length)
+            .map(|(value, factor)| value * factor);
+        let stroke_color = node
+            .attr_local("strokecolor")
+            .and_then(normalize_color_strict);
+        let filled = !matches!(node.attr_local("filled"), Some("f") | Some("false") | Some("0"));
+        let fill_color = node
+            .attr_local("fillcolor")
+            .and_then(normalize_color_strict)
+            .filter(|_| filled);
+        let dash = node
+            .attr_local("dashstyle")
+            .filter(|value| !value.eq_ignore_ascii_case("solid"))
+            .map(|value| normalize_vml_dash(value).to_string());
+
+        if is_line {
+            let fallback = stroke_width.unwrap_or(1.0);
+            if width_pt <= 0.0 {
+                width_pt = fallback;
+            }
+            if height_pt <= 0.0 {
+                height_pt = fallback;
+            }
+            vertical = vertical || height_pt > width_pt;
+        }
+
+        Some(ShapeBlock {
+            shape: shape.to_string(),
+            x_pt,
+            y_pt,
+            width_pt,
+            height_pt,
+            line_width_pt: stroke_width,
+            line_color: stroke_color,
+            fill_color,
+            dash,
+            vertical,
+        })
     }
 
     /// `w:object`（OLE 嵌入对象，如公式编辑器 3.0、Excel 表格对象）。
@@ -2230,7 +2626,7 @@ impl<'a> DocBuilder<'a> {
     fn handle_object(&mut self, node: &XmlNode, content: &mut ParagraphContent) {
         let mut previewed = false;
         if let Some(image) = self.vml_image(node) {
-            content.images.push(image);
+            content.objects.push(Block::Image(image));
             previewed = true;
         }
         let prog_id = node
@@ -2238,7 +2634,7 @@ impl<'a> DocBuilder<'a> {
             .and_then(|ole| ole.attr("ProgID"))
             .map(|prog| format!("（{prog}）"))
             .unwrap_or_default();
-        content.unsupported.push(unsupported(
+        content.objects.push(unsupported(
             "OLE 嵌入对象（暂不支持显示）",
             if previewed {
                 format!("上面显示的是文档里的预览图{prog_id}；打开/编辑实际对象请用 Word / WPS")
@@ -2466,40 +2862,152 @@ fn merge_borders(cell: Option<[Option<bool>; 4]>, table: [Option<bool>; 4]) -> [
     out
 }
 
-/// VML `style="width:72pt;height:36pt"` → px（认不出就给兜底尺寸，绝不给 0）
+/// VML `style="width:72pt;height:36pt"` → px（认不出就给兜底尺寸，绝不给 0）。
+/// 注意这里要的是 **px**（图片块用 px），而 [`vml_style_size`] 给的是 pt，所以 ×4/3。
 fn parse_vml_size(style: &str) -> (f32, f32) {
-    let mut size = FALLBACK_IMAGE_PX;
+    let (width, height, _) = vml_style_size(style);
+    (
+        width
+            .map(|pt| (pt * 4.0 / 3.0) as f32)
+            .unwrap_or(FALLBACK_IMAGE_PX.0),
+        height
+            .map(|pt| (pt * 4.0 / 3.0) as f32)
+            .unwrap_or(FALLBACK_IMAGE_PX.1),
+    )
+}
+
+/// VML / CSS style 里的长度 → `(数值, 换算成 pt 的系数)`。
+/// 无单位的长度按 CSS 约定当 px（×0.75）——Word 写的 VML 基本都带单位，这条是兜底。
+fn parse_style_length(value: &str) -> Option<(f64, f64)> {
+    let value = value.trim();
+    for (suffix, factor) in [
+        ("pt", 1.0),
+        ("px", 0.75),
+        ("in", 72.0),
+        ("cm", 72.0 / 2.54),
+        ("mm", 72.0 / 25.4),
+        ("pc", 12.0),
+        ("em", 12.0),
+    ] {
+        if let Some(number) = value.strip_suffix(suffix) {
+            return number
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(|number| (number, factor));
+        }
+    }
+    value.parse::<f64>().ok().map(|number| (number, 0.75))
+}
+
+/// VML `style` 里的 width / height → `(宽 pt, 高 pt, 该 style 的"单位系数")`。
+/// 第三个值是给**无单位**的 `from`/`to` 坐标用的：VML 规范里没写 `coordsize` 时，
+/// 坐标空间就是形状自身的尺寸，单位与 style 一致（Word 写 `width:400pt` + `to="400,0"`）。
+fn vml_style_size(style: &str) -> (Option<f64>, Option<f64>, f64) {
+    let mut width = None;
+    let mut height = None;
+    let mut unit_pt = 1.0;
     for part in style.split(';') {
         let Some((key, value)) = part.split_once(':') else {
             continue;
         };
-        let value = value.trim();
-        let (number_part, factor) = if let Some(value) = value.strip_suffix("pt") {
-            (value, 4.0 / 3.0)
-        } else if let Some(value) = value.strip_suffix("px") {
-            (value, 1.0)
-        } else if let Some(value) = value.strip_suffix("in") {
-            (value, 96.0)
-        } else if let Some(value) = value.strip_suffix("cm") {
-            (value, 96.0 / 2.54)
-        } else if let Some(value) = value.strip_suffix("mm") {
-            (value, 96.0 / 25.4)
-        } else {
+        let Some((number, factor)) = parse_style_length(value) else {
             continue;
         };
-        let Ok(parsed) = number_part.trim().parse::<f32>() else {
-            continue;
-        };
-        if parsed <= 0.0 {
-            continue;
-        }
-        match key.trim() {
-            "width" => size.0 = parsed * factor,
-            "height" => size.1 = parsed * factor,
+        match key.trim().to_ascii_lowercase().as_str() {
+            "width" => {
+                width = Some(number * factor);
+                unit_pt = factor;
+            }
+            "height" => {
+                height = Some(number * factor);
+                unit_pt = factor;
+            }
             _ => {}
         }
     }
-    size
+    (width, height, unit_pt)
+}
+
+/// 从 VML `style` 里取第一个命中的长度属性（pt）：`margin-left` / `left` / `margin-top` / `top`
+fn vml_style_length(style: &str, keys: &[&str]) -> Option<f64> {
+    for part in style.split(';') {
+        let Some((key, value)) = part.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if keys.iter().any(|wanted| *wanted == key) {
+            if let Some((number, factor)) = parse_style_length(value) {
+                return Some(number * factor);
+            }
+        }
+    }
+    None
+}
+
+/// VML 点（`from="0,0"` / `to="400pt,0"`）→ `(x, y, 是否带单位)`
+fn parse_vml_point(value: &str) -> Option<(f64, f64, bool)> {
+    let mut parts = value.split(',');
+    let x = parts.next()?.trim();
+    let y = parts.next().unwrap_or("0").trim();
+    let (x_number, x_factor) = parse_style_length(x)?;
+    let (y_number, y_factor) = parse_style_length(y)?;
+    // 判断"带没带单位"：带单位时 parse_style_length 走的不是无单位分支（系数 ≠ 0.75 或缺后缀）
+    let has_unit = |raw: &str| {
+        let raw = raw.trim();
+        raw.ends_with("pt") || raw.ends_with("px") || raw.ends_with("in") || raw.ends_with("cm")
+            || raw.ends_with("mm") || raw.ends_with("pc") || raw.ends_with("em")
+    };
+    let unit = has_unit(x) || has_unit(y);
+    let (x_pt, y_pt) = if unit {
+        (x_number * x_factor, y_number * y_factor)
+    } else {
+        (x_number, y_number)
+    };
+    Some((x_pt, y_pt, unit))
+}
+
+/// VML 端点 → pt。三种坐标空间，按优先级：
+/// 1. 端点自带单位 → 已经是 pt，直接用；
+/// 2. 有 `coordsize`（`coordsize="1000,1000"`）→ 按它映射到形状的 style 尺寸；
+/// 3. 都没有 → 坐标与 style 同单位（Word 的常见写法）。
+fn resolve_vml_point(
+    point: (f64, f64, bool),
+    coordsize: Option<(f64, f64)>,
+    box_pt: (f64, f64),
+    unit_pt: f64,
+) -> (f64, f64) {
+    if point.2 {
+        return (point.0, point.1);
+    }
+    match coordsize {
+        Some((cx, cy)) if cx > 0.0 && cy > 0.0 => (
+            point.0 / cx * box_pt.0.max(1.0),
+            point.1 / cy * box_pt.1.max(1.0),
+        ),
+        _ => (point.0 * unit_pt, point.1 * unit_pt),
+    }
+}
+
+/// VML 的 `dashstyle` 名字归一到与 DrawingML `a:prstDash` 同名的那一套
+fn normalize_vml_dash(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "shortdot" | "dot" => "dot",
+        "shortdash" | "dash" => "dash",
+        "dashdot" | "shortdashdot" => "dashDot",
+        "longdash" | "dashdotdot" | "longdashdot" => "lgDash",
+        "sysdot" => "sysDot",
+        "sysdash" => "sysDash",
+        _ => "dash",
+    }
+}
+
+/// XML 属性形式的布尔（`val="1"` / `"true"` / `"on"` 为真；缺省为假）
+fn attr_is_on(node: &XmlNode, name: &str) -> bool {
+    match node.attr_local(name) {
+        None => false,
+        Some(value) => !matches!(value.trim(), "0" | "false" | "off" | "none"),
+    }
 }
 
 /// 占位块构造（`label` 是给用户看的中文说明）
@@ -2527,6 +3035,8 @@ fn block_plain_text(block: &Block) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         Block::Image(image) => image.name.clone().unwrap_or_default(),
+        // 形状没有文字（查找"直线/方框"没有意义，别污染搜索结果）
+        Block::Shape(_) => String::new(),
         Block::PageBreak => String::new(),
         Block::Unsupported { label, detail } => {
             if detail.is_empty() {
@@ -2552,6 +3062,8 @@ struct ParsedDocument {
     #[cfg_attr(not(test), allow(dead_code))]
     paragraph_count: usize,
     encrypted: bool,
+    /// 页面几何（`w:sectPr`；缺失为 None）。解析一次缓存起来，每次取窗口都带上。
+    page: Option<PageGeometry>,
 }
 
 /// 缓存最近打开的 2 个文档（只读查看，缓存是安全的；解析大文档要几十毫秒，虚拟滚动会反复要）
@@ -2564,6 +3076,12 @@ const MAX_FIND_HITS: usize = 500;
 const EXCERPT_PAD: usize = 30;
 /// 单张图片的大小上限（32MB）：超过就明确拒绝，别把几十 MB 解压进内存再 base64 传前端
 const MAX_MEDIA_BYTES: usize = 32 * 1024 * 1024;
+
+/// A4 竖版纸张尺寸（pt）：`w:sectPr` 缺失或 `w:pgSz` 畸形时的兜底
+const A4_WIDTH_PT: f64 = 595.3;
+const A4_HEIGHT_PT: f64 = 841.9;
+/// A4 默认页边距（pt）= 2.54cm：`w:pgMar` 缺失或畸形时的兜底
+const A4_MARGIN_PT: f64 = 72.0;
 
 struct CacheEntry {
     /// 路径原样（用户视角的 key）
@@ -2645,8 +3163,10 @@ fn parse_document(bytes: &[u8], encrypted: bool) -> Result<ParsedDocument, Strin
     let styles = StyleSheet::parse(&styles_xml, &theme);
     let numbering = Numbering::parse(&numbering_xml);
     let rels = parse_rels(&rels_xml);
+    // 页面几何要先算：`v:hr`（整栏宽的水平线）之类的形状需要栏宽，块构建时就要用
+    let page = find_section_properties(body).map(parse_page_geometry);
 
-    let mut builder = DocBuilder::new(&styles, &numbering, &theme, &rels);
+    let mut builder = DocBuilder::new(&styles, &numbering, &theme, &rels, page.as_ref());
     let mut blocks = Vec::new();
     builder.collect_blocks(body, &mut blocks);
 
@@ -2662,7 +3182,79 @@ fn parse_document(bytes: &[u8], encrypted: bool) -> Result<ParsedDocument, Strin
         search_index,
         paragraph_count: builder.paragraph_count,
         encrypted,
+        page,
     })
+}
+
+/// 找页面设置（`w:sectPr`）：
+/// 1. 优先文档级 `w:body/w:sectPr`（Word 把**最后一节**的设置写在这里）；
+/// 2. 没有就取**最后一个**带 `w:pPr/w:sectPr` 的段落（分节符就藏在段落属性里）。
+///
+/// 只取一个：正文是连续流，"一页一页"显示按同一套纸张尺寸切页即可；
+/// 多节文档里各节尺寸不同属于已知简化（分节处仍会画提示线）。
+fn find_section_properties(body: &XmlNode) -> Option<&XmlNode> {
+    if let Some(sect) = body.child("sectPr") {
+        return Some(sect);
+    }
+    let mut found = None;
+    for child in body.children() {
+        if child.local() != "p" {
+            continue;
+        }
+        if let Some(sect) = child.child("pPr").and_then(|ppr| ppr.child("sectPr")) {
+            found = Some(sect);
+        }
+    }
+    found
+}
+
+/// `w:sectPr` → 页面几何。单个字段缺失/畸形时按 A4 兜底（**不 panic**）：
+/// 分页视图宁可显示一个正常的 A4，也不要因为一个坏属性把整页算成 0×0。
+fn parse_page_geometry(sect: &XmlNode) -> PageGeometry {
+    let size = sect.child("pgSz");
+    let margins = sect.child("pgMar");
+
+    // 纸张：必须是正数，0 / 负数 / 非数字都退回 A4
+    let dimension = |value: Option<f64>, fallback: f64| match value {
+        Some(value) if value > 0.0 => value,
+        _ => fallback,
+    };
+    // 边距：允许为 0 甚至负数（Word 允许负边距），只有缺失/非数字才兜底
+    let margin = |value: Option<f64>| value.unwrap_or(A4_MARGIN_PT);
+
+    PageGeometry {
+        width_pt: dimension(
+            size.and_then(|node| number_f64(node.attr_local("w"))).map(twips_to_pt_f64),
+            A4_WIDTH_PT,
+        ),
+        height_pt: dimension(
+            size.and_then(|node| number_f64(node.attr_local("h"))).map(twips_to_pt_f64),
+            A4_HEIGHT_PT,
+        ),
+        margin_top_pt: margin(
+            margins
+                .and_then(|node| number_f64(node.attr_local("top")))
+                .map(twips_to_pt_f64),
+        ),
+        margin_right_pt: margin(
+            margins
+                .and_then(|node| number_f64(node.attr_local("right")))
+                .map(twips_to_pt_f64),
+        ),
+        margin_bottom_pt: margin(
+            margins
+                .and_then(|node| number_f64(node.attr_local("bottom")))
+                .map(twips_to_pt_f64),
+        ),
+        margin_left_pt: margin(
+            margins
+                .and_then(|node| number_f64(node.attr_local("left")))
+                .map(twips_to_pt_f64),
+        ),
+        landscape: size
+            .and_then(|node| node.attr_local("orient"))
+            .is_some_and(|orient| orient.eq_ignore_ascii_case("landscape")),
+    }
 }
 
 /// 找正文节点：正常是 `w:document/w:body`；XML 有点毛病时退化为深度搜索
@@ -2809,6 +3401,7 @@ pub fn document_blocks(path: String, from: usize, count: usize) -> Result<BlockP
         from,
         blocks: doc.blocks[from..end].to_vec(),
         encrypted: doc.encrypted,
+        page: doc.page.clone(),
     })
 }
 
@@ -3632,6 +4225,7 @@ mod tests {
                 Block::Paragraph(_) => "段落",
                 Block::Table(_) => "表格",
                 Block::Image(_) => "图片",
+                Block::Shape(_) => "形状",
                 Block::PageBreak => "分页",
                 Block::Unsupported { .. } => "占位",
             })
@@ -3936,10 +4530,15 @@ mod tests {
             from: 0,
             blocks: parsed.blocks.clone(),
             encrypted: true,
+            page: parsed.page.clone(),
         };
         let json = serde_json::to_value(&page).expect("应能序列化成 JSON");
 
         assert_eq!(json["total"], 3);
+        assert!(
+            json["page"].is_null(),
+            "这份样本没有 w:sectPr，page 应是 null（前端按 A4 兜底）"
+        );
         assert_eq!(json["from"], 0);
         assert_eq!(json["encrypted"], true);
 
@@ -4592,6 +5191,430 @@ mod tests {
         assert_eq!(from_style.space_before_pt, Some(12.0));
     }
 
+    /* ------------------------------ 页面几何（一页一页显示用） ------------------------------ */
+
+    /// A4 竖版：`w:pgSz` 595.3×841.9pt（11906×16838 twip）、`w:pgMar` 72pt（1440 twip）
+    #[test]
+    fn parses_a4_portrait_page_geometry() {
+        let body = r#"<w:p><w:r><w:t>正文</w:t></w:r></w:p>
+            <w:sectPr><w:pgSz w:w="11906" w:h="16838"/>
+              <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"
+                w:header="851" w:footer="992" w:gutter="0"/></w:sectPr>"#;
+        let parsed = parse(&docx_with(body, &[]));
+        let page = parsed.page.clone().expect("应有页面几何（w:body/w:sectPr）");
+
+        assert!((page.width_pt - 595.3).abs() < 0.01, "{}", page.width_pt);
+        assert!((page.height_pt - 841.9).abs() < 0.01, "{}", page.height_pt);
+        assert_eq!(page.margin_top_pt, 72.0);
+        assert_eq!(page.margin_right_pt, 72.0);
+        assert_eq!(page.margin_bottom_pt, 72.0);
+        assert_eq!(page.margin_left_pt, 72.0);
+        assert!(!page.landscape);
+        // header/footer/gutter 不导出（前端分页用不到）
+
+        // 前端契约：字段名 camelCase，page 挂在 BlockPage 上
+        let page_block = BlockPage {
+            total: parsed.blocks.len(),
+            from: 0,
+            blocks: parsed.blocks.clone(),
+            encrypted: false,
+            page: parsed.page.clone(),
+        };
+        let json = serde_json::to_value(&page_block).expect("应能序列化");
+        assert!((json["page"]["widthPt"].as_f64().unwrap() - 595.3).abs() < 0.01);
+        assert!((json["page"]["heightPt"].as_f64().unwrap() - 841.9).abs() < 0.01);
+        assert_eq!(json["page"]["marginTopPt"], 72.0);
+        assert_eq!(json["page"]["landscape"], false);
+    }
+
+    /// 横版：Word 会把 `w:w/w:h` 直接写成横向尺寸，同时给 `w:orient="landscape"`
+    #[test]
+    fn parses_landscape_page_geometry() {
+        let body = r#"<w:p><w:r><w:t>横向</w:t></w:r></w:p>
+            <w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/>
+              <w:pgMar w:top="1800" w:right="1440" w:bottom="1800" w:left="1440"/></w:sectPr>"#;
+        let page = parse(&docx_with(body, &[])).page.expect("应有页面几何");
+        assert!(page.landscape);
+        assert!((page.width_pt - 841.9).abs() < 0.01, "{}", page.width_pt);
+        assert!((page.height_pt - 595.3).abs() < 0.01, "{}", page.height_pt);
+        assert_eq!(page.margin_top_pt, 90.0, "1800 twip = 90pt");
+        assert_eq!(page.margin_left_pt, 72.0);
+    }
+
+    /// 没有 `w:sectPr` → `page` 为 `None`（前端按 A4 + 2.54cm 兜底）
+    /// 退化路径：`w:sectPr` 藏在段落属性里（`w:pPr/w:sectPr`，分节符的写法）
+    #[test]
+    fn page_geometry_falls_back_to_paragraph_sectpr_or_none() {
+        // 1) 完全没有 sectPr
+        let none = parse(&docx_with(r#"<w:p><w:r><w:t>无页面设置</w:t></w:r></w:p>"#, &[]));
+        assert!(none.page.is_none(), "没有 sectPr 就该是 None");
+
+        // 2) 只有段落属性里的 sectPr（且取最后一个）
+        let body = r#"
+            <w:p><w:pPr><w:sectPr><w:pgSz w:w="11906" w:h="16838"/>
+              <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr></w:pPr>
+              <w:r><w:t>第一节</w:t></w:r></w:p>
+            <w:p><w:pPr><w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/>
+              <w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720"/></w:sectPr></w:pPr>
+              <w:r><w:t>第二节</w:t></w:r></w:p>"#;
+        let page = parse(&docx_with(body, &[]))
+            .page
+            .expect("段落里的 sectPr 也要认");
+        assert!(page.landscape, "取最后一个（第二节）");
+        assert_eq!(page.margin_top_pt, 36.0, "720 twip = 36pt");
+    }
+
+    /// 畸形值不 panic：非数字、0、缺属性、只有部分属性 —— 单字段按 A4 兜底
+    #[test]
+    fn malformed_page_geometry_values_fall_back_to_a4() {
+        let cases = [
+            // 非数字 + 缺 h
+            r#"<w:pgSz w:w="abc"/><w:pgMar w:top="xyz" w:right="1440"/>"#,
+            // 0 尺寸（Word 里不该出现，但坏文档会有）+ 负边距（Word 允许）
+            r#"<w:pgSz w:w="0" w:h="-5"/><w:pgMar w:top="-100" w:right="0" w:bottom="1440" w:left="720"/>"#,
+            // 空 sectPr
+            r#""#,
+            // 只有 pgMar
+            r#"<w:pgMar w:top="1440"/>"#,
+        ];
+        for case in cases {
+            let body = format!("<w:p><w:r><w:t>坏设置</w:t></w:r></w:p><w:sectPr>{case}</w:sectPr>");
+            let parsed = parse(&docx_with(&body, &[]));
+            let page = parsed.page.unwrap_or_else(|| panic!("{case} 应仍给出页面几何"));
+            assert!(page.width_pt > 0.0 && page.height_pt > 0.0, "{case}");
+            assert!(
+                page.margin_top_pt.is_finite() && page.margin_left_pt.is_finite(),
+                "{case}"
+            );
+        }
+
+        // 逐个字段确认兜底值
+        let page = parse(&docx_with(
+            r#"<w:p/><w:sectPr><w:pgSz w:w="abc"/><w:pgMar w:top="xyz"/></w:sectPr>"#,
+            &[],
+        ))
+        .page
+        .expect("应给出兜底几何");
+        assert_eq!(page.width_pt, A4_WIDTH_PT, "非数字 → A4 宽");
+        assert_eq!(page.height_pt, A4_HEIGHT_PT, "缺属性 → A4 高");
+        assert_eq!(page.margin_top_pt, A4_MARGIN_PT, "非数字 → A4 边距");
+        assert_eq!(page.margin_right_pt, A4_MARGIN_PT);
+        assert!(!page.landscape);
+
+        // 0 尺寸 → A4；负边距 / 0 边距要**原样保留**（Word 允许）
+        let page = parse(&docx_with(
+            r#"<w:p/><w:sectPr><w:pgSz w:w="0" w:h="0"/>
+                 <w:pgMar w:top="-100" w:right="0" w:bottom="1440" w:left="720"/></w:sectPr>"#,
+            &[],
+        ))
+        .page
+        .expect("应给出兜底几何");
+        assert_eq!(page.width_pt, A4_WIDTH_PT, "0 宽 → A4");
+        assert_eq!(page.height_pt, A4_HEIGHT_PT, "0 高 → A4");
+        assert_eq!(page.margin_top_pt, -5.0, "负边距保留（-100 twip）");
+        assert_eq!(page.margin_right_pt, 0.0, "0 边距保留");
+        assert_eq!(page.margin_bottom_pt, 72.0);
+    }
+
+    /// **形状渲染**（合同/表单里的横线与方框）：VML 与 DrawingML 两条路都要覆盖。
+    /// 认不出来的（组合图形、无 `prstGeom`、旋转过的）仍然走占位块 —— **不丢内容**。
+    #[test]
+    fn renders_vml_and_drawingml_shapes() {
+        let rels = format!(
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/vml.png"/>
+            </Relationships>"#
+        );
+        // graphicData 的 uri 决定走图片/图形/SmartArt/图表哪条路，测试里写真实的 uri。
+        // `wp:extent` 是 Word 排版用的显示尺寸（也是我们优先取的那个），所以与 `a:ext` 保持一致。
+        let drawing_full = |uri: &str, cx: &str, cy: &str, body: &str| {
+            format!(
+                r#"<w:p><w:r><w:drawing><wp:inline><wp:extent cx="{cx}" cy="{cy}"/>
+                  <a:graphic><a:graphicData uri="{uri}">
+                    {body}</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#
+            )
+        };
+        let shape_uri = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape";
+        let drawing = |body: &str| drawing_full(shape_uri, "914400", "0", body);
+        let body = format!(
+            r#"{vml_line}{vml_hr}{vml_rect}{dml_line}{dml_rect}{alternate}{vml_two_lines}
+               {vml_group}{dml_no_prst}{dml_rotated}{diagram}{chart}{missing_image}"#,
+            // ① VML 直线（合同里的横线）：400pt 长、height:0 + strokeweight 1pt
+            vml_line = r##"<w:p><w:r><w:pict><v:line from="0,0" to="400pt,0"
+                style="position:absolute;left:0;text-align:left;width:400pt;height:0"
+                strokecolor="#3465a4" strokeweight="1pt"/></w:pict></w:r></w:p>"##,
+            // ② Word 的「水平线」：没有尺寸，就是整栏宽
+            vml_hr = r#"<w:p><w:r><w:pict><v:hr o:hrpct="100" o:hrstd="t"/></w:pict></w:r></w:p>"#,
+            // ③ VML 矩形（表单方框）：无填充 + 具名颜色 black
+            vml_rect = r#"<w:p><w:r><w:pict><v:rect style="width:200pt;height:40pt"
+                filled="f" strokecolor="black" strokeweight=".5pt"/></w:pict></w:r></w:p>"#,
+            // ④ DrawingML 直线：5486400 EMU = 432pt，1pt 红色虚线
+            dml_line = drawing_full(
+                shape_uri,
+                "5486400",
+                "0",
+                r#"<wps:wsp><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="5486400" cy="0"/></a:xfrm>
+                   <a:prstGeom prst="line"><a:avLst/></a:prstGeom>
+                   <a:ln w="12700"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>
+                     <a:prstDash val="dash"/></a:ln>
+                   </wps:spPr></wps:wsp>"#
+            ),
+            // ⑤ DrawingML 矩形：914400×457200 EMU = 72×36pt，带填充
+            dml_rect = drawing_full(
+                shape_uri,
+                "914400",
+                "457200",
+                r#"<wps:wsp><wps:spPr><a:xfrm><a:off x="12700" y="25400"/><a:ext cx="914400" cy="457200"/></a:xfrm>
+                   <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                   <a:solidFill><a:srgbClr val="DDEEFF"/></a:solidFill>
+                   <a:ln w="25400"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln>
+                   </wps:spPr></wps:wsp>"#
+            ),
+            // ⑥ mc:AlternateContent：Choice=DrawingML、Fallback=VML → 只能产出一个 Shape
+            alternate = r#"<w:p><w:r><mc:AlternateContent>
+                <mc:Choice Requires="wps"><w:drawing><wp:inline><wp:extent cx="914400" cy="457200"/>
+                  <a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+                    <wps:wsp><wps:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr></wps:wsp>
+                  </a:graphicData></a:graphic></wp:inline></w:drawing></mc:Choice>
+                <mc:Fallback><w:pict><v:rect style="width:100pt;height:20pt"/></w:pict></mc:Fallback>
+                </mc:AlternateContent></w:r></w:p>"#,
+            // ⑦ 一个 w:pict 里两条线 → 两个 Shape 块（不是只认第一个）
+            vml_two_lines = r#"<w:p><w:r><w:pict>
+                <v:line from="0,0" to="100pt,0" style="width:100pt;height:0" strokeweight="1pt"/>
+                <v:line from="0,0" to="0,50pt" style="width:0;height:50pt" strokeweight="1pt"/>
+                </w:pict></w:r></w:p>"#,
+            // ⑧ 组合图形：整体走占位（只画其中一部分会丢内容）
+            vml_group = r#"<w:p><w:r><w:pict><v:group style="width:100pt;height:50pt">
+                <v:rect style="width:100pt;height:50pt"/><v:line from="0,0" to="100pt,0"/></v:group></w:pict></w:r></w:p>"#,
+            // ⑨ DrawingML 自由曲线（没有 prstGeom）→ 占位
+            dml_no_prst = drawing(
+                r#"<wps:wsp><wps:spPr><a:xfrm><a:ext cx="914400" cy="914400"/></a:xfrm>
+                   <a:custGeom><a:pathLst/></a:custGeom></wps:spPr></wps:wsp>"#
+            ),
+            // ⑩ 旋转过的形状 → 占位（几何算不准，画歪不如不画）
+            dml_rotated = drawing(
+                r#"<wps:wsp><wps:spPr><a:xfrm rot="5400000"><a:ext cx="914400" cy="457200"/></a:xfrm>
+                   <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr></wps:wsp>"#
+            ),
+            diagram = drawing_full(
+                "http://schemas.openxmlformats.org/drawingml/2006/diagram",
+                "914400",
+                "914400",
+                r#"<dgm:relIds r:dm="rId1"/>"#
+            ),
+            chart = drawing_full(
+                "http://schemas.openxmlformats.org/drawingml/2006/chart",
+                "914400",
+                "914400",
+                r#"<c:chart r:id="rId2"/>"#
+            ),
+            missing_image = drawing(
+                r#"<pic:pic><pic:blipFill><a:blip r:embed="rId404"/></pic:blipFill></pic:pic>"#
+            ),
+        );
+        let blocks = blocks_of(&docx_with(&body, &[("word/_rels/document.xml.rels", &rels)]));
+
+        let kinds: Vec<String> = blocks
+            .iter()
+            .map(|block| match block {
+                Block::Shape(shape) => format!("形状:{}", shape.shape),
+                Block::Unsupported { label, .. } => format!("占位:{label}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+
+        // ① VML 直线：400pt 长；height 为 0 → 按 strokeweight（1pt）兜底，前端才好定位
+        let line = match &blocks[0] {
+            Block::Shape(shape) => shape,
+            other => panic!("VML 直线应产出 Shape：{other:?}"),
+        };
+        assert_eq!(line.shape, "line");
+        assert_eq!(line.width_pt, 400.0);
+        assert_eq!(line.height_pt, 1.0, "height:0 → 按线宽 1pt 兜底（不是 0）");
+        assert_eq!(line.line_width_pt, Some(1.0));
+        assert_eq!(line.line_color.as_deref(), Some("3465A4"));
+        assert_eq!(line.fill_color, None);
+        assert_eq!(line.dash, None);
+        assert!(!line.vertical, "横线");
+
+        // ② v:hr：整栏宽（无 sectPr → A4 正文宽 595.3 − 72×2 = 451.3pt）
+        let hr = match &blocks[1] {
+            Block::Shape(shape) => shape,
+            other => panic!("v:hr 应产出 Shape：{other:?}"),
+        };
+        assert_eq!(hr.shape, "line");
+        assert!((hr.width_pt - 451.3).abs() < 0.1, "实际 {}", hr.width_pt);
+        assert_eq!(hr.height_pt, 1.0);
+        assert_eq!(hr.line_color, None, "拿不到颜色给 null（前端用默认黑）");
+
+        // ③ VML 矩形：具名颜色 black → 000000；filled="f" → 无填充
+        let rect = match &blocks[2] {
+            Block::Shape(shape) => shape,
+            other => panic!("VML 矩形应产出 Shape：{other:?}"),
+        };
+        assert_eq!(rect.shape, "rect");
+        assert_eq!((rect.width_pt, rect.height_pt), (200.0, 40.0));
+        assert_eq!(rect.line_width_pt, Some(0.5));
+        assert_eq!(rect.line_color.as_deref(), Some("000000"));
+        assert_eq!(rect.fill_color, None);
+
+        // ④ DrawingML 直线：432pt、1pt 红虚线、y=0
+        let dml_line = match &blocks[3] {
+            Block::Shape(shape) => shape,
+            other => panic!("DrawingML 直线应产出 Shape：{other:?}"),
+        };
+        assert_eq!(dml_line.shape, "line");
+        assert_eq!(dml_line.width_pt, 432.0);
+        assert_eq!(dml_line.height_pt, 1.0, "cy=0 → 按 1pt 线宽兜底");
+        assert_eq!(dml_line.line_width_pt, Some(1.0));
+        assert_eq!(dml_line.line_color.as_deref(), Some("FF0000"));
+        assert_eq!(dml_line.dash.as_deref(), Some("dash"));
+        assert_eq!((dml_line.x_pt, dml_line.y_pt), (0.0, 0.0));
+
+        // ⑤ DrawingML 矩形：72×36pt、填充 DDEEFF、2pt 黑边、偏移 (1pt, 2pt)
+        let dml_rect = match &blocks[4] {
+            Block::Shape(shape) => shape,
+            other => panic!("DrawingML 矩形应产出 Shape：{other:?}"),
+        };
+        assert_eq!(dml_rect.shape, "rect");
+        assert_eq!((dml_rect.width_pt, dml_rect.height_pt), (72.0, 36.0));
+        assert_eq!(dml_rect.fill_color.as_deref(), Some("DDEEFF"));
+        assert_eq!(dml_rect.line_width_pt, Some(2.0));
+        assert_eq!(dml_rect.line_color.as_deref(), Some("000000"));
+        assert_eq!((dml_rect.x_pt, dml_rect.y_pt), (1.0, 2.0));
+
+        // ⑥ AlternateContent：只产出一个 Shape（Choice 的 DrawingML 那条，72×36）
+        let alternate = match &blocks[5] {
+            Block::Shape(shape) => shape,
+            other => panic!("AlternateContent 应产出一个 Shape：{other:?}"),
+        };
+        assert_eq!((alternate.width_pt, alternate.height_pt), (72.0, 36.0));
+
+        // ⑦ 一个 pict 两条线 → 两个 Shape：横线 + 竖线
+        let two = match (&blocks[6], &blocks[7]) {
+            (Block::Shape(first), Block::Shape(second)) => (first, second),
+            other => panic!("一个 pict 里的两条线应产出两个 Shape：{other:?}"),
+        };
+        assert_eq!((two.0.width_pt, two.0.height_pt), (100.0, 1.0));
+        assert!(!two.0.vertical);
+        assert_eq!((two.1.width_pt, two.1.height_pt), (1.0, 50.0), "竖线宽度兜底 1pt");
+        assert!(two.1.vertical, "height > width → 竖线");
+
+        // ⑧⑨⑩ 认不出来的 → 占位，且说明里讲清是哪一类
+        assert_eq!(kinds[8], "占位:图形对象（VML，暂不支持显示）");
+        assert!(kinds[8].contains("VML"), "组合图形走 VML 占位");
+        assert_eq!(kinds[9], "占位:图形对象（暂不支持显示）", "自由曲线");
+        assert_eq!(kinds[10], "占位:图形对象（暂不支持显示）", "旋转过的形状");
+        assert_eq!(kinds[11], "占位:SmartArt 图形（暂不支持显示）");
+        assert_eq!(kinds[12], "占位:图表（暂不支持显示）");
+        assert_eq!(kinds[13], "占位:图片（无法显示）");
+
+        // 前端契约：camelCase 字段名 + kind 判别
+        let json = serde_json::to_value(&blocks[4]).expect("应能序列化");
+        assert_eq!(json["kind"], "shape");
+        assert_eq!(json["shape"], "rect");
+        assert_eq!(json["widthPt"], 72.0);
+        assert_eq!(json["heightPt"], 36.0);
+        assert_eq!(json["lineWidthPt"], 2.0);
+        assert_eq!(json["lineColor"], "000000");
+        assert_eq!(json["fillColor"], "DDEEFF");
+        assert!(json["dash"].is_null());
+        assert_eq!(json["vertical"], false);
+    }
+
+    /// `v:hr` 的"整栏宽"要跟着页面几何与段落缩进走
+    #[test]
+    fn hr_width_follows_page_and_indent() {
+        let body = r#"
+            <w:p><w:pPr><w:ind w:left="720" w:right="360"/></w:pPr>
+              <w:r><w:pict><v:hr/></w:pict></w:r></w:p>
+            <w:sectPr><w:pgSz w:w="11906" w:h="16838"/>
+              <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>"#;
+        let blocks = blocks_of(&docx_with(body, &[]));
+        let hr = match &blocks[0] {
+            Block::Shape(shape) => shape,
+            other => panic!("v:hr 应产出 Shape：{other:?}"),
+        };
+        // 正文宽 595.3 − 72 − 72 = 451.3；再减左缩进 36pt（720 twip）与右缩进 18pt（360 twip）
+        assert!(
+            (hr.width_pt - (451.3 - 36.0 - 18.0)).abs() < 0.1,
+            "实际 {}",
+            hr.width_pt
+        );
+    }
+
+    /// **段落边框**（`w:pBdr`）：合同/表单里"空段落 + 下边框"就是一条横线。
+    /// 只解析 `w:val` 不为 none/nil 的边；`w:sz` 是八分之一磅；四边皆空 → 整个字段 null。
+    #[test]
+    fn parses_paragraph_borders() {
+        let styles = format!(
+            r#"<?xml version="1.0"?><w:styles {NS}>
+              <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+              <w:style w:type="paragraph" w:styleId="Boxed"><w:name w:val="Boxed"/>
+                <w:pPr><w:pBdr>
+                  <w:top w:val="double" w:sz="12" w:color="0000FF"/>
+                  <w:left w:val="single" w:sz="8" w:color="auto"/>
+                </w:pBdr></w:pPr></w:style>
+            </w:styles>"#
+        );
+        let body = r#"
+            <w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="FF0000"/></w:pBdr></w:pPr>
+              <w:r><w:t>只有下边框</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pBdr><w:bottom w:val="none" w:sz="6" w:color="FF0000"/></w:pBdr></w:pPr>
+              <w:r><w:t>明确不要边框</w:t></w:r></w:p>
+            <w:p><w:r><w:t>没有边框</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:color="auto"/></w:pBdr></w:pPr>
+              <w:r><w:t>自动色</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:color="FFFFFF"/></w:pBdr></w:pPr>
+              <w:r><w:t>白线</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="Boxed"/></w:pPr><w:r><w:t>样式里的边框</w:t></w:r></w:p>"#;
+        let blocks = blocks_of(&docx_with(body, &[("word/styles.xml", &styles)]));
+
+        // ① 只写下边框：w:sz=6（八分之一磅）→ 0.75pt，其它三边 null
+        let single = paragraph_of(&blocks[0])
+            .borders
+            .clone()
+            .expect("应解析出段落边框");
+        let bottom = single.bottom.as_ref().expect("应有下边框");
+        assert_eq!(bottom.style, "single");
+        assert!((bottom.width_pt - 0.75).abs() < 0.001, "{}", bottom.width_pt);
+        assert_eq!(bottom.color.as_deref(), Some("FF0000"));
+        assert_eq!(bottom.space_pt, Some(1.0));
+        assert!(single.top.is_none() && single.left.is_none() && single.right.is_none());
+
+        // ② w:val="none" 是"明确不要边框" → 四边皆空 → 整个字段 null
+        assert!(paragraph_of(&blocks[1]).borders.is_none());
+        // ③ 没有 w:pBdr → null
+        assert!(paragraph_of(&blocks[2]).borders.is_none());
+
+        // ④ w:color="auto" → null（前端用默认色）
+        let auto = paragraph_of(&blocks[3]).borders.clone().expect("仍应有边框");
+        assert_eq!(auto.bottom.expect("应有下边框").color, None);
+
+        // ⑤ 白线要**保留**：白色是合法的可见设置，不能像底纹那样被当成"没写"
+        let white = paragraph_of(&blocks[4]).borders.clone().expect("仍应有边框");
+        assert_eq!(white.bottom.expect("应有下边框").color.as_deref(), Some("FFFFFF"));
+
+        // ⑥ 样式里的边框也要能通过层叠拿到（top 是 double 1.5pt 蓝色、left 是 auto 色）
+        let from_style = paragraph_of(&blocks[5]).borders.clone().expect("样式里的边框");
+        let top = from_style.top.as_ref().expect("应有上边框");
+        assert_eq!(top.style, "double");
+        assert!((top.width_pt - 1.5).abs() < 0.001, "sz=12 → 1.5pt");
+        assert_eq!(top.color.as_deref(), Some("0000FF"));
+        assert_eq!(from_style.left.expect("应有左边框").color, None, "auto → null");
+        assert!(from_style.bottom.is_none() && from_style.right.is_none());
+
+        // 前端契约：camelCase 字段名
+        let json = serde_json::to_value(&blocks[0]).expect("应能序列化");
+        assert_eq!(json["borders"]["bottom"]["style"], "single");
+        assert_eq!(json["borders"]["bottom"]["widthPt"], 0.75);
+        assert_eq!(json["borders"]["bottom"]["color"], "FF0000");
+        assert_eq!(json["borders"]["bottom"]["spacePt"], 1.0);
+        assert!(json["borders"]["top"].is_null());
+        let json = serde_json::to_value(&blocks[2]).expect("应能序列化");
+        assert!(json["borders"].is_null(), "四边皆空 → null");
+    }
+
     /* ------------------------------ 真实语料库（存在才跑） ------------------------------ */
 
     /// 拿真实语料库（默认是 Z 盘上的每周汇报目录）跑一遍块模型：
@@ -4643,7 +5666,10 @@ mod tests {
         let mut total_unsupported = 0usize;
         let mut merged_cells = 0usize;
         let mut nested_tables = 0usize;
+        let mut total_shapes = 0usize;
+        let mut total_bordered = 0usize;
         let mut labels: HashMap<String, usize> = HashMap::new();
+        let mut paper_sizes: HashMap<String, usize> = HashMap::new();
 
         for path in &files {
             let label = path
@@ -4663,32 +5689,71 @@ mod tests {
             let page = document_blocks(text.clone(), 0, MAX_BLOCK_WINDOW)
                 .unwrap_or_else(|error| panic!("{label}: document_blocks 失败：{error}"));
             assert_eq!(page.total, parsed.blocks.len(), "{label}: 窗口总数应与块数一致");
+            // 页面几何：窗口返回里必须带上（没有 sectPr 的文档是 None，也是合法结果）
+            assert_eq!(
+                page.page.is_some(),
+                parsed.page.is_some(),
+                "{label}: 窗口里的 page 应与解析结果一致"
+            );
+            if let Some(geometry) = parsed.page.as_ref() {
+                *paper_sizes
+                    .entry(format!(
+                        "{:.0}×{:.0}pt{} · 边距 {:.0}/{:.0}/{:.0}/{:.0}",
+                        geometry.width_pt,
+                        geometry.height_pt,
+                        if geometry.landscape { " 横" } else { " 竖" },
+                        geometry.margin_top_pt,
+                        geometry.margin_right_pt,
+                        geometry.margin_bottom_pt,
+                        geometry.margin_left_pt,
+                    ))
+                    .or_insert(0) += 1;
+            }
             // 查找也不该 panic（顺带证明索引可用）
             let _ = document_find(text, "的".to_string(), false)
                 .unwrap_or_else(|error| panic!("{label}: document_find 失败：{error}"));
 
-            /// 递归数表格：返回（表格总数, 其中嵌套表格数），顺带统计合并单元格
-            fn count_tables(blocks: &[Block], merged: &mut usize) -> (usize, usize) {
-                let mut tables = 0usize;
-                let mut nested = 0usize;
+            /// 递归统计：表格（含嵌套）、形状、带段落边框的段落、合并单元格
+            #[derive(Default)]
+            struct Counts {
+                tables: usize,
+                nested: usize,
+                merged: usize,
+                shapes: usize,
+                bordered: usize,
+            }
+            fn count_blocks(blocks: &[Block], counts: &mut Counts) {
                 for block in blocks {
-                    if let Block::Table(table) = block {
-                        tables += 1;
-                        for row in &table.rows {
-                            for cell in &row.cells {
-                                if cell.grid_span > 1 || cell.v_merge != VMerge::None {
-                                    *merged += 1;
-                                }
-                                let (inner, inner_nested) = count_tables(&cell.blocks, merged);
-                                tables += inner;
-                                nested += inner + inner_nested;
+                    match block {
+                        Block::Shape(_) => counts.shapes += 1,
+                        Block::Paragraph(paragraph) => {
+                            if paragraph.borders.is_some() {
+                                counts.bordered += 1;
                             }
                         }
+                        Block::Table(table) => {
+                            counts.tables += 1;
+                            for row in &table.rows {
+                                for cell in &row.cells {
+                                    if cell.grid_span > 1 || cell.v_merge != VMerge::None {
+                                        counts.merged += 1;
+                                    }
+                                    let before = counts.tables;
+                                    count_blocks(&cell.blocks, counts);
+                                    counts.nested += counts.tables - before;
+                                }
+                            }
+                        }
+                        Block::Image(_) | Block::PageBreak | Block::Unsupported { .. } => {}
                     }
                 }
-                (tables, nested)
             }
-            let (tables, nested) = count_tables(&parsed.blocks, &mut merged_cells);
+            let mut counts = Counts::default();
+            count_blocks(&parsed.blocks, &mut counts);
+            let (tables, nested) = (counts.tables, counts.nested);
+            merged_cells += counts.merged;
+            total_shapes += counts.shapes;
+            total_bordered += counts.bordered;
             total_tables += tables;
             total_blocks += parsed.blocks.len();
             nested_tables += nested;
@@ -4708,8 +5773,14 @@ mod tests {
                     *labels.entry(label.clone()).or_insert(0) += 1;
                 }
             }
+            if counts.shapes > 0 || counts.bordered > 0 {
+                eprintln!(
+                    "         └ 形状 {} 个 · 带边框段落 {} 个",
+                    counts.shapes, counts.bordered
+                );
+            }
             eprintln!(
-                "  [OK]   {label:<30} 块 {:>4} · 段落统计 {:>4} · 表 {:>2} · 图 {:>3} · 合并格 {:>3}",
+                "  [OK]   {label:<30} 块 {:>4} · 段落统计 {:>4} · 表 {:>2} · 图 {:>3} · 形状 {:>3} · 边框段 {:>3}",
                 parsed.blocks.len(),
                 parsed.paragraph_count,
                 tables,
@@ -4718,14 +5789,15 @@ mod tests {
                     .iter()
                     .filter(|block| matches!(block, Block::Image(_)))
                     .count(),
-                merged_cells
+                counts.shapes,
+                counts.bordered
             );
         }
 
         let mut sorted: Vec<(String, usize)> = labels.into_iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
         eprintln!(
-            "\n语料库块模型统计：{} 个文件；顶层块 {}、表格 {}（嵌套 {}）、图片 {}、编号段落 {}、合并单元格 {}、占位块 {}",
+            "\n语料库块模型统计：{} 个文件；顶层块 {}、表格 {}（嵌套 {}）、图片 {}、编号段落 {}、合并单元格 {}、占位块 {}、形状 {}、带边框段落 {}",
             files.len(),
             total_blocks,
             total_tables,
@@ -4733,10 +5805,17 @@ mod tests {
             total_images,
             total_numbered,
             merged_cells,
-            total_unsupported
+            total_unsupported,
+            total_shapes,
+            total_bordered
         );
         for (label, count) in &sorted {
             eprintln!("  占位类型 {count:>3} × {label}");
+        }
+        let mut papers: Vec<(String, usize)> = paper_sizes.into_iter().collect();
+        papers.sort_by(|a, b| b.1.cmp(&a.1));
+        for (size, count) in &papers {
+            eprintln!("  纸张 {count:>3} 个 × {size}");
         }
         assert!(!files.is_empty());
     }
@@ -4806,6 +5885,21 @@ mod tests {
         assert_eq!(images[0].name.as_deref(), Some("图片 1"));
         assert!((images[0].width_px - 378.15).abs() < 1.0, "{}", images[0].width_px);
         assert!((images[0].height_px - 242.42).abs() < 1.0, "{}", images[0].height_px);
+
+        // 3.1) 形状与段落边框：这份周报里应该都没有（线条/方框是合同类文档才有的）
+        let shapes = parsed
+            .blocks
+            .iter()
+            .filter(|block| matches!(block, Block::Shape(_)))
+            .count();
+        let bordered = parsed
+            .blocks
+            .iter()
+            .filter(|block| matches!(block, Block::Paragraph(p) if p.borders.is_some()))
+            .count();
+        eprintln!("样本形状块 {shapes} 个、带段落边框的段落 {bordered} 个");
+        assert_eq!(shapes, 0, "周报里没有画线/方框");
+        assert_eq!(bordered, 0, "周报里没有段落边框");
 
         // 4) 样式链：标题 4（styleId=4）应拿到「宋体 / 12pt / 加粗」
         let heading = parsed
@@ -4893,6 +5987,18 @@ mod tests {
             .filter(|block| matches!(block, Block::PageBreak))
             .count();
         assert_eq!(page_breaks, 2);
+
+        // 7.1) 页面几何：样本是 **A4 横向**（pgSz 16838×11906 twip + orient=landscape，
+        //      页边距上下 1800 twip = 90pt、左右 1440 twip = 72pt）
+        let geometry = parsed.page.clone().expect("样本里有 w:sectPr");
+        assert!(geometry.landscape, "样本是横向");
+        assert!((geometry.width_pt - 841.9).abs() < 0.01, "{}", geometry.width_pt);
+        assert!((geometry.height_pt - 595.3).abs() < 0.01, "{}", geometry.height_pt);
+        assert_eq!(geometry.margin_top_pt, 90.0);
+        assert_eq!(geometry.margin_right_pt, 72.0);
+        assert_eq!(geometry.margin_bottom_pt, 90.0);
+        assert_eq!(geometry.margin_left_pt, 72.0);
+        eprintln!("样本页面几何：{geometry:?}");
         let unsupported: Vec<&str> = parsed
             .blocks
             .iter()

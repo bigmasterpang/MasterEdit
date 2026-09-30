@@ -267,6 +267,64 @@ export function blocksToPlainText(blocks: Array<DocBlock | undefined>): string {
   return lines.join("\n");
 }
 
+/* ------------------------- 分页 / 占位块合并计划 ------------------------- */
+
+/** 这个块是否**强制开新页**（显式分页符 / 段前分页 / 分节符） */
+export function startsNewPage(block: DocBlock): boolean {
+  if (block.kind === "pageBreak") return true;
+  if (block.kind === "paragraph") return block.pageBreakBefore || block.sectionBreak !== null;
+  return false;
+}
+
+/**
+ * 每个块的渲染计划（一遍扫完，供高度索引与渲染共用）：
+ *  · `leader[i]`：块 i 所属「合并组」的首块下标（不合并时就是自己）；
+ *  · `count[i]`：组的块数；**0 表示它是组内非首块（不渲染，高度记 0）**；
+ *  · `startsPage[i]`：是否强制开新页（分页模式用）。
+ *
+ * 合并规则：**相邻**且 `kind === "unsupported"` 且 `label` 相同才算一组。
+ * 中间夹任何别的块、或 label 不同（公式 / 文本框 / SmartArt 混排）都不合并 ——
+ * 一份合同里 6 个「图形对象」卡片正是靠这条降噪成 1 张。
+ * 未加载的块（`undefined`）会截断合并链：宁可少合并，也不要把不相邻的东西并到一起。
+ */
+export interface BlockPlan {
+  leader: Int32Array;
+  count: Int32Array;
+  startsPage: Uint8Array;
+}
+
+export function planBlocks(total: number, blockAt: (index: number) => DocBlock | undefined): BlockPlan {
+  const leader = new Int32Array(total);
+  const count = new Int32Array(total);
+  const startsPage = new Uint8Array(total);
+  let index = 0;
+  while (index < total) {
+    const block = blockAt(index);
+    startsPage[index] = block && startsNewPage(block) ? 1 : 0;
+    if (block && block.kind === "unsupported") {
+      let next = index + 1;
+      while (next < total) {
+        const candidate = blockAt(next);
+        if (!candidate || candidate.kind !== "unsupported" || candidate.label !== block.label) break;
+        startsPage[next] = startsNewPage(candidate) ? 1 : 0;
+        next += 1;
+      }
+      leader[index] = index;
+      count[index] = next - index;
+      for (let member = index + 1; member < next; member += 1) {
+        leader[member] = index;
+        count[member] = 0;
+      }
+      index = next;
+      continue;
+    }
+    leader[index] = index;
+    count[index] = 1;
+    index += 1;
+  }
+  return { leader, count, startsPage };
+}
+
 /** 大纲条目：按 `outlineLevel`（0..8）收集标题 */
 export interface OutlineItem {
   /** 顶层块下标（点击后滚到这里） */

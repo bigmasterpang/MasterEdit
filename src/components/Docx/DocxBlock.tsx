@@ -1,17 +1,23 @@
 /**
- * 单个块的渲染：段落（含 run 级格式与列表前缀）、图片（懒加载）、分页提示线、占位卡片。
+ * 单个块的渲染：段落（含 run 级格式、列表前缀、四边边框）、图片（懒加载）、
+ * 形状（线框）、分页提示线、占位卡片。
  *
  * 只读原则（见 `docs/plan-docx.md`）：**不做 contentEditable、不做输入框**，
  * 文字保持可选中复制（不加 `user-select: none`）。
  */
 import { memo, useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import type { DocBlock, DocImage, DocParagraph } from "../../types";
+import type { DocBlock, DocImage, DocParagraph, DocShape } from "../../types";
 import {
   BLOCK_MARGIN_Y,
+  DEFAULT_LINE_WIDTH_PT,
   PAGE_BREAK_HEIGHT,
+  borderStyleToCss,
   breakHintText,
+  estimateShapeHeight,
+  hexColor,
   listGapPx,
   paragraphBoxStyle,
+  ptToPx,
   round2,
   runInlineStyle,
 } from "./docxStyle";
@@ -316,14 +322,111 @@ const DocxImageBlock = memo(function DocxImageBlock({
   );
 });
 
+/* -------------------------------- 形状 -------------------------------- */
+
+/**
+ * 形状块（合同/表单里的线框：下划线、竖线、方框、椭圆）。
+ *
+ * **不要用 `<hr>`**：合同里的线有精确的起止位置与长度，`<hr>` 撑满整行必然走样。
+ * 这里用绝对定位的 `<div>`：
+ *  · 水平线 = `border-top`（`height: 0`）；
+ *  · 竖线（`vertical`）= `border-left`（`width: 0`）；
+ *  · rect / roundRect / ellipse = 带边框（+ 可选填充）的框。
+ * 块的盒高 = `yPt + heightPt`（线按线宽兜底），由 `estimateShapeHeight` 参与布局，
+ * 所以后面的块不会叠上来。
+ */
+const DocxShapeBlock = memo(function DocxShapeBlock({
+  shape,
+  ctx,
+}: {
+  shape: DocShape;
+  ctx: DocxRenderContext;
+}) {
+  const scale = ctx.scale;
+  const lineWidthPt = shape.lineWidthPt !== null && shape.lineWidthPt > 0 ? shape.lineWidthPt : DEFAULT_LINE_WIDTH_PT;
+  const lineWidthPx = Math.max(0.5, round2(ptToPx(lineWidthPt, scale)));
+  // 颜色缺省用 currentColor：与正文同色，浅色/深色主题下都看得见（Word 的 auto 就是文字色）
+  const lineColor = hexColor(shape.lineColor) ?? "currentColor";
+  const fill = hexColor(shape.fillColor);
+  const borderStyle = shape.dash && shape.dash.trim() ? borderStyleToCss(shape.dash) : "solid";
+  const isLine = shape.shape === "line";
+  const widthPx = round2(ptToPx(Math.max(0, shape.widthPt), scale));
+  const heightPx = round2(ptToPx(Math.max(0, shape.heightPt), scale));
+  const left = round2(ptToPx(Math.max(0, shape.xPt), scale));
+  const top = round2(ptToPx(Math.max(0, shape.yPt), scale));
+
+  let style: CSSProperties;
+  if (isLine && shape.vertical) {
+    style = {
+      position: "absolute",
+      left: `${left}px`,
+      top: `${top}px`,
+      width: "0px",
+      height: `${Math.max(heightPx, lineWidthPx)}px`,
+      borderLeft: `${lineWidthPx}px ${borderStyle} ${lineColor}`,
+    };
+  } else if (isLine) {
+    style = {
+      position: "absolute",
+      left: `${left}px`,
+      top: `${top}px`,
+      width: `${Math.max(widthPx, 1)}px`,
+      height: "0px",
+      borderTop: `${lineWidthPx}px ${borderStyle} ${lineColor}`,
+    };
+  } else {
+    style = {
+      position: "absolute",
+      left: `${left}px`,
+      top: `${top}px`,
+      width: `${Math.max(widthPx, 1)}px`,
+      height: `${Math.max(heightPx, lineWidthPx)}px`,
+      border: `${lineWidthPx}px ${borderStyle} ${lineColor}`,
+      // 用 backgroundColor 而不是 background 简写：简写在部分内核/测试环境里读不回具体属性
+      backgroundColor: fill ?? undefined,
+      boxSizing: "border-box",
+      borderRadius:
+        shape.shape === "ellipse" ? "50%" : shape.shape === "roundRect" ? `${round2(4 * scale)}px` : undefined,
+    };
+  }
+
+  return (
+    <div
+      data-docx-shape="true"
+      data-docx-shape-kind={shape.shape}
+      data-docx-shape-vertical={shape.vertical ? "true" : undefined}
+      style={{ position: "relative", width: "100%", height: `${estimateShapeHeight(shape, scale)}px` }}
+    >
+      <div data-docx-shape-body="true" style={style} />
+    </div>
+  );
+});
+
 /* ------------------------------ 不支持的对象 ------------------------------ */
 
-/** 占位卡片：**绝不静默丢失**（OMML 公式、OLE、SmartArt、文本框…） */
-function UnsupportedCard({ label, detail }: { label: string; detail: string }) {
+/**
+ * 占位卡片：**绝不静默丢失**（OMML 公式、OLE、SmartArt、文本框…）。
+ *
+ * 连续多个**同类**占位块会被 `planBlocks` 合并成一张卡片（`details.length > 1`）：
+ * 标题写成「N 个图形对象（暂不支持显示）」，下面小字逐条列出各自的 `detail` ——
+ * 一份合同里 6 张卡片那种视觉噪音就此消掉，内容仍然查得到（复制文本里也仍有 `[label]`）。
+ */
+export function UnsupportedCard({
+  label,
+  details,
+}: {
+  label: string;
+  /** 组内每个块的 detail（单个占位块就是长度 1 的数组） */
+  details: readonly string[];
+}) {
+  const count = details.length;
+  // 单个：文案与样式保持原样；合并后：「N 个图形对象（暂不支持显示）」
+  const title = count > 1 ? `${count} 个${label}` : label;
   return (
     <div
       data-docx-unsupported="true"
       data-docx-label={label}
+      data-docx-unsupported-count={count}
       style={{ paddingTop: `${BLOCK_MARGIN_Y.unsupported}px`, paddingBottom: `${BLOCK_MARGIN_Y.unsupported}px` }}
     >
       <div
@@ -334,25 +437,34 @@ function UnsupportedCard({ label, detail }: { label: string; detail: string }) {
           padding: "5px 10px",
         }}
       >
-        <div style={{ fontSize: "12px", color: HINT_COLOR }}>{label}</div>
-        {detail ? (
-          <div
-            style={{
-              marginTop: "2px",
-              fontSize: "11px",
-              lineHeight: "16px",
-              color: HINT_COLOR,
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-            }}
-          >
-            {detail}
-          </div>
-        ) : null}
+        <div style={{ fontSize: "12px", color: HINT_COLOR }}>{title}</div>
+        {details.map((detail, index) =>
+          detail ? (
+            <div
+              key={index}
+              style={{
+                marginTop: "2px",
+                fontSize: "11px",
+                lineHeight: "16px",
+                color: HINT_COLOR,
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+              }}
+            >
+              {/* 合并卡片里逐条编号，方便和原文对照 */}
+              {count > 1 ? `${index + 1}. ${detail}` : detail}
+            </div>
+          ) : null,
+        )}
       </div>
     </div>
   );
 }
+
+/**
+ * 「图形对象（暂不支持显示）」这类 label 直接接数字前缀即可：
+ * 合并后读作「6 个图形对象（暂不支持显示）」。
+ */
 
 /* -------------------------------- 分派 -------------------------------- */
 
@@ -378,10 +490,12 @@ export const DocxBlock = memo(function DocxBlock({ block, ctx, depth = 0 }: Docx
       );
     case "image":
       return <DocxImageBlock block={block} ctx={ctx} />;
+    case "shape":
+      return <DocxShapeBlock shape={block} ctx={ctx} />;
     case "pageBreak":
       return <PageBreakLine label="分页符" />;
     case "unsupported":
-      return <UnsupportedCard label={block.label} detail={block.detail} />;
+      return <UnsupportedCard label={block.label} details={[block.detail]} />;
     default:
       return null;
   }

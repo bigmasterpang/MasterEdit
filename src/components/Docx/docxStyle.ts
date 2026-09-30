@@ -17,9 +17,11 @@
 import type { CSSProperties } from "react";
 import type {
   DocBlock,
+  DocBorderSpec,
   DocLineSpacing,
   DocParagraph,
   DocRun,
+  DocShape,
   DocTable,
   DocTableCell,
   DocTableRow,
@@ -47,6 +49,8 @@ export const PAGE_PADDING = 48;
 export const LIST_LEVEL_INDENT = 24;
 /** 未加载（还没取回来）的块按这个高度占位 */
 export const DEFAULT_BLOCK_HEIGHT = 24;
+/** 形状没有给线宽时的默认线宽（pt，≈1px） */
+export const DEFAULT_LINE_WIDTH_PT = 0.75;
 /** 分页提示线的高度（px） */
 export const PAGE_BREAK_HEIGHT = 18;
 /** 表格 / 图片 / 占位卡片上下各留一点缝，估算与渲染都用同一组常量 */
@@ -226,9 +230,61 @@ export function firstLineIndentPx(paragraph: DocParagraph, scale: number): numbe
   return 0;
 }
 
-/** 段落的盒模型样式（缩进、间距、行距、对齐、换行规则） */
+/* ------------------------------ 段落边框 ------------------------------ */
+
+/** 边框样式映射：`w:val` → CSS border-style（认不出的按实线处理） */
+export function borderStyleToCss(style: string | null | undefined): string {
+  switch ((style ?? "").toLowerCase()) {
+    case "dashed":
+    case "dash":
+    case "dashsmallgap":
+    case "lgdash":
+      return "dashed";
+    case "dotted":
+    case "dot":
+    case "sysdot":
+    case "dotdash":
+      return "dotted";
+    case "double":
+      return "double";
+    default:
+      return "solid";
+  }
+}
+
+/**
+ * 段落每条边的「占位」（px）= 线宽 + 间距（`w:space`）。
+ * 渲染时把它加到同侧的 padding 上、边框画在外面 —— 这样**边框在盒模型里的占位
+ * 与高度估算完全一致**，不会出现"有边框的段落和下一段重叠"。
+ */
+export function paragraphBorderInsets(
+  paragraph: DocParagraph,
+  scale: number,
+): { top: number; right: number; bottom: number; left: number } {
+  const zero = { top: 0, right: 0, bottom: 0, left: 0 };
+  const borders = paragraph.borders;
+  if (!borders) return zero;
+  const side = (spec: DocBorderSpec | null): number =>
+    spec ? ptToPx(Math.max(0, spec.widthPt), scale) + ptToPx(Math.max(0, spec.spacePt ?? 0), scale) : 0;
+  return {
+    top: side(borders.top),
+    right: side(borders.right),
+    bottom: side(borders.bottom),
+    left: side(borders.left),
+  };
+}
+
+/** 一条边框 → 内联 border-* 值（颜色缺省用 currentColor：Word 的 auto 就是文字色） */
+function borderCssValue(spec: DocBorderSpec, scale: number): string {
+  const width = Math.max(0.5, round2(ptToPx(Math.max(0, spec.widthPt), scale)));
+  const color = hexColor(spec.color) ?? "currentColor";
+  return `${width}px ${borderStyleToCss(spec.style)} ${color}`;
+}
+
+/** 段落的盒模型样式（缩进、间距、行距、对齐、换行规则、四边边框） */
 export function paragraphBoxStyle(paragraph: DocParagraph, scale: number): CSSProperties {
   const lineHeight = lineHeightPx(paragraph, scale);
+  const insets = paragraphBorderInsets(paragraph, scale);
   const style: CSSProperties = {
     // pre-wrap：块模型里的 `\n`（软换行）与 `\t`（制表符）要原样保留
     whiteSpace: "pre-wrap",
@@ -236,12 +292,19 @@ export function paragraphBoxStyle(paragraph: DocParagraph, scale: number): CSSPr
     overflowWrap: "anywhere",
     lineHeight: `${round2(lineHeight)}px`,
     minHeight: `${round2(lineHeight)}px`,
-    paddingTop: `${round2(ptToPx(paragraph.spaceBeforePt ?? 0, scale))}px`,
-    paddingBottom: `${round2(ptToPx(paragraph.spaceAfterPt ?? 0, scale))}px`,
-    paddingLeft: `${round2(ptToPx(paragraph.indentLeftPt ?? 0, scale) + listIndentPx(paragraph, scale))}px`,
-    paddingRight: `${round2(ptToPx(paragraph.indentRightPt ?? 0, scale))}px`,
+    // 段前段后 + 边框侧的「线宽 + 间距」都进 padding（绝对定位下 margin 不计入 offsetHeight，
+    // 用 padding 才能让"估算高度"与"实测高度"是同一个口径）
+    paddingTop: `${round2(ptToPx(paragraph.spaceBeforePt ?? 0, scale) + insets.top)}px`,
+    paddingBottom: `${round2(ptToPx(paragraph.spaceAfterPt ?? 0, scale) + insets.bottom)}px`,
+    paddingLeft: `${round2(ptToPx(paragraph.indentLeftPt ?? 0, scale) + listIndentPx(paragraph, scale) + insets.left)}px`,
+    paddingRight: `${round2(ptToPx(paragraph.indentRightPt ?? 0, scale) + insets.right)}px`,
     textIndent: `${round2(firstLineIndentPx(paragraph, scale))}px`,
   };
+  const borders = paragraph.borders;
+  if (borders?.top) style.borderTop = borderCssValue(borders.top, scale);
+  if (borders?.right) style.borderRight = borderCssValue(borders.right, scale);
+  if (borders?.bottom) style.borderBottom = borderCssValue(borders.bottom, scale);
+  if (borders?.left) style.borderLeft = borderCssValue(borders.left, scale);
   const align = alignToCss(paragraph.align);
   if (align) style.textAlign = align;
   return style;
@@ -347,21 +410,37 @@ function paragraphRunSegments(
   return segments;
 }
 
-/** 估算一个段落块的高度（px）：行数 × 行高 + 段前段后 + 分页提示线 */
+/** 估算一个段落块的高度（px）：行数 × 行高 + 段前段后 + 边框占位 + 分页提示线 */
 export function estimateParagraphHeight(
   paragraph: DocParagraph,
   scale: number,
   contentWidth: number,
 ): number {
   const lineHeight = lineHeightPx(paragraph, scale);
-  const paddingLeft = ptToPx(paragraph.indentLeftPt ?? 0, scale) + listIndentPx(paragraph, scale);
-  const paddingRight = ptToPx(paragraph.indentRightPt ?? 0, scale);
+  const insets = paragraphBorderInsets(paragraph, scale);
+  const paddingLeft =
+    ptToPx(paragraph.indentLeftPt ?? 0, scale) + listIndentPx(paragraph, scale) + insets.left;
+  const paddingRight = ptToPx(paragraph.indentRightPt ?? 0, scale) + insets.right;
   const avail = contentWidth - paddingLeft - paddingRight;
   const lines = countLines(paragraphRunSegments(paragraph, scale), avail, listPrefixWidthPx(paragraph, scale));
   const spacing =
-    ptToPx(paragraph.spaceBeforePt ?? 0, scale) + ptToPx(paragraph.spaceAfterPt ?? 0, scale);
+    ptToPx(paragraph.spaceBeforePt ?? 0, scale) +
+    ptToPx(paragraph.spaceAfterPt ?? 0, scale) +
+    insets.top +
+    insets.bottom;
   const hint = breakHintText(paragraph) ? PAGE_BREAK_HEIGHT : 0;
   return round2(lines * lineHeight + spacing + hint);
+}
+
+/**
+ * 估算形状块的高度（px）= `yPt + heightPt`（相对段落内容区左上角）。
+ * 线（`heightPt = 0`）按**线宽**兜底，否则会算成 0 高度、和下一块叠在一起。
+ */
+export function estimateShapeHeight(shape: DocShape, scale: number): number {
+  const offsetY = ptToPx(Math.max(0, shape.yPt), scale);
+  const own = ptToPx(Math.max(0, shape.heightPt), scale);
+  const line = ptToPx(shape.lineWidthPt !== null && shape.lineWidthPt > 0 ? shape.lineWidthPt : DEFAULT_LINE_WIDTH_PT, scale);
+  return round2(offsetY + Math.max(own, line, 1));
 }
 
 /** 估算单元格内容高度（px） */
@@ -414,6 +493,22 @@ export function estimateBlocksHeight(blocks: DocBlock[], scale: number, contentW
 }
 
 /**
+ * 估算占位卡片高度（px）。支持**合并后的多行说明**：
+ * 标题行 + 每一条 detail 各占若干行。
+ * 卡片是**我们自己的界面元素**（不是文档内容），字号固定 11/12px，所以不吃缩放倍率 ——
+ * 渲染与估算都不乘 scale，两边一致。
+ */
+export function estimateUnsupportedHeight(details: readonly string[], contentWidth: number): number {
+  const avail = Math.max(120, contentWidth - 24);
+  let lines = 0;
+  for (const detail of details) {
+    if (!detail) continue;
+    lines += countLines([{ text: detail, fontPx: 12 }], avail, 0);
+  }
+  return round2(32 + lines * 16 + UNSUPPORTED_MARGIN_Y * 2);
+}
+
+/**
  * 估算单块高度（px）。**虚拟滚动在块尚未渲染时只能靠它定位**，
  * 所以任何分支都必须给出一个正数（宁可偏大）。
  */
@@ -431,11 +526,10 @@ export function estimateBlockHeight(block: DocBlock, scale: number, contentWidth
     }
     case "pageBreak":
       return PAGE_BREAK_HEIGHT;
-    case "unsupported": {
-      // 卡片固定行（标题）+ 说明文字按 12px 字号估行；26 → 32 是照实测补的标题行高
-      const detailLines = countLines([{ text: block.detail, fontPx: 12 }], Math.max(120, contentWidth - 24), 0);
-      return round2(32 + detailLines * 16 + UNSUPPORTED_MARGIN_Y * 2);
-    }
+    case "shape":
+      return estimateShapeHeight(block, scale);
+    case "unsupported":
+      return estimateUnsupportedHeight([block.detail], contentWidth);
     default:
       return DEFAULT_BLOCK_HEIGHT;
   }

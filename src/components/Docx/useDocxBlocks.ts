@@ -13,7 +13,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { DocBlock, DocBlockPage } from "../../types";
+import type { DocBlock, DocBlockPage, DocPageSetup } from "../../types";
 
 /** 一次取的块数（后端建议 50~200：首次是"解密+解包+建块"，之后是切片克隆） */
 const WINDOW_SIZE = 120;
@@ -42,6 +42,11 @@ export interface DocxBlocksApi {
   loadAll(): Promise<{ blocks: Array<DocBlock | undefined>; complete: boolean }>;
   /** 清掉失败记录并重新取当前需要的窗口 */
   retry(): void;
+  /**
+   * 页面设置（分页视图用，来自后端 `w:sectPr`）。
+   * 后端字段还没落地时是 null，渲染层按 A4 + 2.54cm 页边距兜底。
+   */
+  page: DocPageSetup | null;
 }
 
 export function useDocxBlocks(path: string | null, modifiedAt: number): DocxBlocksApi {
@@ -50,6 +55,7 @@ export function useDocxBlocks(path: string | null, modifiedAt: number): DocxBloc
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState(0);
+  const [page, setPage] = useState<DocPageSetup | null>(null);
 
   /** 块缓存：下标 → 块 */
   const cacheRef = useRef(new Map<number, DocBlock>());
@@ -86,6 +92,8 @@ export function useDocxBlocks(path: string | null, modifiedAt: number): DocxBloc
         totalRef.current = page.total;
         setTotal(page.total);
         setEncrypted(page.encrypted);
+        // 页面设置：后端还在补这个字段，缺了就当 null（渲染层按 A4 兜底）
+        if (page.page) setPage(page.page);
         setError(null);
         bump();
         return true;
@@ -112,6 +120,7 @@ export function useDocxBlocks(path: string | null, modifiedAt: number): DocxBloc
     totalRef.current = 0;
     setTotal(0);
     setEncrypted(false);
+    setPage(null);
     setError(null);
     if (!path) {
       setLoading(false);
@@ -197,11 +206,12 @@ export function useDocxBlocks(path: string | null, modifiedAt: number): DocxBloc
       loading,
       error,
       version,
+      page,
       blockAt: (index: number) => cacheRef.current.get(index),
       ensure,
       loadAll,
       retry,
     }),
-    [total, encrypted, loading, error, version, ensure, loadAll, retry],
+    [total, encrypted, loading, error, version, page, ensure, loadAll, retry],
   );
 }

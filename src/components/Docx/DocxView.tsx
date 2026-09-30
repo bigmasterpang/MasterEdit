@@ -19,7 +19,7 @@ import type { DocTable, DocumentInfo } from "../../types";
 import { Icon } from "../common/Icon";
 import { openActiveDocWithExternalApp } from "../../utils/fileActions";
 import { formatBytes } from "../../utils/timing";
-import { DocxBlocks } from "./DocxBlocks";
+import { DocxBlocks, type DocxViewMode } from "./DocxBlocks";
 import { DocxFindBar, useDocxFind } from "./DocxFind";
 import { DocxOutline } from "./DocxOutline";
 import { useDocxBlocks } from "./useDocxBlocks";
@@ -57,6 +57,8 @@ export function DocxView({ docId }: { docId: string }) {
   const [showXml, setShowXml] = useState(false);
   const [xml, setXml] = useState("");
   const [scale, setScale] = useState(1);
+  /** 视图模式：**默认分页**（用户明确要"一页一页"），可切回连续流 */
+  const [viewMode, setViewMode] = useState<DocxViewMode>("paged");
   const [copyBusy, setCopyBusy] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
@@ -395,6 +397,39 @@ export function DocxView({ docId }: { docId: string }) {
 
           <span className="mx-1 h-4 w-px bg-line" />
 
+          {/* 分页 / 连续：默认分页（用户要的是"一页一页"），连续模式保留原来的一条流 */}
+          <div
+            data-docx-mode-switch="true"
+            className="flex items-center overflow-hidden rounded border border-line"
+            title="分页：按纸张一页一页显示（默认）；连续：一条流滚到底"
+          >
+            <button
+              type="button"
+              data-docx-mode-paged="true"
+              aria-pressed={viewMode === "paged"}
+              onClick={() => setViewMode("paged")}
+              className={`px-2 py-1 text-[12px] ${
+                viewMode === "paged" ? "bg-accent/15 text-accent" : "text-muted hover:bg-hover"
+              }`}
+            >
+              分页
+            </button>
+            <span className="h-4 w-px bg-line" />
+            <button
+              type="button"
+              data-docx-mode-continuous="true"
+              aria-pressed={viewMode === "continuous"}
+              onClick={() => setViewMode("continuous")}
+              className={`px-2 py-1 text-[12px] ${
+                viewMode === "continuous" ? "bg-accent/15 text-accent" : "text-muted hover:bg-hover"
+              }`}
+            >
+              连续
+            </button>
+          </div>
+
+          <span className="mx-1 h-4 w-px bg-line" />
+
           <div className="flex items-center gap-1">
             <button
               type="button"
@@ -448,7 +483,7 @@ export function DocxView({ docId }: { docId: string }) {
             />
           ) : null}
           <div className="relative min-w-0 flex-1">
-            <DocxBlocks api={api} ctx={renderContext} scrollRequest={scrollRequest} />
+            <DocxBlocks api={api} ctx={renderContext} mode={viewMode} scrollRequest={scrollRequest} />
             <DocxFindBar api={find} />
 
             {api.error ? (

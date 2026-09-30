@@ -15,11 +15,34 @@ use std::path::{Path, PathBuf};
 
 use masteredit_lib::commands::office_docx::{document_blocks, document_info, document_xml};
 
-fn corpus_dir() -> PathBuf {
-    match std::env::var("MASTEREDIT_DOCX_CORPUS") {
-        Ok(value) => PathBuf::from(value),
-        Err(_) => PathBuf::from(r"Z:\D\mywork\05_会议汇报\每周汇报\2026"),
+/// 语料库目录：默认两处（每周汇报 + 查新合同），可用 `MASTEREDIT_DOCX_CORPUS` 覆盖
+/// （多个目录用 `;` 分隔）。不存在的目录会被跳过。
+fn corpus_dirs() -> Vec<PathBuf> {
+    let raw = std::env::var("MASTEREDIT_DOCX_CORPUS").unwrap_or_else(|_| {
+        [
+            r"Z:\D\mywork\05_会议汇报\每周汇报\2026",
+            r"Z:\D\mywork\08_项目总结\AI加持下的家庭能源管理系统",
+        ]
+        .join(";")
+    });
+    raw.split(';')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// 收集所有语料目录下的 .docx（去重 + 排序，保证输出稳定）
+fn collect_corpus() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for dir in corpus_dirs() {
+        if dir.exists() {
+            collect_docx(&dir, &mut files);
+        }
     }
+    files.sort();
+    files.dedup();
+    files
 }
 
 /// 递归收集目录下的 .docx（按路径排序，保证输出稳定）
@@ -49,15 +72,9 @@ fn collect_docx(dir: &Path, out: &mut Vec<PathBuf>) {
 
 #[test]
 fn every_corpus_file_parses_or_fails_cleanly() {
-    let dir = corpus_dir();
-    if !dir.exists() {
-        eprintln!("跳过：语料库目录不存在 {}", dir.display());
-        return;
-    }
-    let mut files = Vec::new();
-    collect_docx(&dir, &mut files);
+    let files = collect_corpus();
     if files.is_empty() {
-        eprintln!("跳过：目录里没有 .docx —— {}", dir.display());
+        eprintln!("跳过：语料库目录不存在或里面没有 .docx");
         return;
     }
 
@@ -66,6 +83,9 @@ fn every_corpus_file_parses_or_fails_cleanly() {
     let mut total_paragraphs = 0usize;
     let mut total_tables = 0usize;
     let mut failures: Vec<String> = Vec::new();
+    let mut placeholder_total = 0usize;
+    let mut shape_total = 0usize;
+    let mut border_total = 0usize;
 
     for path in &files {
         let label = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -90,12 +110,52 @@ fn every_corpus_file_parses_or_fails_cleanly() {
                     assert!(xml.starts_with("<?xml"), "{label}: document.xml 不是 XML 文本");
                     assert!(xml.contains("<w:body"), "{label}: document.xml 缺少文档主体");
                 }
+                // 占位块统计：解析器遇到不支持的图形/对象必须产出带说明的占位块，
+                // 绝不能静默丢失（方案的硬要求）。这里把每个文件的占位情况打出来，
+                // 既能看到真实语料里到底有多少"暂不支持"，也能盯住回归。
+                let page = document_blocks(path.to_string_lossy().to_string(), 0, 2000)
+                    .unwrap_or_else(|error| panic!("{label}: 取块失败：{error}"));
+                let blocks = serde_json::to_value(&page.blocks).expect("序列化块失败");
+                let list = blocks.as_array().cloned().unwrap_or_default();
+                let mut placeholders: Vec<String> = Vec::new();
+                let mut shapes = 0usize;
+                let mut paragraphs_with_borders = 0usize;
+                for block in &list {
+                    if block["kind"] == "shape" {
+                        shapes += 1;
+                    }
+                    if block["kind"] == "paragraph" && !block["borders"].is_null() {
+                        paragraphs_with_borders += 1;
+                    }
+                    if block["kind"] == "unsupported" {
+                        let text = block["label"].as_str().unwrap_or_default().to_string();
+                        assert!(
+                            !text.trim().is_empty(),
+                            "{label}: 占位块没有 label —— 等于静默丢失"
+                        );
+                        placeholders.push(text);
+                    }
+                }
+                placeholder_total += placeholders.len();
+                shape_total += shapes;
+                border_total += paragraphs_with_borders;
+                if !placeholders.is_empty() {
+                    placeholders.sort();
+                    placeholders.dedup();
+                    eprintln!(
+                        "         └ 占位块 {} 个：{}",
+                        list.iter().filter(|b| b["kind"] == "unsupported").count(),
+                        placeholders.join(" / ")
+                    );
+                }
                 eprintln!(
-                    "  [OK]   {label:<28} 部件 {:>3} · 段落 {:>4} · 表格 {:>2} · 图片 {:>2}{}",
+                    "  [OK]   {label:<28} 部件 {:>3} · 段落 {:>4} · 表格 {:>2} · 图片 {:>2} · 顶层块 {:>3} · 形状 {:>2}{}",
                     info.parts.len(),
                     info.paragraphs,
                     info.tables,
                     info.images,
+                    list.len(),
+                    shapes,
                     if info.encrypted { " · 已解密" } else { "" }
                 );
             }
@@ -125,6 +185,10 @@ fn every_corpus_file_parses_or_fails_cleanly() {
         total_paragraphs,
         total_tables
     );
+    eprintln!(
+        "形状块合计：{shape_total} 个（VML / DrawingML 的线、框等，已直接渲染）；带边框的段落：{border_total} 个"
+    );
+    eprintln!("占位块合计：{placeholder_total} 个（不支持的图形/对象，全部带中文说明）");
 
     assert!(
         failures.is_empty(),
@@ -139,13 +203,7 @@ fn every_corpus_file_parses_or_fails_cleanly() {
 /// 首尾标签闭合、没有截断（加密解密链路一旦出错，这里最先暴露）
 #[test]
 fn corpus_document_xml_is_well_formed() {
-    let dir = corpus_dir();
-    if !dir.exists() {
-        eprintln!("跳过：语料库目录不存在 {}", dir.display());
-        return;
-    }
-    let mut files = Vec::new();
-    collect_docx(&dir, &mut files);
+    let files = collect_corpus();
     if files.is_empty() {
         return;
     }

@@ -403,6 +403,26 @@ export interface DocLineSpacing {
   value: number;
 }
 
+/** 段落的一条边框（`w:pBdr`）：合同里「空段落 + 下边框」画的横线就是它 */
+export interface DocBorderSpec {
+  /** `w:val` 原值：single / dashed / dotted / double … */
+  style: string;
+  /** 线宽（pt） */
+  widthPt: number;
+  /** 颜色（RRGGBB）；null 表示 `auto` → 用文字颜色 */
+  color: string | null;
+  /** 边框与正文的间距（pt，`w:space`）→ 渲染成 padding */
+  spacePt: number | null;
+}
+
+/** 段落四边边框；null 表示这一段没有边框 */
+export interface DocParagraphBorders {
+  top: DocBorderSpec | null;
+  bottom: DocBorderSpec | null;
+  left: DocBorderSpec | null;
+  right: DocBorderSpec | null;
+}
+
 /** 列表信息（前缀文本由后端算好，前端只负责显示与缩进） */
 export interface DocListInfo {
   numId: number;
@@ -441,6 +461,33 @@ export interface DocParagraph {
   pageBreak: boolean;
   /** 分节符类型（nextPage / continuous / evenPage / oddPage） */
   sectionBreak: string | null;
+  /** 四边边框（合同里的横线/竖线常由「空段落 + 边框」实现）；null = 没有边框 */
+  borders: DocParagraphBorders | null;
+}
+
+/** 形状类型：线框（合同/表单里的下划线、方框） */
+export type DocShapeKind = "line" | "rect" | "roundRect" | "ellipse";
+
+/**
+ * 形状块（`w:drawing` 里的线框）。
+ * 坐标 `xPt / yPt` 是**相对段落内容区左上角**的偏移，宽高单位为 pt。
+ */
+export interface DocShape {
+  shape: DocShapeKind;
+  xPt: number;
+  yPt: number;
+  widthPt: number;
+  heightPt: number;
+  /** 线宽（pt）；null = 默认 0.75pt */
+  lineWidthPt: number | null;
+  /** 线色（RRGGBB）；null = 默认（用文字色/黑） */
+  lineColor: string | null;
+  /** 填充色（RRGGBB）；null = 不填充 */
+  fillColor: string | null;
+  /** 虚线样式（`a:prstDash` 原值）；null/空 = 实线 */
+  dash: string | null;
+  /** 是否为竖线（`border-left` 渲染） */
+  vertical: boolean;
 }
 
 /** 纵向合并：restart = 起点，continue = 延续（不重复输出 `<td>`） */
@@ -501,8 +548,22 @@ export type DocBlock =
   | ({ kind: "paragraph" } & DocParagraph)
   | ({ kind: "table" } & DocTable)
   | ({ kind: "image" } & DocImage)
+  | ({ kind: "shape" } & DocShape)
   | { kind: "pageBreak" }
   | { kind: "unsupported"; label: string; detail: string };
+
+/**
+ * 页面设置（分页视图用）：后端从第一个 `w:sectPr` 读出来，单位统一 pt。
+ * 字段缺失时前端按 A4 + 2.54cm 页边距兜底。
+ */
+export interface DocPageSetup {
+  widthPt: number;
+  heightPt: number;
+  marginTopPt: number;
+  marginRightPt: number;
+  marginBottomPt: number;
+  marginLeftPt: number;
+}
 
 /** `document_blocks` 的返回：窗口化的顶层块 + 真实块总数 */
 export interface DocBlockPage {
@@ -510,6 +571,8 @@ export interface DocBlockPage {
   from: number;
   blocks: DocBlock[];
   encrypted: boolean;
+  /** 页面设置（可选：后端还在补这个字段，没有就用 A4 兜底） */
+  page?: DocPageSetup | null;
 }
 
 /** `document_find` 的一处命中（块级：一个块最多一条，`block` 是顶层块下标） */

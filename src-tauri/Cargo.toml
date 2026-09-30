@@ -2,7 +2,7 @@
 # 包名即最终可执行文件名（cargo 输出 MasterEdit.exe），与 productName 保持一致，
 # 避免安装目录里再出现旧的 mastermd.exe。库名单独用 [lib] 指定为合法标识符。
 name = "MasterEdit"
-version = "0.21.1"
+version = "0.21.2"
 description = "MasterEdit — Windows Markdown, Office Sheet, PDF & Code Viewer/Editor"
 authors = ["bigmasterpang"]
 edition = "2021"
