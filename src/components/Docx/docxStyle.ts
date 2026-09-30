@@ -100,6 +100,40 @@ export function hexColor(value: string | null): string | null {
   return `#${raw.toUpperCase()}`;
 }
 
+/** Word 页面默认底色：**白色**（即使应用整体处于深色主题，纸面默认也是白纸黑字） */
+export const DEFAULT_PAGE_BG = "#ffffff";
+
+/** 页面底色预设（白纸 / 暖黄 / 护眼绿 / 浅灰 / 深色） */
+export const DOCX_PAGE_BG_PRESETS: ReadonlyArray<{ id: string; label: string; color: string }> = [
+  { id: "white", label: "白色", color: "#ffffff" },
+  { id: "warm", label: "暖黄", color: "#faf4e8" },
+  { id: "green", label: "护眼绿", color: "#cce8cf" },
+  { id: "gray", label: "浅灰", color: "#f3f4f6" },
+  { id: "dark", label: "深色", color: "#1e222a" },
+];
+
+/** 归一化页面底色（`#rrggbb` 小写），非法或空值回退为默认白色 `#ffffff` */
+export function normalizePageBg(value: string | null | undefined): string {
+  if (!value) return DEFAULT_PAGE_BG;
+  const raw = value.trim().replace(/^#/, "");
+  if (!/^[0-9a-fA-F]{6}$/.test(raw)) return DEFAULT_PAGE_BG;
+  return `#${raw.toLowerCase()}`;
+}
+
+/**
+ * 按纸面底色亮度决定默认前景色（对应 Word `w:color="auto"`）：
+ * 浅色纸面（白纸/暖黄/护眼绿/浅灰）统一用深色墨水 `#1f2328`，避免在应用深色主题下出现「白纸白字」；
+ * 深色纸面用浅色字 `#e5e7eb`。段落 run 若显式指定了颜色（`run.color`），仍以文档颜色为准。
+ */
+export function pageFgColor(bgHex: string): string {
+  const norm = normalizePageBg(bgHex).slice(1);
+  const r = Number.parseInt(norm.slice(0, 2), 16) / 255;
+  const g = Number.parseInt(norm.slice(2, 4), 16) / 255;
+  const b = Number.parseInt(norm.slice(4, 6), 16) / 255;
+  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  return lum >= 0.45 ? "#1f2328" : "#e5e7eb";
+}
+
 /** CSS 字体名：含非 ASCII / 空格的名字要加引号 */
 function quoteFont(name: string): string {
   const trimmed = name.trim();

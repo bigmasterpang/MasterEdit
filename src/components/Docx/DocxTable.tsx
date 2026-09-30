@@ -11,7 +11,7 @@
  */
 import { memo, useMemo, type CSSProperties, type ReactNode } from "react";
 import type { DocBlock, DocTable, DocTableCell } from "../../types";
-import { BLOCK_MARGIN_Y, CELL_PADDING_X, CELL_PADDING_Y, hexColor, round2 } from "./docxStyle";
+import { BLOCK_MARGIN_Y, CELL_PADDING_X, CELL_PADDING_Y, hexColor, pageFgColor, round2 } from "./docxStyle";
 import { buildTableGrid, type TableGridEntry } from "./docxGrid";
 import { MAX_BLOCK_DEPTH, type DocxRenderContext } from "./docxRender";
 
@@ -56,7 +56,10 @@ function cellBaseStyle(cell: DocTableCell): CSSProperties {
     overflowWrap: "anywhere",
   };
   const shading = hexColor(cell.shading);
-  if (shading) style.backgroundColor = shading;
+  if (shading) {
+    style.backgroundColor = shading;
+    style.color = pageFgColor(shading);
+  }
   return style;
 }
 

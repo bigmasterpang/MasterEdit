@@ -741,6 +741,10 @@ struct ParaProps {
     auto_after: Option<bool>,
     /// `w:pBdr` 段落边框（四边都空时解析成 None）
     borders: Option<ParagraphBorders>,
+    /// `w:numPr/w:numId`（0 表示明确取消编号；None 表示本层未表态，沿样式链向上找）
+    num_id: Option<i64>,
+    /// `w:numPr/w:ilvl`（0..=8；None 表示本层未表态）
+    num_ilvl: Option<u8>,
 }
 
 impl ParaProps {
@@ -776,6 +780,13 @@ impl ParaProps {
         fill(&mut self.auto_before, &lower.auto_before);
         fill(&mut self.auto_after, &lower.auto_after);
         fill(&mut self.borders, &lower.borders);
+        // 编号：若本层未表态 ilvl，且本层未另起一套不同的 numId，则沿用下层的 ilvl
+        // （企业标准里 `heading 4` 只写 ilvl=1、basedOn `heading 2` 写 numId=7，靠此合流）；
+        // numId 按最内层优先填充（本层写 numId=0 会保留为 Some(0)，从而拦截外层样式的编号）。
+        if self.num_ilvl.is_none() && (self.num_id.is_none() || lower.num_id == self.num_id) {
+            self.num_ilvl = lower.num_ilvl;
+        }
+        fill(&mut self.num_id, &lower.num_id);
         // 缩进：twips 与 Chars 是一组
         fill_pair(
             &mut self.indent_left_pt,
@@ -1028,6 +1039,25 @@ impl StyleSheet {
         props
     }
 
+    /// 段落样式链的样式 ID 列表：`[本样式 id, 父样式 id, …]`，供 `w:lvl/w:pStyle` 反查级别
+    fn chain_ids(&self, style_id: Option<&str>) -> Vec<String> {
+        let start = style_id
+            .map(str::to_string)
+            .or_else(|| self.default_para_style.clone());
+        let mut out: Vec<String> = Vec::new();
+        let mut current = start;
+        while let Some(id) = current {
+            if out.len() >= MAX_STYLE_DEPTH || out.iter().any(|seen| seen == &id) {
+                break;
+            }
+            let Some(def) = self.styles.get(&id) else { break };
+            let next = def.based_on.clone();
+            out.push(id);
+            current = next;
+        }
+        out
+    }
+
     fn style_name(&self, style_id: &str) -> Option<String> {
         self.styles.get(style_id).and_then(|def| def.name.clone())
     }
@@ -1255,6 +1285,17 @@ fn parse_para_props(node: &XmlNode) -> ParaProps {
     // 段落边框（合同/表单里"空段落 + 下边框"就是一条横线）
     props.borders = node.child("pBdr").and_then(parse_paragraph_borders);
 
+    // 编号属性（段落直接格式或段落样式 `w:style/w:pPr/w:numPr` 都能带）
+    if let Some(num_pr) = node.child("numPr") {
+        props.num_id = num_pr
+            .child("numId")
+            .and_then(|num| integer(num.attr_local("val")));
+        props.num_ilvl = num_pr
+            .child("ilvl")
+            .and_then(|num| integer(num.attr_local("val")))
+            .map(|level| level.clamp(0, 8) as u8);
+    }
+
     props
 }
 
@@ -1450,6 +1491,8 @@ struct LevelDef {
     text: String,
     /// `w:suff`：标记与正文的间隔（tab / space / nothing）
     suffix: String,
+    /// `w:pStyle`：与该级别绑定的段落样式 id（ECMA-376 §17.9.23，多级标题编号常靠它决定 ilvl）
+    p_style: Option<String>,
     /// 该级自带的缩进（作为段落属性的中间层）
     indent_left_twips: Option<f32>,
     /// 悬挂缩进（正数，渲染时取负作为首行缩进）
@@ -1468,6 +1511,7 @@ impl Default for LevelDef {
             format: "decimal".to_string(),
             text: "%1.".to_string(),
             suffix: "tab".to_string(),
+            p_style: None,
             indent_left_twips: None,
             hanging_twips: None,
             left_chars: None,
@@ -1570,6 +1614,28 @@ impl Numbering {
         (level, def.abstract_id)
     }
 
+    /// 当段落/样式只给了 `numId` 没给 `ilvl` 时，按 `w:lvl/w:pStyle` 反查该样式绑定的级别
+    fn level_for_style(&self, num_id: u32, style_chain: &[String]) -> Option<u8> {
+        let def = self.nums.get(&num_id)?;
+        let abs = self.abstracts.get(&def.abstract_id);
+        for style_id in style_chain {
+            for ilvl in 0..=8u8 {
+                let p_style = def
+                    .level_overrides
+                    .get(&ilvl)
+                    .and_then(|lvl| lvl.p_style.as_deref())
+                    .or_else(|| {
+                        abs.and_then(|a| a.levels.get(&ilvl))
+                            .and_then(|lvl| lvl.p_style.as_deref())
+                    });
+                if p_style == Some(style_id.as_str()) {
+                    return Some(ilvl);
+                }
+            }
+        }
+        None
+    }
+
     /// 该级自带的缩进 → 段落属性（层叠里位于"段落样式之上、直接格式之下"）
     fn level_indent(&self, num_id: u32, ilvl: u8) -> ParaProps {
         let (level, _) = self.level(num_id, ilvl);
@@ -1583,6 +1649,23 @@ impl Numbering {
     }
 }
 
+/// 把 `w:lvlText` 里的 Wingdings / Symbol 私用区字符（U+E000..U+F8FF）映射为通用 Unicode 符号。
+/// Word 的项目符号常写 `Symbol` 的 `\u{F0B7}` 或 `Wingdings` 的 `\u{F06C}`/`\u{F06E}`/`\u{F0A7}`，
+/// 浏览器按正文宋/黑体渲染私用区码位会显示成豆腐块，换算成标准符号即可跨字体稳定显示。
+fn normalize_lvl_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\u{F0B7}' | '\u{F06C}' | '\u{F09F}' => '•',
+            '\u{F06E}' | '\u{F0A7}' => '▪',
+            '\u{F075}' | '\u{F076}' => '◆',
+            '\u{F0D8}' | '\u{F0E8}' => '➢',
+            '\u{F0FC}' | '\u{F0FE}' => '✓',
+            '\u{E000}'..='\u{F8FF}' => '•',
+            other => other,
+        })
+        .collect()
+}
+
 fn parse_level(node: &XmlNode) -> LevelDef {
     let mut level = LevelDef::default();
     if let Some(start) = integer(node.child("start").and_then(|node| node.attr_local("val"))) {
@@ -1592,10 +1675,16 @@ fn parse_level(node: &XmlNode) -> LevelDef {
         level.format = format.to_string();
     }
     if let Some(text) = node.child("lvlText").and_then(|node| node.attr_local("val")) {
-        level.text = text.to_string();
+        level.text = normalize_lvl_text(text);
     }
     if let Some(suffix) = node.child("suff").and_then(|node| node.attr_local("val")) {
         level.suffix = suffix.to_string();
+    }
+    if let Some(style) = node.child("pStyle").and_then(|node| node.attr_local("val")) {
+        let trimmed = style.trim();
+        if !trimmed.is_empty() {
+            level.p_style = Some(trimmed.to_string());
+        }
     }
     if let Some(indent) = node.child("pPr").and_then(|node| node.child("ind")) {
         level.indent_left_twips = number(indent.attr_local("left").or_else(|| indent.attr_local("start")));
@@ -2127,38 +2216,38 @@ impl<'a> DocBuilder<'a> {
             .and_then(|style| style.attr_local("val"))
             .map(str::to_string);
 
-        // ---- 编号：先把 numId/ilvl 读出来，编号级别的缩进要参与段落属性层叠 ----
-        let num_pr = node.child("pPr").and_then(|ppr| ppr.child("numPr"));
-        let num_id = num_pr
-            .and_then(|num| num.child("numId"))
-            .and_then(|num| integer(num.attr_local("val")));
-        let ilvl = num_pr
-            .and_then(|num| num.child("ilvl"))
-            .and_then(|num| integer(num.attr_local("val")))
-            .unwrap_or(0)
-            .clamp(0, 8) as u8;
+        let direct_ppr = node.child("pPr").map(parse_para_props).unwrap_or_default();
+        let style_ppr = self.styles.chain_ppr(style_id.as_deref());
 
-        // numId=0 是"取消编号"（Word 用 0 表示无编号）
-        let list = match num_id {
-            Some(id) if id > 0 => Some(
-                self.numbering_state
-                    .next(self.numbering, id.max(0) as u32, ilvl),
-            ),
-            _ => None,
-        };
-        let numbering_ppr = match &list {
-            Some(info) => self.numbering.level_indent(info.num_id, info.level),
-            None => ParaProps::default(),
+        // ---- 编号：直接 pPr → 段落样式（basedOn 逐级）→ docDefaults ----
+        // 先合成 numId / ilvl（缺省 ilvl 时再按 numbering.xml 的 w:lvl/w:pStyle 反查），
+        // 以便把该编号级别的缩进放到「直接格式与段落样式之间」参与段落属性层叠。
+        let mut num_probe = direct_ppr.clone();
+        num_probe.apply_over(&style_ppr);
+        num_probe.apply_over(&self.styles.doc_ppr);
+        let num_id = num_probe.num_id;
+        let style_chain = self.styles.chain_ids(style_id.as_deref());
+        let ilvl = num_probe
+            .num_ilvl
+            .or_else(|| {
+                num_id
+                    .filter(|&id| id > 0)
+                    .and_then(|id| self.numbering.level_for_style(id as u32, &style_chain))
+            })
+            .unwrap_or(0)
+            .clamp(0, 8);
+        let numbering_ppr = match num_id {
+            Some(id) if id > 0 => self.numbering.level_indent(id as u32, ilvl),
+            _ => ParaProps::default(),
         };
 
         // ---- 段落属性层叠：直接格式 → 编号级别缩进 → 段落样式（basedOn 逐级）→ docDefaults ----
-        let direct_ppr = node.child("pPr").map(parse_para_props).unwrap_or_default();
         // 段落自己显式写了段前/段后吗？自动段间距遇到显式值要让位（见 resolve_autospacing）
         let explicit_before = direct_ppr.space_before_pt.is_some();
         let explicit_after = direct_ppr.space_after_pt.is_some();
         let mut ppr = direct_ppr;
         ppr.apply_over(&numbering_ppr);
-        ppr.apply_over(&self.styles.chain_ppr(style_id.as_deref()));
+        ppr.apply_over(&style_ppr);
         ppr.apply_over(&self.styles.doc_ppr);
 
         // ---- 字符属性基线（给没有自己 rPr 的 run 用）：段落标记的 rPr → 段落样式链 → docDefaults
@@ -2222,7 +2311,7 @@ impl<'a> DocBuilder<'a> {
             return;
         }
 
-        // 完全空的段落（`<w:p/>`）：也要留成块，前端用它撑出空行高度
+        // 完全空的段落（`<w:p/>`）：也要留成块，前端用它撑出空行高度（不消耗编号计数）
         if content.is_empty() {
             out.push(Block::Paragraph(ParagraphBlock {
                 style: style_id.as_deref().and_then(|id| self.styles.style_name(id)),
@@ -2237,7 +2326,7 @@ impl<'a> DocBuilder<'a> {
                 outline_level: ppr.outline_level,
                 page_break_before,
                 section_break,
-                list,
+                list: None,
                 borders: ppr.borders,
                 ..ParagraphBlock::default()
             }));
@@ -2252,6 +2341,21 @@ impl<'a> DocBuilder<'a> {
             }
             return;
         }
+
+        // numId=0 是"取消编号"（Word 用 0 表示无编号）；numFmt="none" 且前缀为空同样不显示标记
+        let list = match num_id {
+            Some(id) if id > 0 => {
+                let info = self
+                    .numbering_state
+                    .next(self.numbering, id.max(0) as u32, ilvl);
+                if info.format == "none" && info.prefix.is_empty() {
+                    None
+                } else {
+                    Some(info)
+                }
+            }
+            _ => None,
+        };
 
         out.push(Block::Paragraph(ParagraphBlock {
             style: style_id.as_deref().and_then(|id| self.styles.style_name(id)),
@@ -7105,10 +7209,87 @@ mod tests {
         assert!(!files.is_empty());
     }
 
+    /* ------------------------------ 样式关联编号 + PUA 项目符号 ------------------------------ */
+
+    /// **样式关联编号**：段落只写 `<w:pStyle>`，编号挂在样式的 `<w:pPr><w:numPr>` 上：
+    /// 1) 样式 `"2"`（heading 2）只写 `<w:numId w:val="7"/>`、不写 `<w:ilvl>`，由 `numbering.xml` 里的 `<w:lvl><w:pStyle w:val="2"/>` 反查级别；
+    /// 2) 样式 `"4"`（heading 4）`basedOn="2"`，只写 `<w:ilvl w:val="1"/>`、不写 `<w:numId>`，从父样式继承 `numId=7`；
+    /// 3) 段落显式写 `<w:numId w:val="0"/>` 取消样式继承的编号；
+    /// 4) 空段落不消耗编号计数；
+    /// 5) Wingdings/Symbol 私用区（`\u{F0B7}` 等）项目符号归一化为标准 Unicode 圆点 `•`。
+    #[test]
+    fn parses_style_inherited_numbering_and_pua_bullets() {
+        let styles = format!(
+            r#"<?xml version="1.0"?><w:styles {NS}>
+              <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+              <w:style w:type="paragraph" w:styleId="2"><w:name w:val="heading 2"/>
+                <w:basedOn w:val="Normal"/>
+                <w:pPr><w:numPr><w:numId w:val="7"/></w:numPr><w:outlineLvl w:val="1"/></w:pPr>
+              </w:style>
+              <w:style w:type="paragraph" w:styleId="4"><w:name w:val="heading 4"/>
+                <w:basedOn w:val="2"/>
+                <w:pPr><w:numPr><w:ilvl w:val="1"/></w:numPr><w:outlineLvl w:val="3"/></w:pPr>
+              </w:style>
+            </w:styles>"#
+        );
+        let numbering = format!(
+            r#"<?xml version="1.0"?><w:numbering {NS}>
+              <w:abstractNum w:abstractNumId="6">
+                <w:lvl w:ilvl="0">
+                  <w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="&#xF0B7;"/>
+                </w:lvl>
+              </w:abstractNum>
+              <w:abstractNum w:abstractNumId="7">
+                <w:lvl w:ilvl="0">
+                  <w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="2"/><w:lvlText w:val="%1."/>
+                </w:lvl>
+                <w:lvl w:ilvl="1">
+                  <w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="4"/><w:lvlText w:val="%1.%2."/>
+                </w:lvl>
+              </w:abstractNum>
+              <w:num w:numId="6"><w:abstractNumId w:val="6"/></w:num>
+              <w:num w:numId="7"><w:abstractNumId w:val="7"/></w:num>
+            </w:numbering>"#
+        );
+        let body = r#"
+            <w:p><w:pPr><w:pStyle w:val="2"/><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr>
+              <w:r><w:t>前言（显式取消编号）</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="2"/></w:pPr></w:p>
+            <w:p><w:pPr><w:pStyle w:val="2"/></w:pPr><w:r><w:t>范围</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="2"/></w:pPr><w:r><w:t>规范性引用文件</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="2"/></w:pPr><w:r><w:t>术语</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="4"/></w:pPr><w:r><w:t>边缘计算</w:t></w:r></w:p>
+            <w:p><w:pPr><w:pStyle w:val="4"/></w:pPr><w:r><w:t>电弧实时检测</w:t></w:r></w:p>
+            <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="6"/></w:numPr></w:pPr>
+              <w:r><w:t>项目符号项</w:t></w:r></w:p>"#;
+        let blocks = blocks_of(&docx_with(
+            body,
+            &[
+                ("word/styles.xml", &styles),
+                ("word/numbering.xml", &numbering),
+            ],
+        ));
+        // 1) numId=0 取消样式继承的编号
+        assert!(paragraph_of(&blocks[0]).list.is_none(), "numId=0 应取消样式编号");
+        // 2) 空段落不编号、也不消耗计数
+        assert!(paragraph_of(&blocks[1]).list.is_none(), "空段落不编号");
+        // 3) 一级标题从 1. 开始递增
+        assert_eq!(paragraph_of(&blocks[2]).list.as_ref().map(|l| l.prefix.as_str()), Some("1."));
+        assert_eq!(paragraph_of(&blocks[3]).list.as_ref().map(|l| l.prefix.as_str()), Some("2."));
+        assert_eq!(paragraph_of(&blocks[4]).list.as_ref().map(|l| l.prefix.as_str()), Some("3."));
+        // 4) 二级标题（styleId="4" basedOn="2"）继承 numId=7 + ilvl=1 → 3.1. / 3.2.
+        assert_eq!(paragraph_of(&blocks[5]).list.as_ref().map(|l| l.prefix.as_str()), Some("3.1."));
+        assert_eq!(paragraph_of(&blocks[6]).list.as_ref().map(|l| l.prefix.as_str()), Some("3.2."));
+        // 5) Wingdings 私用区 U+F0B7 归一化为 •
+        let bullet = paragraph_of(&blocks[7]).list.as_ref().expect("项目符号段落应有 list");
+        assert!(!bullet.ordered);
+        assert_eq!(bullet.prefix, "•");
+    }
+
     /* ------------------------------ 真实样本（存在才跑） ------------------------------ */
 
     /// **真实的企业标准封面**（用户实测反馈里"封面差异太大"的那份）：整页由 4 个文本框 + 2 条线组成。
-    /// 断言封面文字真的进了文本框块、标题可被查找命中、页眉拿到标准号。文件不存在时静默跳过。
+    /// 断言封面文字真的进了文本框块、标题可被查找命中、页眉拿到标准号、正文多级标题编号齐全。文件不存在时静默跳过。
     #[test]
     fn parses_enterprise_standard_cover_if_present() {
         let path = std::env::var("MASTEREDIT_DOCX_ENTERPRISE").unwrap_or_else(|_| {
@@ -7120,6 +7301,36 @@ mod tests {
             return;
         }
         let parsed = load_document(&path).expect("企业标准应能解析");
+
+        // 正文多级标题编号（样式 `"2"` / `"4"` 关联 `numId=7`）：
+        // 断言 1. 范围 / 2. 规范性引用文件 / 3. 术语 / 3.1. 边缘计算 / 3.2. 电弧实时检测 / 3.3. 故障电弧 都有编号
+        let numbered_headings: Vec<(String, String)> = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Paragraph(p) if matches!(p.style_id.as_deref(), Some("2") | Some("4")) => {
+                    p.list.as_ref().map(|l| (l.prefix.clone(), p.text.trim().to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (expected_prefix, expected_title) in [
+            ("1.", "范围"),
+            ("2.", "规范性引用文件"),
+            ("3.", "术语"),
+            ("3.1.", "边缘计算（Edge Computing）"),
+            ("3.2.", "电弧实时检测（Real-time Arc Detection）"),
+            ("3.3.", "故障电弧（Arc Fault）"),
+            ("4.", "功能"),
+            ("4.1.", "电弧实时检测功能"),
+        ] {
+            assert!(
+                numbered_headings
+                    .iter()
+                    .any(|(prefix, title)| prefix == expected_prefix && title == expected_title),
+                "企业标准应有标题编号 {expected_prefix} {expected_title}，实际：{numbered_headings:?}"
+            );
+        }
 
         // 封面 = 4 个文本框（标准号 / 发布单位 / 发布实施日期 / 标题）+ 2 条分隔线
         let text_boxes: Vec<&TextBoxBlock> = parsed

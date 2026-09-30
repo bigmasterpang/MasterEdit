@@ -28,6 +28,8 @@ import {
   PAGE_WIDTH,
   estimateBlockHeight,
   estimateUnsupportedHeight,
+  normalizePageBg,
+  pageFgColor,
   round2,
 } from "./docxStyle";
 import { planBlocks, type BlockPlan } from "./docxGrid";
@@ -529,6 +531,9 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
 
   const isLoadingFirst = api.loading && total === 0;
   const pageCount = Math.max(1, pagedLayout.pages.length);
+  /** 纸张底色与对比前景色（默认白纸 `#ffffff` + 深色墨水 `#1f2328`） */
+  const pageBg = normalizePageBg(ctx.pageBg);
+  const pageFg = pageFgColor(pageBg);
   /** 文档自己的页眉/页脚（每一页都画；没有就不占地方） */
   const headerBlocks = api.header ?? [];
   const footerBlocks = api.footer ?? [];
@@ -540,6 +545,7 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
    */
   const contextForPage = (pageNumber: number): DocxRenderContext => ({
     ...ctx,
+    pageBg,
     pageNumber,
     totalPages: pageCount,
     maxBlockWidth,
@@ -579,6 +585,7 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
         <div
           ref={canvasRef}
           data-docx-page={mode === "continuous" ? "true" : undefined}
+          data-docx-page-bg={mode === "continuous" ? pageBg : undefined}
           data-docx-book={mode === "paged" ? "true" : undefined}
           data-docx-content-width={round2(contentWidth)}
           data-docx-page-content-height={round2(geometry.contentHeightPx)}
@@ -597,6 +604,8 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
             margin: "0 auto",
             paddingLeft: mode === "paged" ? undefined : `${continuousPadding}px`,
             paddingRight: mode === "paged" ? undefined : `${continuousPadding}px`,
+            backgroundColor: mode === "paged" ? undefined : pageBg,
+            color: mode === "paged" ? undefined : pageFg,
             boxSizing: "border-box",
           }}
         >
@@ -605,11 +614,12 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
                 <div
                   key={page.index}
                   data-docx-page="true"
+                  data-docx-page-bg={pageBg}
                   data-docx-page-number={page.index + 1}
                   data-docx-page-top={round2(page.top + BOOK_OFFSET)}
                   data-docx-page-height={page.height}
                   data-docx-oversized={page.oversized ? "true" : undefined}
-                  className="border border-line bg-panel shadow-sm"
+                  className="border border-line shadow-sm"
                   style={{
                     position: "absolute",
                     top: `${round2(page.top + BOOK_OFFSET)}px`,
@@ -617,6 +627,8 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
                     transform: "translateX(-50%)",
                     width: `${geometry.widthPx}px`,
                     height: `${page.height}px`,
+                    backgroundColor: pageBg,
+                    color: pageFg,
                     /**
                      * `overflow: clip`（不是 `hidden`）：纸张是**视觉单位**，永远不产生滚动条，
                      * 也不因内容溢出而被撑宽；`clip` 不创建滚动容器，所以不会把纵向滚动吃掉

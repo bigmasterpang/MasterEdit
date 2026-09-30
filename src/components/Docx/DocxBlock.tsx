@@ -21,6 +21,7 @@ import {
   listGapPx,
   MEDIA_RETRY_MS,
   MEDIA_TIMEOUT_MS,
+  pageFgColor,
   paragraphBoxStyle,
   ptToPx,
   resolveImageBox,
@@ -632,8 +633,10 @@ const DocxTextBoxBlock = memo(function DocxTextBoxBlock({
   );
   const innerWidth = round2(Math.max(24, contentBoxWidth - TEXT_BOX_PADDING * 2));
   const declaredHeight = ptToPx(Math.max(0, box.heightPt), scale);
-  const fill = hexColor(box.fillColor);
+  const rawFill = hexColor(box.fillColor);
   const borderColor = hexColor(box.borderColor);
+  // Word/VML 无边框文本框缺省带 #FFFFFF 白底；当用户调整纸面底色时跟随纸面底色，避免封面出现突兀白块
+  const fill = rawFill === "#FFFFFF" && !borderColor && ctx.pageBg ? ctx.pageBg : rawFill;
   const borderWidth = Math.max(
     0.5,
     round2(ptToPx(box.borderWidthPt !== null && box.borderWidthPt > 0 ? box.borderWidthPt : TEXT_BOX_DEFAULT_BORDER_PT, scale)),
@@ -657,6 +660,7 @@ const DocxTextBoxBlock = memo(function DocxTextBoxBlock({
         padding: `${TEXT_BOX_PADDING}px`,
         boxSizing: "border-box",
         backgroundColor: fill ?? undefined,
+        color: fill ? pageFgColor(fill) : undefined,
         border: borderColor ? `${borderWidth}px solid ${borderColor}` : undefined,
         borderRadius: floating ? `${round2(3 * scale)}px` : undefined,
       }}

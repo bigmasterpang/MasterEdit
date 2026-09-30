@@ -39,6 +39,8 @@ export interface DocxRenderContext {
    * 由 `DocxBlocks` 在 layout 阶段同步进来。
    */
   scrollRootRef: { current: HTMLElement | null };
+  /** 纸张底色（默认 `#ffffff` 白纸；用户可在工具栏切换或自定义） */
+  pageBg?: string;
   /** 表格右键菜单（复制为制表符文本等）；不注入则不显示菜单 */
   onTableContextMenu?: (event: { clientX: number; clientY: number }, table: DocTable) => void;
 }

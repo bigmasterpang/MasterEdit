@@ -348,7 +348,9 @@ export function collectOutline(blocks: Array<DocBlock | undefined>): OutlineItem
   blocks.forEach((block, index) => {
     if (!block || block.kind !== "paragraph" || block.outlineLevel === null) return;
     const level = Math.max(0, Math.min(8, Math.round(block.outlineLevel)));
-    const raw = block.text.replace(/[\n\t]/g, " ").trim();
+    const body = block.text.replace(/[\n\t]/g, " ").trim();
+    const prefix = block.list?.ordered && block.list.prefix ? `${block.list.prefix} ` : "";
+    const raw = body ? `${prefix}${body}` : "";
     items.push({
       index,
       level,

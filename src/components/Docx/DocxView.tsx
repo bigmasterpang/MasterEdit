@@ -19,11 +19,17 @@ import type { DocTable, DocumentInfo } from "../../types";
 import { Icon } from "../common/Icon";
 import { openActiveDocWithExternalApp } from "../../utils/fileActions";
 import { formatBytes } from "../../utils/timing";
+import { readMigratedItem, writeItem } from "../../utils/storage";
 import { DocxBlocks, type DocxViewMode } from "./DocxBlocks";
 import { DocxFindBar, useDocxFind } from "./DocxFind";
 import { DocxOutline } from "./DocxOutline";
 import { useDocxBlocks } from "./useDocxBlocks";
-import { MEDIA_TIMEOUT_MS } from "./docxStyle";
+import {
+  DEFAULT_PAGE_BG,
+  DOCX_PAGE_BG_PRESETS,
+  MEDIA_TIMEOUT_MS,
+  normalizePageBg,
+} from "./docxStyle";
 import { copyTextToClipboard } from "./docxCopy";
 import { blocksToPlainText, collectOutline, tableToTsv, type OutlineItem } from "./docxGrid";
 import type { DocxRenderContext } from "./docxRender";
@@ -34,6 +40,9 @@ const SCALE_MAX = 2.4;
 const SCALE_STEP = 0.1;
 /** 顶部提示条自动消失时间 */
 const TOAST_MS = 2600;
+/** Word 页面底色持久化键（默认白色 `#ffffff`） */
+const PAGE_BG_STORAGE_KEY = "masteredit.docx.pageBg";
+const PAGE_BG_LEGACY_KEY = "mastermd.docx.pageBg";
 
 interface Toast {
   kind: "ok" | "error";
@@ -60,6 +69,15 @@ export function DocxView({ docId }: { docId: string }) {
   const [scale, setScale] = useState(1);
   /** 视图模式：**默认分页**（用户明确要"一页一页"），可切回连续流 */
   const [viewMode, setViewMode] = useState<DocxViewMode>("paged");
+  /** 页面底色：**默认白色** `#ffffff`，可切换预设或自定义颜色并持久化 */
+  const [pageBg, setPageBg] = useState<string>(() =>
+    normalizePageBg(readMigratedItem(PAGE_BG_STORAGE_KEY, PAGE_BG_LEGACY_KEY) ?? DEFAULT_PAGE_BG),
+  );
+  const updatePageBg = useCallback((value: string) => {
+    const next = normalizePageBg(value);
+    setPageBg(next);
+    writeItem(PAGE_BG_STORAGE_KEY, next);
+  }, []);
   const [copyBusy, setCopyBusy] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
@@ -255,6 +273,7 @@ export function DocxView({ docId }: { docId: string }) {
   const renderContext: DocxRenderContext = useMemo(
     () => ({
       scale,
+      pageBg,
       mediaCache: mediaCacheRef.current,
       mediaCacheKey,
       loadMedia,
@@ -267,7 +286,7 @@ export function DocxView({ docId }: { docId: string }) {
       maxBlockWidth: 0,
       onTableContextMenu: (event, table) => setMenu({ x: event.clientX, y: event.clientY, table }),
     }),
-    [scale, mediaCacheKey, loadMedia, highlightBlock],
+    [scale, pageBg, mediaCacheKey, loadMedia, highlightBlock],
   );
 
   /* ------------------ 原始 document.xml（排查用，保留原能力） ------------------ */
@@ -474,6 +493,50 @@ export function DocxView({ docId }: { docId: string }) {
             >
               <Icon name="zoom-in" size={13} />
             </button>
+          </div>
+
+          <span className="mx-1 h-4 w-px bg-line" />
+
+          {/* 页面底色：默认白色（#ffffff），支持一键切换预设或自定义拾色 */}
+          <div
+            data-docx-bg-picker="true"
+            className="flex items-center gap-1.5"
+            title="调整 Word 页面底色（默认白色）"
+          >
+            <span className="text-[11px] text-muted">底色</span>
+            {DOCX_PAGE_BG_PRESETS.map((preset) => {
+              const activePreset = pageBg === preset.color;
+              return (
+                <button
+                  key={preset.id}
+                  type="button"
+                  data-docx-bg-preset={preset.id}
+                  data-docx-bg-color={preset.color}
+                  aria-pressed={activePreset}
+                  onClick={() => updatePageBg(preset.color)}
+                  title={`底色：${preset.label}（${preset.color}）`}
+                  className={`h-5 w-5 rounded border transition-transform ${
+                    activePreset
+                      ? "scale-105 border-accent ring-1 ring-accent"
+                      : "border-line hover:scale-105"
+                  }`}
+                  style={{ backgroundColor: preset.color }}
+                />
+              );
+            })}
+            <label
+              className="relative flex h-5 w-5 cursor-pointer items-center justify-center rounded border border-line text-[10px] text-muted hover:bg-hover"
+              title={`自定义底色（当前 ${pageBg}）`}
+            >
+              🎨
+              <input
+                type="color"
+                data-docx-bg-custom="true"
+                value={pageBg}
+                onChange={(event) => updatePageBg(event.target.value)}
+                className="sr-only"
+              />
+            </label>
           </div>
 
           <button
