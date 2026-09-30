@@ -52,14 +52,17 @@ export const OPENABLE_EXTENSIONS = [
   ...MARKDOWN_EXTENSIONS,
   ...PDF_EXTENSIONS,
   ...SPREADSHEET_EXTENSIONS,
+  // Word 文档：漏了它会让欢迎页「常用打开」与资源管理栏都看不到 .docx
+  ...DOCUMENT_EXTENSIONS,
   ...TEXT_EXTENSIONS,
   ...CODE_EXTENSIONS,
 ];
 
 /** 打开对话框过滤器（精简分类显示，避免单个选项因扩展名过多导致下拉列表超长） */
 export const OPEN_DIALOG_FILTERS = [
-  { name: "常用支持文件", extensions: ["md", "markdown", "pdf", "xlsx", "csv", "txt", "json", "js", "ts", "html", "py", "rs"] },
+  { name: "常用支持文件", extensions: ["md", "markdown", "docx", "pdf", "xlsx", "csv", "txt", "json", "js", "ts", "html", "py", "rs"] },
   { name: "Markdown 文档 (*.md)", extensions: ["md", "markdown", "mdown"] },
+  { name: "Word 文档 (*.docx)", extensions: ["docx"] },
   { name: "PDF 文档 (*.pdf)", extensions: ["pdf"] },
   { name: "Excel 表格 (*.xlsx, *.xls, *.ods)", extensions: ["xlsx", "xls", "xlsb", "ods"] },
   { name: "CSV 表格 (*.csv, *.tsv)", extensions: ["csv", "tsv"] },

@@ -25,8 +25,13 @@ export interface DocxTableProps {
   ctx: DocxRenderContext;
   /** 嵌套深度（顶层表格 = 0） */
   depth: number;
-  /** 单元格内容的块渲染器（由 DocxBlock 注入，避免两个模块循环依赖） */
-  renderBlocks: (blocks: DocBlock[], depth: number) => ReactNode;
+  /** 表格所在版心的可用宽（px）：算不出单元格宽度时兜底 */
+  contentWidth: number;
+  /**
+   * 单元格内容的块渲染器（由 DocxBlock 注入，避免两个模块循环依赖）。
+   * 第三个参数是**单元格内宽**：单元格里的图片要按它算显示盒子，与高度估算保持同一个口径。
+   */
+  renderBlocks: (blocks: DocBlock[], depth: number, cellWidth: number) => ReactNode;
 }
 
 /** 单元格四边边框的内联样式（`border-collapse: collapse` 下相邻边只画一次） */
@@ -71,6 +76,8 @@ function TableRow({
   heightPx,
   ctx,
   depth,
+  columnWidths,
+  contentWidth,
   renderBlocks,
 }: {
   entries: TableGridEntry[];
@@ -78,7 +85,9 @@ function TableRow({
   heightPx: number | null;
   ctx: DocxRenderContext;
   depth: number;
-  renderBlocks: (blocks: DocBlock[], depth: number) => ReactNode;
+  columnWidths: number[];
+  contentWidth: number;
+  renderBlocks: (blocks: DocBlock[], depth: number, cellWidth: number) => ReactNode;
 }) {
   const rowStyle: CSSProperties | undefined =
     heightPx !== null && heightPx > 0 ? { height: `${round2(heightPx * ctx.scale)}px` } : undefined;
@@ -90,6 +99,18 @@ function TableRow({
           style.backgroundColor = style.backgroundColor ?? HEADER_BACKGROUND;
           style.fontWeight = 600;
         }
+        /**
+         * 单元格内宽：优先用单元格自己的 `widthPx`，否则按它跨越的列宽求和；
+         * 都拿不到就用表格版心宽（与 `estimateCellHeight` 的口径一致）。
+         */
+        let cellBox = entry.cell.widthPx !== null && entry.cell.widthPx > 0 ? entry.cell.widthPx * ctx.scale : 0;
+        if (cellBox <= 0) {
+          for (let column = entry.colStart; column < entry.colStart + entry.colSpan; column += 1) {
+            cellBox += columnWidths[column] ?? 0;
+          }
+        }
+        if (cellBox <= 0) cellBox = contentWidth;
+        const cellInnerWidth = Math.max(40, cellBox - CELL_PADDING_X * 2);
         return (
           <td
             key={cellIndex}
@@ -101,7 +122,7 @@ function TableRow({
             rowSpan={entry.rowSpan > 1 ? entry.rowSpan : undefined}
             style={style}
           >
-            {renderBlocks(entry.cell.blocks, depth)}
+            {renderBlocks(entry.cell.blocks, depth, cellInnerWidth)}
           </td>
         );
       })}
@@ -113,6 +134,7 @@ export const DocxTable = memo(function DocxTable({
   table,
   ctx,
   depth,
+  contentWidth,
   renderBlocks,
 }: DocxTableProps) {
   /** 网格配对（rowspan 计算）只在表格数据变化时重算 */
@@ -171,6 +193,8 @@ export const DocxTable = memo(function DocxTable({
         heightPx={row.heightPx}
         ctx={ctx}
         depth={depth + 1}
+        columnWidths={columnWidths}
+        contentWidth={contentWidth}
         renderBlocks={renderBlocks}
       />
     );

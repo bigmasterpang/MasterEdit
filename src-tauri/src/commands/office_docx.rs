@@ -27,7 +27,11 @@
 //! - `w:contextualSpacing`（同样式段落之间不加空）未实现 —— 它是**渲染规则**而不是数值，
 //!   要让前端遵守就得新增契约字段（`Block`/`ParagraphBlock` 加标志），收益相对有限，
 //!   所以本版不导出；段落间距按 XML 里的实际数值渲染。
-//! - 浮动图片按内联显示、不做环绕排版；文本框 / SmartArt / 图表 / OLE / OMML 只给占位块。
+//! - 页眉页脚只取**默认**那一套（`w:headerReference`/`w:footerReference` 的 `w:type="default"`，
+//!   没有 default 时取第一个存在的）：**"首页不同"（`w:titlePg`）与奇偶页不区分**，
+//!   所以首页也按默认页眉页脚显示。多节的页眉页脚同理只取最后一节（`w:body/w:sectPr`）。
+//! - 浮动图片/文本框按内联显示、不做文字环绕排版（`wrap` 字段只用来判断"是不是浮动对象"）。
+//! - SmartArt / 图表 / OLE / OMML 公式只给占位块。
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
@@ -44,7 +48,8 @@ use super::{file, office};
 /* ================================================================================== */
 
 /// 文档中的一个有序块。JSON 里带 `kind` 判别字段（`paragraph` / `table` / `image` /
-/// `shape` / `pageBreak` / `unsupported`），字段名统一 camelCase，前端可以直接写成 TS 联合类型。
+/// `shape` / `textBox` / `pageBreak` / `unsupported`），字段名统一 camelCase，
+/// 前端可以直接写成 TS 联合类型。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum Block {
@@ -58,6 +63,9 @@ pub enum Block {
     /// （VML 的 `v:line` / `v:rect` / `v:roundrect` / `v:oval` / `v:hr`，
     ///   DrawingML 的 `wps:wsp` + `a:prstGeom`）。识别不出来的形状仍走 [`Block::Unsupported`]。
     Shape(ShapeBlock),
+    /// 文本框：里面的内容**结构化**成块（封面、表单、页脚里的框都用它）。
+    /// 空文本框、或压根没有内容的形状才退回 [`Block::Unsupported`]。
+    TextBox(TextBoxBlock),
     /// 显式分页符（`<w:br w:type="page"/>` 独占一段时）
     PageBreak,
     /// 无法呈现的对象 —— **绝不静默丢失**，前端显示占位卡片 + 中文说明
@@ -155,6 +163,19 @@ pub struct ListInfo {
     pub suffix: String,
 }
 
+/// 会跟着分页变的域类型。
+///
+/// 这类域在 XML 里存的是**上次保存时的缓存结果**（页脚里的 `2`、`30`、`I`、`II` 都是它），
+/// 前端拿到实际页序后要用实时值替换，所以标记要一路带到 run 上（`Run::field`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum FieldKind {
+    /// `PAGE`：当前页码
+    Page,
+    /// `NUMPAGES`：总页数
+    NumPages,
+}
+
 /// 文本片段（run）。布尔值都是"最终生效"的结果，不是原始值。
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -178,6 +199,9 @@ pub struct Run {
     pub vert_align: Option<String>,
     /// 字符样式 id（`w:rStyle@w:val`）
     pub style_id: Option<String>,
+    /// 这个 run 的文本是**域缓存结果**（`PAGE` / `NUMPAGES`）时要替换成实时值；
+    /// 其余 run 一律 `None`
+    pub field: Option<FieldKind>,
 }
 
 /// 表格块
@@ -297,6 +321,35 @@ pub struct ShapeBlock {
     pub vertical: bool,
 }
 
+/// 文本框。**内容是真解析出来的块**（段落/表格/图片/嵌套块走同一套样式层叠与编号），
+/// 不是一张占位卡片 —— 企业标准的封面整页、表单里的签字框都是文本框。
+///
+/// `xPt`/`yPt` 与 [`ShapeBlock`] 同义：Word 对**内联**文本框不记录段落内偏移，
+/// 拿不到就是 0（前端按"就在这个 run 的位置"处理）；浮动文本框给的是它自己声明的偏移。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextBoxBlock {
+    /// 文本框内部的块
+    pub blocks: Vec<Block>,
+    /// 相对段落内容区左上角的横向偏移（pt；拿不到为 0）
+    pub x_pt: f64,
+    /// 纵向偏移（pt）
+    pub y_pt: f64,
+    /// 宽（pt；拿不到给 200pt 兜底）
+    pub width_pt: f64,
+    /// 高（pt；拿不到给 40pt 兜底）
+    pub height_pt: f64,
+    /// 填充色 RRGGBB（无填充 / 拿不到为 `null`）
+    pub fill_color: Option<String>,
+    /// 边框色 RRGGBB
+    pub border_color: Option<String>,
+    /// 边框线宽（pt）
+    pub border_width_pt: Option<f64>,
+    /// 环绕方式原值：square / none / tight / through / topAndBottom
+    /// （前端只用它判断"是不是浮动对象"；内联文本框给 `none`）
+    pub wrap: String,
+}
+
 /// `document_blocks` 的返回：窗口化的块 + 总数（前端虚拟滚动用）
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -310,6 +363,10 @@ pub struct BlockPage {
     pub encrypted: bool,
     /// 页面几何（"一页一页"显示时前端算分页要用）；文档里没有 `w:sectPr` 时为 `None`
     pub page: Option<PageGeometry>,
+    /// **文档自己的页眉**（`w:headerReference`，默认页眉）解析出的块；没有就是 `None`
+    pub header: Option<Vec<Block>>,
+    /// **文档自己的页脚**（`w:footerReference`，默认页脚）解析出的块
+    pub footer: Option<Vec<Block>>,
 }
 
 /// 页面几何：取自 `w:sectPr` 的 `w:pgSz` / `w:pgMar`（单位统一 pt，twip ÷ 20）。
@@ -374,6 +431,8 @@ pub struct DocumentPart {
 
 /// 一个极简 DOM。docx 的 XML 单部件通常几百 KB ~ 几 MB，建成树再按名字查最省心，
 /// 也避免手写状态机在"未知节点"上丢内容。用完即随 `ParsedDocument` 一起释放。
+/// （`Clone` 是给页眉/页脚的"独立故事"用的：那些部件需要自己持有一棵树。）
+#[derive(Clone)]
 struct XmlNode {
     /// **原始限定名**（如 `w:pStyle`），保留下来是为了在占位说明里报出真实节点名
     name: String,
@@ -381,6 +440,7 @@ struct XmlNode {
     children: Vec<XmlChild>,
 }
 
+#[derive(Clone)]
 enum XmlChild {
     Elem(XmlNode),
     Text(String),
@@ -1039,6 +1099,26 @@ fn east_asian_typeface(font_node: &XmlNode) -> Option<String> {
         }
     }
     None
+}
+
+/// 用最终生效的字符属性造一个 [`Run`]。
+/// 空结果的域（`PAGE`/`NUMPAGES` 没有缓存文本）也要产出 run，所以构造逻辑抽出来共用。
+fn run_of(rpr: &RunProps, text: String, style_id: Option<String>, field: Option<FieldKind>) -> Run {
+    Run {
+        text,
+        bold: rpr.bold.unwrap_or(false),
+        italic: rpr.italic.unwrap_or(false),
+        underline: rpr.underline.unwrap_or(false),
+        strike: rpr.strike.unwrap_or(false),
+        font: rpr.font_latin.clone(),
+        font_east_asia: rpr.font_ea.clone(),
+        size_pt: rpr.size_half_pt.map(|half| half / 2.0),
+        color: rpr.color.clone(),
+        highlight: rpr.highlight.clone(),
+        vert_align: rpr.vert_align.clone(),
+        style_id,
+        field,
+    }
 }
 
 /// `w:rPr` → 字符属性
@@ -1849,6 +1929,97 @@ struct ParagraphContent {
     objects: Vec<Block>,
     /// 段落里出现过 `<w:br w:type="page"/>`
     page_break: bool,
+    /// 域（`PAGE` / `NUMPAGES`）的状态：Word 把 begin / instrText / separate / end
+    /// 拆在**多个 run** 里，所以要跨 run 记状态
+    field: FieldState,
+}
+
+/// 域解析状态。用**栈**做嵌套域的深度计数（`IF` 里套 `PAGE` 很常见）。
+#[derive(Default)]
+struct FieldState {
+    /// 每个未结束的域一层：是否已经 `separate`（之后的文本就是缓存结果）+ 指令原文
+    frames: Vec<FieldFrame>,
+    /// `w:fldSimple`（属性式域，`w:instr=" PAGE "`）：里面的 run 全是缓存结果
+    simple: Option<FieldKind>,
+}
+
+#[derive(Default)]
+struct FieldFrame {
+    /// 已经遇到 `separate`：后面的文本就是缓存结果
+    separated: bool,
+    /// 指令文本（`w:instrText` 可能跨若干 run）
+    instruction: String,
+    /// 结果区里出现过非空的 `w:t` 吗（没有就要补一个带标记的空 run，见 `on_fld_char`）
+    text_seen: bool,
+}
+
+impl FieldState {
+    /// `w:fldChar@w:fldCharType`：begin 入栈 / separate 标记 / end 出栈
+    /// （注意属性名是 `w:fldCharType`，本地名不是 `type`）。
+    ///
+    /// `end` 时如果这个域**已识别（PAGE/NUMPAGES）、已经算过（separate）、
+    /// 但结果区里一个字的缓存结果都没有**，返回它的类型：调用方要补一个带标记的空 run。
+    /// 否则渲染器没有可替换的对象 —— 新建、或从未打印过的文档，页脚页码会是一片空白。
+    fn on_fld_char(&mut self, node: &XmlNode) -> Option<FieldKind> {
+        match node.attr_local("fldCharType").map(str::trim) {
+            Some("begin") => self.frames.push(FieldFrame::default()),
+            Some("separate") => {
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.separated = true;
+                }
+            }
+            Some("end") => {
+                // 多出来的 end（XML 有毛病）不该把已有状态清空
+                let frame = self.frames.pop()?;
+                if frame.separated && !frame.text_seen {
+                    return field_kind_from_instruction(&frame.instruction);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// `w:instrText`：拼到最近一层未结束的域的指令里
+    fn on_instruction(&mut self, text: &str) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.instruction.push_str(text);
+        }
+    }
+
+    /// 结果区里读到了非空的 `w:t`：给所有"已算过"的域记一笔
+    /// （嵌套时外层域也不该再补一个空 run）
+    fn note_text(&mut self) {
+        for frame in self.frames.iter_mut().filter(|frame| frame.separated) {
+            frame.text_seen = true;
+        }
+    }
+
+    /// 当前文本是不是"会变的域"的缓存结果。
+    /// 从最内层往外找第一个**已经 separate** 的域：它的指令决定这段文本的性质 ——
+    /// 是 `PAGE`/`NUMPAGES` 就标记，是别的域（`DATE`/`REF`…）就返回 `None`（行为完全不变）。
+    fn result_kind(&self) -> Option<FieldKind> {
+        if self.simple.is_some() {
+            return self.simple;
+        }
+        for frame in self.frames.iter().rev() {
+            if frame.separated {
+                return field_kind_from_instruction(&frame.instruction);
+            }
+        }
+        None
+    }
+}
+
+/// 域指令 → 域类型。指令形如 `PAGE`、` PAGE `、`PAGE \* MERGEFORMAT`、`NUMPAGES \* Arabic`：
+/// 取**第一个词**判断、大小写不敏感；只认 `PAGE` 与 `NUMPAGES`，其它一律 `None`。
+fn field_kind_from_instruction(instruction: &str) -> Option<FieldKind> {
+    let word = instruction.split_whitespace().next()?;
+    match word.to_ascii_uppercase().as_str() {
+        "PAGE" => Some(FieldKind::Page),
+        "NUMPAGES" => Some(FieldKind::NumPages),
+        _ => None,
+    }
 }
 
 impl ParagraphContent {
@@ -1894,6 +2065,16 @@ impl<'a> DocBuilder<'a> {
             column_width_pt,
             current_width_pt: column_width_pt,
         }
+    }
+
+    /// 解析一段独立"故事"（页眉 / 页脚）：编号计数器**进出都还原**，
+    /// 而且故事里从零开始计数 —— 页眉里的"1."就是 1，不继承正文、也不影响正文。
+    fn parse_story(&mut self, container: &XmlNode) -> Vec<Block> {
+        let saved = std::mem::take(&mut self.numbering_state.counters);
+        let mut blocks = Vec::new();
+        self.collect_blocks(container, &mut blocks);
+        self.numbering_state.counters = saved;
+        blocks
     }
 
     /// 容器（body / tc / sdtContent）的直接子元素 → 有序块
@@ -2115,11 +2296,45 @@ impl<'a> DocBuilder<'a> {
                     self.walk_inline(child, base_rpr, style.as_deref(), content);
                 }
             }
-            "ins" | "smartTag" | "customXml" | "fldSimple" | "moveTo" => {
+            "ins" | "smartTag" | "customXml" | "moveTo" => {
                 for child in node.children() {
                     self.walk_inline(child, base_rpr, char_style, content);
                 }
             }
+            // 属性式域（`<w:fldSimple w:instr=" PAGE ">`）：里面的 run 就是缓存结果，
+            // 没有 begin/separate，标记直接由 w:instr 决定
+            "fldSimple" => {
+                let saved = content.field.simple;
+                let kind = node.attr_local("instr").and_then(field_kind_from_instruction);
+                let before = content.runs.len();
+                content.field.simple = kind;
+                for child in node.children() {
+                    self.walk_inline(child, base_rpr, char_style, content);
+                }
+                content.field.simple = saved;
+                // 还没来得及算结果的属性式域（里面没有缓存文本）：同样补一个带标记的空 run
+                if let Some(kind) = kind {
+                    if content.runs.len() == before {
+                        content.runs.push(Run {
+                            text: String::new(),
+                            field: Some(kind),
+                            ..Run::default()
+                        });
+                    }
+                }
+            }
+            // 域的分隔元素偶尔会直接挂在段落上（不包在 w:r 里）
+            "fldChar" => {
+                if let Some(kind) = content.field.on_fld_char(node) {
+                    // 空结果的域：补一个带标记的空 run（详见 FieldState::on_fld_char）
+                    content.runs.push(Run {
+                        text: String::new(),
+                        field: Some(kind),
+                        ..Run::default()
+                    });
+                }
+            }
+            "instrText" => content.field.on_instruction(&node.texts()),
             "sdt" => {
                 if let Some(inner) = node.child("sdtContent") {
                     for child in inner.children() {
@@ -2128,7 +2343,7 @@ impl<'a> DocBuilder<'a> {
                 }
             }
             // 修订痕迹：只显示最终态 —— w:del 里的文字不显示，w:ins 里的显示
-            "del" | "moveFrom" | "delText" | "instrText" => {}
+            "del" | "moveFrom" | "delText" => {}
             "oMath" | "oMathPara" => {
                 let plain = node.collect_text();
                 let detail = if plain.trim().is_empty() {
@@ -2145,15 +2360,22 @@ impl<'a> DocBuilder<'a> {
             "pict" => self.handle_pict(node, content),
             "object" => self.handle_object(node, content),
             "txbxContent" => {
-                let plain = node.collect_text();
-                let detail = if plain.trim().is_empty() {
-                    "文本框内容无法显示，Word / WPS 可正常显示".to_string()
-                } else {
-                    format!("文本框内容（纯文本）：{}", plain.trim())
-                };
-                content
-                    .objects
-                    .push(unsupported("文本框（暂不支持显示）", detail));
+                // 直接撞见文本框内容（例如别的包装节点里）：内容才是重点，几何用兜底值
+                let look = self.text_box_look(node);
+                match self.text_box(node, look) {
+                    Some(text_box) => content.objects.push(Block::TextBox(text_box)),
+                    None => {
+                        let plain = node.collect_text();
+                        let detail = if plain.trim().is_empty() {
+                            "文本框里没有内容".to_string()
+                        } else {
+                            format!("文本框内容（纯文本）：{}", plain.trim())
+                        };
+                        content
+                            .objects
+                            .push(unsupported("文本框（暂不支持显示）", detail));
+                    }
+                }
             }
             // 段落/表格/单元格属性、锚点、书签：都不是可显示内容
             "pPr" | "rPr" | "tblPr" | "trPr" | "tcPr" | "sectPr" | "bookmarkStart"
@@ -2230,9 +2452,23 @@ impl<'a> DocBuilder<'a> {
         rpr.apply_over(base_rpr);
 
         let mut text = String::new();
+        // 这个 run 的文本是不是某个"会变的域"的缓存结果（`PAGE` / `NUMPAGES`）
+        let mut field: Option<FieldKind> = None;
         for child in node.children() {
             match child.local() {
-                "t" => text.push_str(&child.texts()),
+                "t" => {
+                    // 取**取文本那一刻**的域状态：`<w:r><w:fldChar begin/><w:instrText>..</w:instrText>
+                    // <w:fldChar separate/><w:t>2</w:t><w:fldChar end/></w:r>` 这种"全塞一个 run"
+                    // 的写法也要标对（run 结束时的状态早就出栈了）
+                    let piece = child.texts();
+                    if !piece.is_empty() {
+                        content.field.note_text();
+                        if field.is_none() {
+                            field = content.field.result_kind();
+                        }
+                    }
+                    text.push_str(&piece);
+                }
                 "tab" => text.push('\t'),
                 "br" => {
                     // 分页符：独占一段时整段变成 PageBreak 块；与文字混排时保留换行
@@ -2242,6 +2478,15 @@ impl<'a> DocBuilder<'a> {
                     text.push('\n');
                 }
                 "cr" => text.push('\n'),
+                // 域的四个部分：指令文本（w:instrText）**永远不当正文输出**（Word 里它也不可见）
+                "fldChar" => {
+                    // 已识别、已算过、但结果区里一个字的缓存结果都没有 → 补一个带标记的空 run，
+                    // 否则渲染器没有可替换的对象（新建文档的页脚会是一片空白）
+                    if let Some(kind) = content.field.on_fld_char(child) {
+                        content.runs.push(run_of(&rpr, String::new(), run_style.clone(), Some(kind)));
+                    }
+                }
+                "instrText" => content.field.on_instruction(&child.texts()),
                 "sym" => {
                     // 符号字符（`w:sym@w:char` 是十六进制码位）
                     if let Some(code) = child
@@ -2259,15 +2504,21 @@ impl<'a> DocBuilder<'a> {
                 "pict" => self.handle_pict(child, content),
                 "object" => self.handle_object(child, content),
                 "txbxContent" => {
-                    let plain = child.collect_text();
-                    let detail = if plain.trim().is_empty() {
-                        "文本框内容无法显示，Word / WPS 可正常显示".to_string()
-                    } else {
-                        format!("文本框内容（纯文本）：{}", plain.trim())
-                    };
-                    content
-                        .objects
-                        .push(unsupported("文本框（暂不支持显示）", detail));
+                    let look = self.text_box_look(child);
+                    match self.text_box(child, look) {
+                        Some(text_box) => content.objects.push(Block::TextBox(text_box)),
+                        None => {
+                            let plain = child.collect_text();
+                            let detail = if plain.trim().is_empty() {
+                                "文本框里没有内容".to_string()
+                            } else {
+                                format!("文本框内容（纯文本）：{}", plain.trim())
+                            };
+                            content
+                                .objects
+                                .push(unsupported("文本框（暂不支持显示）", detail));
+                        }
+                    }
                 }
                 "oMath" | "oMathPara" => {
                     let plain = child.collect_text();
@@ -2286,20 +2537,9 @@ impl<'a> DocBuilder<'a> {
         }
 
         if !text.is_empty() {
-            content.runs.push(Run {
-                text,
-                bold: rpr.bold.unwrap_or(false),
-                italic: rpr.italic.unwrap_or(false),
-                underline: rpr.underline.unwrap_or(false),
-                strike: rpr.strike.unwrap_or(false),
-                font: rpr.font_latin,
-                font_east_asia: rpr.font_ea,
-                size_pt: rpr.size_half_pt.map(|half| half / 2.0),
-                color: rpr.color,
-                highlight: rpr.highlight,
-                vert_align: rpr.vert_align,
-                style_id: run_style,
-            });
+            content
+                .runs
+                .push(run_of(&rpr, text, run_style.clone(), field));
         }
     }
 
@@ -2369,16 +2609,26 @@ impl<'a> DocBuilder<'a> {
             return;
         }
 
-        if node.has_descendant("txbxContent") {
-            let plain = node.collect_text();
-            let detail = if plain.trim().is_empty() {
-                "文本框内容无法显示，Word / WPS 可正常显示".to_string()
-            } else {
-                format!("文本框内容（纯文本）：{}", plain.trim())
-            };
-            content
-                .objects
-                .push(unsupported("文本框（暂不支持显示）", detail));
+        // 文本框：内容**结构化**成块（封面整页、表单签字框都是它）
+        if let Some(content_node) = node.find_descendant("txbxContent") {
+            let look = self.text_box_look(node);
+            match self.text_box(content_node, look) {
+                Some(text_box) => {
+                    content.objects.push(Block::TextBox(text_box));
+                }
+                // 空文本框：仍然给占位（不静默丢）
+                None => {
+                    let plain = node.collect_text();
+                    let detail = if plain.trim().is_empty() {
+                        "文本框里没有内容".to_string()
+                    } else {
+                        format!("文本框内容（纯文本）：{}", plain.trim())
+                    };
+                    content
+                        .objects
+                        .push(unsupported("文本框（暂不支持显示）", detail));
+                }
+            }
             return;
         }
 
@@ -2499,16 +2749,23 @@ impl<'a> DocBuilder<'a> {
             content.objects.push(Block::Image(image));
             return;
         }
-        if node.has_descendant("textbox") || node.has_descendant("txbxContent") {
-            let plain = node.collect_text();
-            let detail = if plain.trim().is_empty() {
-                "文本框内容无法显示，Word / WPS 可正常显示".to_string()
-            } else {
-                format!("文本框内容（纯文本）：{}", plain.trim())
-            };
-            content
-                .objects
-                .push(unsupported("文本框（暂不支持显示）", detail));
+        // VML 文本框（`v:shape` + `v:textbox`）：内容结构化，别只给占位
+        if let Some(content_node) = node.find_descendant("txbxContent") {
+            let look = self.text_box_look(node);
+            match self.text_box(content_node, look) {
+                Some(text_box) => content.objects.push(Block::TextBox(text_box)),
+                None => {
+                    let plain = node.collect_text();
+                    let detail = if plain.trim().is_empty() {
+                        "文本框里没有内容".to_string()
+                    } else {
+                        format!("文本框内容（纯文本）：{}", plain.trim())
+                    };
+                    content
+                        .objects
+                        .push(unsupported("文本框（暂不支持显示）", detail));
+                }
+            }
             return;
         }
         // 逐个**直接子形状**处理：一个 w:pict 里可能画了好几条线；
@@ -2523,6 +2780,104 @@ impl<'a> DocBuilder<'a> {
                 ));
             }
         }
+    }
+
+    /// 文本框的几何 / 外观。取值优先级按"谁能给准就用谁"：
+    /// 尺寸 `a:ext`（EMU）→ VML style 的 width/height → `wp:extent` → 兜底 200×40pt；
+    /// 偏移 `a:off`（EMU）→ VML style 的 margin-left/top → 0；
+    /// 填充与边框两套写法（DrawingML 的 `a:solidFill`/`a:ln`、VML 的 `fillcolor`/`strokecolor`）都认。
+    fn text_box_look(&self, node: &XmlNode) -> TextBoxLook {
+        let mut look = TextBoxLook::default();
+        let sp_pr = node
+            .find_descendant("wsp")
+            .and_then(|wsp| wsp.find_descendant("spPr"));
+
+        // ---- 尺寸 ----
+        if let Some(size) = sp_pr
+            .and_then(|sp| sp.find_descendant("xfrm"))
+            .and_then(|xfrm| xfrm.child("ext"))
+            .and_then(emu_extent)
+        {
+            (look.width_pt, look.height_pt) = size;
+        } else if let Some(style) = vml_shape_style(node) {
+            let (width, height, _) = vml_style_size(style);
+            if let Some(width) = width.filter(|value| *value > 0.0) {
+                look.width_pt = width;
+            }
+            if let Some(height) = height.filter(|value| *value > 0.0) {
+                look.height_pt = height;
+            }
+        } else if let Some(size) = node.find_descendant("extent").and_then(emu_extent) {
+            (look.width_pt, look.height_pt) = size;
+        }
+
+        // ---- 偏移 ----
+        if let Some(off) = sp_pr
+            .and_then(|sp| sp.find_descendant("xfrm"))
+            .and_then(|xfrm| xfrm.child("off"))
+        {
+            look.x_pt = number_f64(off.attr_local("x")).unwrap_or(0.0) / EMU_PER_PT;
+            look.y_pt = number_f64(off.attr_local("y")).unwrap_or(0.0) / EMU_PER_PT;
+        } else if let Some(style) = vml_shape_style(node) {
+            look.x_pt = vml_style_length(style, &["margin-left", "left"]).unwrap_or(0.0);
+            look.y_pt = vml_style_length(style, &["margin-top", "top"]).unwrap_or(0.0);
+        }
+
+        // ---- 填充 / 边框 ----
+        if let Some(sp_pr) = sp_pr {
+            look.fill_color = drawing_fill(sp_pr);
+            let (width, color) = drawing_line(sp_pr);
+            look.border_width_pt = width;
+            look.border_color = color;
+        }
+        if let Some(shape) = vml_shape_node(node) {
+            let filled = !matches!(
+                shape.attr_local("filled"),
+                Some("f") | Some("false") | Some("0")
+            );
+            if look.fill_color.is_none() && filled {
+                look.fill_color = shape.attr_local("fillcolor").and_then(normalize_color_strict);
+            }
+            if look.border_color.is_none() {
+                look.border_color = shape.attr_local("strokecolor").and_then(normalize_color_strict);
+            }
+            if look.border_width_pt.is_none() {
+                look.border_width_pt = shape
+                    .attr_local("strokeweight")
+                    .and_then(parse_style_length)
+                    .map(|(value, factor)| value * factor);
+            }
+        }
+
+        look.wrap = drawing_wrap(node)
+            .or_else(|| vml_shape_style(node).and_then(vml_wrap))
+            .unwrap_or_else(|| "none".to_string());
+        look
+    }
+
+    /// `w:txbxContent` → [`TextBoxBlock`]：内容走**同一套**块解析（段落样式层叠、编号、嵌套表格…）。
+    /// 返回 `None` 表示里面没有任何块（空文本框），调用方给占位块。
+    fn text_box(&mut self, content_node: &XmlNode, look: TextBoxLook) -> Option<TextBoxBlock> {
+        let mut blocks = Vec::new();
+        // 文本框是独立的"故事"（story）：它自己的列表从 1 开始数，
+        // 也不会把正文的编号计数器往后推 —— 所以计数器进出都还原。
+        let saved = std::mem::take(&mut self.numbering_state.counters);
+        self.collect_blocks(content_node, &mut blocks);
+        self.numbering_state.counters = saved;
+        if blocks.is_empty() {
+            return None;
+        }
+        Some(TextBoxBlock {
+            blocks,
+            x_pt: look.x_pt,
+            y_pt: look.y_pt,
+            width_pt: look.width_pt,
+            height_pt: look.height_pt,
+            fill_color: look.fill_color,
+            border_color: look.border_color,
+            border_width_pt: look.border_width_pt,
+            wrap: look.wrap,
+        })
     }
 
     /// VML 形状（`v:line` / `v:rect` / `v:roundrect` / `v:oval` / `v:hr`）→ [`ShapeBlock`]。
@@ -3010,6 +3365,130 @@ fn attr_is_on(node: &XmlNode, name: &str) -> bool {
     }
 }
 
+/// 文本框拿不到尺寸时的兜底（pt）—— 宁可给个能看见的框，也不要尺寸为 0 让内容消失
+const TEXTBOX_FALLBACK_PT: (f64, f64) = (200.0, 40.0);
+
+/// 文本框的几何与外观（[`DocBuilder::text_box_look`] 的产物）
+struct TextBoxLook {
+    x_pt: f64,
+    y_pt: f64,
+    width_pt: f64,
+    height_pt: f64,
+    fill_color: Option<String>,
+    border_color: Option<String>,
+    border_width_pt: Option<f64>,
+    wrap: String,
+}
+
+impl Default for TextBoxLook {
+    fn default() -> Self {
+        TextBoxLook {
+            x_pt: 0.0,
+            y_pt: 0.0,
+            width_pt: TEXTBOX_FALLBACK_PT.0,
+            height_pt: TEXTBOX_FALLBACK_PT.1,
+            fill_color: None,
+            border_color: None,
+            border_width_pt: None,
+            wrap: "none".to_string(),
+        }
+    }
+}
+
+/// `a:ext` / `wp:extent`（EMU）→ `(宽 pt, 高 pt)`；缺 cx/cy 或非数字返回 `None`
+fn emu_extent(node: &XmlNode) -> Option<(f64, f64)> {
+    let cx = number_f64(node.attr_local("cx").or_else(|| node.attr_local("w")))?;
+    let cy = number_f64(node.attr_local("cy").or_else(|| node.attr_local("h")))?;
+    Some((cx / EMU_PER_PT, cy / EMU_PER_PT))
+}
+
+/// `a:sfrgba`…——DrawingML 填充色。只看 `spPr` 的**直接子** `a:solidFill`：
+/// `a:ln/a:solidFill` 是描边色，别混进来。
+fn drawing_fill(sp_pr: &XmlNode) -> Option<String> {
+    sp_pr
+        .child("solidFill")
+        .and_then(|fill| fill.find_descendant("srgbClr").or_else(|| fill.find_descendant("sysClr")))
+        .and_then(|color| color.attr("val").or_else(|| color.attr("lastClr")))
+        .and_then(normalize_color_strict)
+}
+
+/// DrawingML 描边：`spPr/a:ln@w`（EMU → pt）与 `a:ln` 里的颜色
+fn drawing_line(sp_pr: &XmlNode) -> (Option<f64>, Option<String>) {
+    let Some(line) = sp_pr.child("ln") else {
+        return (None, None);
+    };
+    let width = number_f64(line.attr("w"))
+        .filter(|value| *value > 0.0)
+        .map(|emu| emu / EMU_PER_PT);
+    let color = line
+        .find_descendant("srgbClr")
+        .or_else(|| line.find_descendant("sysClr"))
+        .and_then(|color| color.attr("val").or_else(|| color.attr("lastClr")))
+        .and_then(normalize_color_strict);
+    (width, color)
+}
+
+/// DrawingML 环绕方式：`wp:anchor` 里的 `wp:wrapXxx` 子节点 → `square` / `none` / `tight` /
+/// `through` / `topAndBottom`；内联（没有 `wp:anchor`）返回 `None`（由调用方定 "none"）。
+fn drawing_wrap(node: &XmlNode) -> Option<String> {
+    let anchor = node.child("anchor")?;
+    for child in anchor.children() {
+        let Some(kind) = child.local().strip_prefix("wrap") else {
+            continue;
+        };
+        let mut chars = kind.chars();
+        let first = chars.next().unwrap_or('n').to_ascii_lowercase();
+        return Some(format!("{first}{}", chars.as_str()));
+    }
+    None
+}
+
+/// VML 形状节点：`w:pict` 的直接子形状，或（`w:object` 那种）后代里的第一个
+fn vml_shape_node(node: &XmlNode) -> Option<&XmlNode> {
+    if matches!(
+        node.local(),
+        "shape" | "rect" | "roundrect" | "oval" | "line" | "group" | "polyline"
+    ) {
+        return Some(node);
+    }
+    node.children().find(|child| {
+        matches!(
+            child.local(),
+            "shape" | "rect" | "roundrect" | "oval" | "line" | "group" | "polyline"
+        )
+    })
+}
+
+/// VML 形状的 `style` 字符串（`w:pict` 节点或形状节点都能给）
+fn vml_shape_style(node: &XmlNode) -> Option<&str> {
+    vml_shape_node(node)?.attr("style")
+}
+
+/// VML 的 `mso-wrap-style` → 与 DrawingML 同一套环绕名字
+fn vml_wrap(style: &str) -> Option<String> {
+    let value = vml_style_named(style, "mso-wrap-style")?;
+    Some(match value.to_ascii_lowercase().as_str() {
+        "square" => "square".to_string(),
+        "tight" => "tight".to_string(),
+        "through" => "through".to_string(),
+        "topandbottom" => "topAndBottom".to_string(),
+        _ => "none".to_string(),
+    })
+}
+
+/// 从 VML `style` 里取一个**非长度**的具名属性值（`mso-wrap-style:square`）
+fn vml_style_named<'a>(style: &'a str, name: &str) -> Option<&'a str> {
+    for part in style.split(';') {
+        let Some((key, value)) = part.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case(name) {
+            return Some(value.trim());
+        }
+    }
+    None
+}
+
 /// 占位块构造（`label` 是给用户看的中文说明）
 fn unsupported(label: &str, detail: impl Into<String>) -> Block {
     Block::Unsupported {
@@ -3037,6 +3516,14 @@ fn block_plain_text(block: &Block) -> String {
         Block::Image(image) => image.name.clone().unwrap_or_default(),
         // 形状没有文字（查找"直线/方框"没有意义，别污染搜索结果）
         Block::Shape(_) => String::new(),
+        // 文本框里的文字是**正文内容**（封面标题、表单字段…），要能被搜到
+        Block::TextBox(text_box) => text_box
+            .blocks
+            .iter()
+            .map(block_plain_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
         Block::PageBreak => String::new(),
         Block::Unsupported { label, detail } => {
             if detail.is_empty() {
@@ -3064,6 +3551,10 @@ struct ParsedDocument {
     encrypted: bool,
     /// 页面几何（`w:sectPr`；缺失为 None）。解析一次缓存起来，每次取窗口都带上。
     page: Option<PageGeometry>,
+    /// 文档自己的页眉（`w:headerReference`，默认页眉）
+    header: Option<Vec<Block>>,
+    /// 文档自己的页脚
+    footer: Option<Vec<Block>>,
 }
 
 /// 缓存最近打开的 2 个文档（只读查看，缓存是安全的；解析大文档要几十毫秒，虚拟滚动会反复要）
@@ -3164,7 +3655,8 @@ fn parse_document(bytes: &[u8], encrypted: bool) -> Result<ParsedDocument, Strin
     let numbering = Numbering::parse(&numbering_xml);
     let rels = parse_rels(&rels_xml);
     // 页面几何要先算：`v:hr`（整栏宽的水平线）之类的形状需要栏宽，块构建时就要用
-    let page = find_section_properties(body).map(parse_page_geometry);
+    let section = find_section_properties(body);
+    let page = section.map(parse_page_geometry);
 
     let mut builder = DocBuilder::new(&styles, &numbering, &theme, &rels, page.as_ref());
     let mut blocks = Vec::new();
@@ -3177,13 +3669,128 @@ fn parse_document(bytes: &[u8], encrypted: bool) -> Result<ParsedDocument, Strin
         .filter(|(_, text)| !text.trim().is_empty())
         .collect();
 
+    // 文档自己的页眉页脚（`w:headerReference` / `w:footerReference`）：
+    // 各自是一个独立"故事"，里面的列表编号不该扰动正文计数器。
+    // 故事里"什么都没有"（全是空段落，例如只有一个占位的空页脚）时按 `None` 返回，
+    // 免得前端为一片空白留出页眉页脚的高度。
+    let header = read_story(&mut zip, &rels, body, "headerReference", "hdr")
+        .map(|container| builder.parse_story(&container))
+        .filter(|blocks| !story_is_empty(blocks));
+    let footer = read_story(&mut zip, &rels, body, "footerReference", "ftr")
+        .map(|container| builder.parse_story(&container))
+        .filter(|blocks| !story_is_empty(blocks));
+
     Ok(ParsedDocument {
         blocks,
         search_index,
         paragraph_count: builder.paragraph_count,
         encrypted,
         page,
+        header,
+        footer,
     })
+}
+
+/// 解析一段独立"故事"（页眉 / 页脚 / 文本框都能用）：
+/// 先把编号计数器存档，解析完再还原 —— 故事里的编号与正文互不影响。
+fn read_story(
+    zip: &mut ZipArchive<Cursor<&[u8]>>,
+    rels: &HashMap<String, RelInfo>,
+    body: &XmlNode,
+    reference: &str,
+    root_local: &str,
+) -> Option<XmlNode> {
+    let target = story_target(body, rels, reference)?;
+    let xml = read_part_lossy(zip, &target)?;
+    parse_story_xml(&xml, root_local)
+}
+
+/// 按**文档顺序**列出所有分节设置：先段落级的（分节符，各自代表它前面那一节），
+/// 最后是 `w:body/w:sectPr`（Word 把最后一节的设置放在这儿）。
+fn sections_in_order(body: &XmlNode) -> Vec<&XmlNode> {
+    let mut sections: Vec<&XmlNode> = Vec::new();
+    for child in body.children() {
+        if child.local() != "p" {
+            continue;
+        }
+        if let Some(section) = child.child("pPr").and_then(|ppr| ppr.child("sectPr")) {
+            sections.push(section);
+        }
+    }
+    if let Some(section) = body.children().find(|child| child.local() == "sectPr") {
+        sections.push(section);
+    }
+    sections
+}
+
+/// 页眉/页脚的部件路径。
+///
+/// **多节文档只给一套**（前端一页一页显示时页眉页脚也是一套）：从**最后一节**往前找，
+/// 谁先给了 `w:type="default"` 就用谁；全都没有 default 时退回"能找到的第一个引用"。
+/// 真实的企业标准就是这么分节的：封面一节、正文一节、附件一节，各自带自己的页眉页脚，
+/// 若只看 `w:body/w:sectPr`（最后一节只有个页码页脚）会连"Q/…"这种标准号页眉都拿不到。
+///
+/// 已知取舍：**"首页不同"（`w:titlePg`）与奇偶页不区分**，同一节里优先 default。
+fn story_target(body: &XmlNode, rels: &HashMap<String, RelInfo>, reference: &str) -> Option<String> {
+    let sections = sections_in_order(body);
+    for want_default in [true, false] {
+        for section in sections.iter().rev() {
+            if let Some(target) = reference_target(section, rels, reference, want_default) {
+                return Some(target);
+            }
+        }
+    }
+    None
+}
+
+/// 单节里找 `w:headerReference` / `w:footerReference`：`want_default` 决定这一轮要哪种
+/// `w:type`（缺省按 default 处理，宽容一点别把能读的页眉丢了）。
+fn reference_target(
+    section: &XmlNode,
+    rels: &HashMap<String, RelInfo>,
+    reference: &str,
+    want_default: bool,
+) -> Option<String> {
+    for node in section.children_named(reference) {
+        let Some(id) = node.attr_local("id") else {
+            continue;
+        };
+        let Some(rel) = rels.get(id) else {
+            continue;
+        };
+        let is_default = node
+            .attr_local("type")
+            .map(|kind| kind == "default")
+            .unwrap_or(true);
+        if is_default == want_default {
+            return Some(rel.target.clone());
+        }
+    }
+    None
+}
+
+/// 页眉/页脚里"什么都没有"（全是空段落）→ 当成没有。
+/// 真实文档里空页脚很常见（有些只是为了让各节页脚高度对齐），前端不该为它留白。
+fn story_is_empty(blocks: &[Block]) -> bool {
+    blocks.iter().all(|block| match block {
+        Block::Paragraph(paragraph) => paragraph.runs.iter().all(|run| run.text.trim().is_empty()),
+        // 图片 / 表格 / 形状 / 文本框都算"有东西"
+        _ => false,
+    })
+}
+
+/// 解析页眉/页脚部件 → 内容容器（`w:hdr` / `w:ftr`）。
+/// 少数生成器会多包一层，找不到就深度搜索；再找不到就把整棵树当容器。
+fn parse_story_xml(xml: &str, root_local: &str) -> Option<XmlNode> {
+    let root = parse_xml(xml)?;
+    if root.local() == root_local {
+        return Some(root);
+    }
+    Some(
+        root.find_descendant(root_local)
+            .cloned()
+            .unwrap_or(root),
+    )
 }
 
 /// 找页面设置（`w:sectPr`）：
@@ -3402,6 +4009,8 @@ pub fn document_blocks(path: String, from: usize, count: usize) -> Result<BlockP
         blocks: doc.blocks[from..end].to_vec(),
         encrypted: doc.encrypted,
         page: doc.page.clone(),
+        header: doc.header.clone(),
+        footer: doc.footer.clone(),
     })
 }
 
@@ -4226,14 +4835,15 @@ mod tests {
                 Block::Table(_) => "表格",
                 Block::Image(_) => "图片",
                 Block::Shape(_) => "形状",
+                Block::TextBox(_) => "文本框",
                 Block::PageBreak => "分页",
                 Block::Unsupported { .. } => "占位",
             })
             .collect();
         assert_eq!(
             shape,
-            vec!["占位", "占位", "图片", "占位", "占位", "占位", "段落", "占位"],
-            "每个不认识的节点都要有落点，绝不能静默消失"
+            vec!["占位", "占位", "图片", "占位", "文本框", "占位", "段落", "占位"],
+            "每个不认识的节点都要有落点，绝不能静默消失（文本框现在有真内容）"
         );
 
         assert!(label_of(&blocks[0]).contains("SmartArt"), "SmartArt 要有中文说明");
@@ -4256,12 +4866,12 @@ mod tests {
         };
         assert!(ole_detail.contains("预览图"), "OLE 应说明显示的是预览图：{ole_detail}");
         assert!(ole_detail.contains("Equation.DSMT4"), "OLE 应报出 ProgID：{ole_detail}");
-        assert!(label_of(&blocks[4]).contains("文本框"));
-        let textbox_detail = match &blocks[4] {
-            Block::Unsupported { detail, .. } => detail,
-            _ => unreachable!(),
+        // 文本框现在是**真内容**（这块行为已由 renders_text_boxes_with_real_content 详测）
+        let text_box = match &blocks[4] {
+            Block::TextBox(text_box) => text_box,
+            other => panic!("VML 文本框应产出文本框块：{other:?}"),
         };
-        assert!(textbox_detail.contains("框内文字"), "文本框占位里回显纯文本：{textbox_detail}");
+        assert_eq!(paragraph_of(&text_box.blocks[0]).text, "框内文字");
         assert!(label_of(&blocks[5]).contains("公式"));
         let math_detail = match &blocks[5] {
             Block::Unsupported { detail, .. } => detail,
@@ -4531,6 +5141,8 @@ mod tests {
             blocks: parsed.blocks.clone(),
             encrypted: true,
             page: parsed.page.clone(),
+            header: parsed.header.clone(),
+            footer: parsed.footer.clone(),
         };
         let json = serde_json::to_value(&page).expect("应能序列化成 JSON");
 
@@ -5219,6 +5831,8 @@ mod tests {
             blocks: parsed.blocks.clone(),
             encrypted: false,
             page: parsed.page.clone(),
+            header: parsed.header.clone(),
+            footer: parsed.footer.clone(),
         };
         let json = serde_json::to_value(&page_block).expect("应能序列化");
         assert!((json["page"]["widthPt"].as_f64().unwrap() - 595.3).abs() < 0.01);
@@ -5615,6 +6229,606 @@ mod tests {
         assert!(json["borders"].is_null(), "四边皆空 → null");
     }
 
+    /// **多节文档**：一套页眉页脚取"离最后一节最近的那个 default"；最后一节没引用时往前找，
+    /// 不能被"最后一节只有个页码"这种情况把整份文档的页眉丢掉（真实的企业标准就是这样）。
+    #[test]
+    fn header_footer_fall_back_to_earlier_sections() {
+        let rels = format!(
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId8" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header2.xml"/>
+              <Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer2.xml"/>
+              <Relationship Id="rId10" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header4.xml"/>
+              <Relationship Id="rId11" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer6.xml"/>
+            </Relationships>"#
+        );
+        let header2 = format!(
+            r#"<?xml version="1.0"?><w:hdr {NS}><w:p><w:r><w:t>封面节的页眉</w:t></w:r></w:p></w:hdr>"#
+        );
+        let header4 = format!(
+            r#"<?xml version="1.0"?><w:hdr {NS}><w:p><w:r><w:t>正文节的页眉</w:t></w:r></w:p></w:hdr>"#
+        );
+        let footer2 = format!(
+            r#"<?xml version="1.0"?><w:ftr {NS}><w:p><w:r><w:t>封面节的页脚</w:t></w:r></w:p></w:ftr>"#
+        );
+        let footer6 = format!(r#"<?xml version="1.0"?><w:ftr {NS}><w:p><w:r><w:t>2</w:t></w:r></w:p></w:ftr>"#);
+        let parts: Vec<(&str, &str)> = vec![
+            ("word/_rels/document.xml.rels", &rels),
+            ("word/header2.xml", &header2),
+            ("word/header4.xml", &header4),
+            ("word/footer2.xml", &footer2),
+            ("word/footer6.xml", &footer6),
+        ];
+
+        // ① 最后一节（body 级）只有页脚 → 页眉往前找"离它最近"的 default（第一节）
+        let body = r#"<w:p><w:r><w:t>封面</w:t></w:r></w:p>
+            <w:p><w:pPr><w:sectPr>
+              <w:headerReference w:type="default" r:id="rId8"/>
+              <w:footerReference w:type="default" r:id="rId9"/>
+            </w:sectPr></w:pPr><w:r><w:t>第一节结束</w:t></w:r></w:p>
+            <w:p><w:r><w:t>正文</w:t></w:r></w:p>
+            <w:sectPr><w:footerReference w:type="default" r:id="rId11"/><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>"#;
+        let parsed = parse(&docx_with(body, &parts));
+        let header = parsed.header.clone().expect("最后一节没页眉也要往前找到");
+        assert_eq!(paragraph_of(&header[0]).text, "封面节的页眉");
+        let footer = parsed.footer.clone().expect("最后一节的页脚");
+        assert_eq!(paragraph_of(&footer[0]).text, "2");
+
+        // ② 最后一节自己也有 default 页眉 → 用它（离最后一节最近的优先）
+        let body = r#"<w:p><w:pPr><w:sectPr>
+              <w:headerReference w:type="default" r:id="rId8"/>
+            </w:sectPr></w:pPr><w:r><w:t>第一节结束</w:t></w:r></w:p>
+            <w:sectPr><w:headerReference w:type="default" r:id="rId10"/><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>"#;
+        let parsed = parse(&docx_with(body, &parts));
+        let header = parsed.header.clone().expect("应有页眉");
+        assert_eq!(paragraph_of(&header[0]).text, "正文节的页眉");
+
+        // ③ 全都没有 default，只有 first → 仍然取得到（不被"没有 default"卡住）
+        let body = r#"<w:p><w:pPr><w:sectPr>
+              <w:headerReference w:type="first" r:id="rId8"/>
+            </w:sectPr></w:pPr><w:r><w:t>第一节结束</w:t></w:r></w:p>
+            <w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>"#;
+        let parsed = parse(&docx_with(body, &parts));
+        let header = parsed.header.clone().expect("只有 first 也应取到");
+        assert_eq!(paragraph_of(&header[0]).text, "封面节的页眉");
+    }
+
+
+
+    /// **文本框内容结构化**：企业标准封面整页、表单签字框都是文本框，不能只给一张占位卡片。
+    #[test]
+    fn renders_text_boxes_with_real_content() {
+        let body = r##"
+            <w:p><w:r><w:drawing><wp:inline><wp:extent cx="1828800" cy="228600"/>
+              <a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+                <wps:wsp><wps:spPr>
+                    <a:xfrm><a:off x="12700" y="25400"/><a:ext cx="1828800" cy="228600"/></a:xfrm>
+                    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                    <a:solidFill><a:srgbClr val="DDEEFF"/></a:solidFill>
+                    <a:ln w="25400"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln>
+                  </wps:spPr>
+                  <wps:txbx><w:txbxContent>
+                    <w:p><w:pPr><w:pStyle w:val="Title"/></w:pPr><w:r><w:t>Q/NDB 001—2026</w:t></w:r></w:p>
+                    <w:p><w:r><w:rPr><w:sz w:val="32"/></w:rPr><w:t>AI加持下的家庭能源管理系统</w:t></w:r></w:p>
+                  </w:txbxContent></wps:txbx>
+                </wps:wsp>
+              </a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
+            <w:p><w:r><w:pict><v:shape style="width:200pt;height:40pt" fillcolor="#FFFFCC"
+                strokecolor="black" strokeweight=".5pt">
+              <v:textbox><w:txbxContent>
+                <w:p><w:r><w:t>甲方签字：</w:t></w:r></w:p>
+                <w:tbl><w:tblGrid><w:gridCol w:w="1500"/></w:tblGrid>
+                  <w:tr><w:tc><w:p><w:r><w:t>表格也在文本框里</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+              </w:txbxContent></v:textbox>
+            </v:shape></w:pict></w:r></w:p>
+            <w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent/></v:textbox></v:shape></w:pict></w:r></w:p>
+            <w:p><mc:AlternateContent>
+              <mc:Choice Requires="wps"><w:pict><v:shape style="width:120pt;height:30pt">
+                <v:textbox><w:txbxContent><w:p><w:r><w:t>Choice 里的框</w:t></w:r></w:p>
+                </w:txbxContent></v:textbox></v:shape></w:pict></mc:Choice>
+              <mc:Fallback><w:pict><v:shape style="width:120pt;height:30pt">
+                <v:textbox><w:txbxContent><w:p><w:r><w:t>Fallback 里的框</w:t></w:r></w:p>
+                </w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback>
+            </mc:AlternateContent></w:p>"##;
+        let styles = format!(
+            r#"<?xml version="1.0"?><w:styles {NS}>
+              <w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="24"/></w:rPr></w:rPrDefault></w:docDefaults>
+              <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+              <w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/>
+                <w:rPr><w:sz w:val="44"/><w:b/></w:rPr></w:style>
+            </w:styles>"#
+        );
+        let blocks = blocks_of(&docx_with(body, &[("word/styles.xml", &styles)]));
+
+        // ① DrawingML 文本框：内容结构化 + 尺寸/填充/边框/偏移
+        let first = match &blocks[0] {
+            Block::TextBox(text_box) => text_box,
+            other => panic!("应产出文本框块：{other:?}"),
+        };
+        assert_eq!(first.blocks.len(), 2, "文本框里两个段落");
+        assert_eq!(paragraph_of(&first.blocks[0]).text, "Q/NDB 001—2026");
+        assert_eq!(paragraph_of(&first.blocks[1]).text, "AI加持下的家庭能源管理系统");
+        // 文本框里的段落走同一套样式层叠：Title 样式给 22pt + 加粗
+        let title_run = &paragraph_of(&first.blocks[0]).runs[0];
+        assert_eq!(title_run.size_pt, Some(22.0), "sz=44 半磅来自 Title 样式");
+        assert!(title_run.bold);
+        assert_eq!(paragraph_of(&first.blocks[1]).runs[0].size_pt, Some(16.0), "sz=32 → 16pt");
+        assert_eq!(paragraph_of(&first.blocks[1]).runs[0].bold, false);
+        assert_eq!((first.width_pt, first.height_pt), (144.0, 18.0), "a:ext EMU → pt");
+        assert_eq!((first.x_pt, first.y_pt), (1.0, 2.0), "a:off EMU → pt");
+        assert_eq!(first.fill_color.as_deref(), Some("DDEEFF"));
+        assert_eq!(first.border_color.as_deref(), Some("000000"));
+        assert_eq!(first.border_width_pt, Some(2.0));
+        assert_eq!(first.wrap, "none", "内联（wp:inline）→ none");
+
+        // ② VML 文本框：尺寸来自 style；里面的表格照常解析
+        let second = match &blocks[1] {
+            Block::TextBox(text_box) => text_box,
+            other => panic!("VML 文本框应产出文本框块：{other:?}"),
+        };
+        assert_eq!((second.width_pt, second.height_pt), (200.0, 40.0));
+        assert_eq!(second.fill_color.as_deref(), Some("FFFFCC"));
+        assert_eq!(second.border_color.as_deref(), Some("000000"));
+        assert_eq!(second.border_width_pt, Some(0.5));
+        assert_eq!(paragraph_of(&second.blocks[0]).text, "甲方签字：");
+        let inner_table = table_of(&second.blocks[1]);
+        assert_eq!(inner_table.rows[0].cells[0].text, "表格也在文本框里");
+
+        // ③ 空文本框 → 仍然给占位（不静默丢）
+        assert_eq!(label_of(&blocks[2]), "文本框（暂不支持显示）");
+
+        // ④ AlternateContent：只出一个文本框（Choice 优先）
+        let alternate = match &blocks[3] {
+            Block::TextBox(text_box) => text_box,
+            other => panic!("应产出一个文本框块：{other:?}"),
+        };
+        assert_eq!(paragraph_of(&alternate.blocks[0]).text, "Choice 里的框");
+        assert_eq!(blocks.len(), 4, "不该两个都产出");
+
+        // 前端契约：kind=textBox + camelCase 字段
+        let json = serde_json::to_value(&blocks[0]).expect("应能序列化");
+        assert_eq!(json["kind"], "textBox");
+        assert_eq!(json["widthPt"], 144.0);
+        assert_eq!(json["heightPt"], 18.0);
+        assert_eq!(json["fillColor"], "DDEEFF");
+        assert_eq!(json["borderColor"], "000000");
+        assert_eq!(json["borderWidthPt"], 2.0);
+        assert_eq!(json["wrap"], "none");
+        assert_eq!(json["blocks"][0]["kind"], "paragraph");
+        // find 索引里要能搜到封面文字
+        let parsed = parse(&docx_with(body, &[("word/styles.xml", &styles)]));
+        assert!(
+            parsed.search_index.iter().any(|(_, text)| text.contains("Q/NDB 001—2026")),
+            "文本框里的文字要能被搜索"
+        );
+    }
+
+    /// 文本框是独立"故事"：里面的列表编号不该把正文的计数器往后推
+    #[test]
+    fn text_box_numbering_does_not_shift_body() {
+        let numbering = format!(
+            r#"<?xml version="1.0"?><w:numbering {NS}>
+              <w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0">
+                <w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>
+              <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+        );
+        let item = |text: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+            )
+        };
+        let body = format!(
+            r#"{before}<w:p><w:r><w:pict><v:shape style="width:100pt;height:30pt"><v:textbox>
+                <w:txbxContent>{in_box}</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>{after}"#,
+            before = item("正文第一项"),
+            in_box = item("框里第一项"),
+            after = item("正文第二项"),
+        );
+        let blocks = blocks_of(&docx_with(&body, &[("word/numbering.xml", &numbering)]));
+
+        let prefixes: Vec<String> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Paragraph(paragraph) => paragraph.list.as_ref().map(|list| list.prefix.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prefixes, vec!["1.", "2."], "文本框里的编号不吃掉正文的计数");
+
+        let in_box = blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::TextBox(text_box) => Some(text_box),
+                _ => None,
+            })
+            .expect("应有文本框块");
+        let box_prefix = paragraph_of(&in_box.blocks[0])
+            .list
+            .as_ref()
+            .map(|list| list.prefix.clone());
+        assert_eq!(box_prefix.as_deref(), Some("1."), "框里自己从 1 开始");
+    }
+
+    /* ------------------------------ 页眉页脚 ------------------------------ */
+
+    /// **文档自己的页眉页脚**：`w:headerReference` / `w:footerReference` → `word/header*.xml`。
+    /// 只取 `w:type="default"`（没有 default 时取第一个），"首页不同"不区分。
+    #[test]
+    fn parses_header_and_footer_parts() {
+        let rels = format!(
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId8" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header2.xml"/>
+              <Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>
+              <Relationship Id="rId10" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+            </Relationships>"#
+        );
+        // 默认页眉 = header2.xml；首页页眉 = header1.xml（不该被取到）
+        let header1 = format!(
+            r#"<?xml version="1.0"?><w:hdr {NS}><w:p><w:r><w:t>首页页眉（不该用到）</w:t></w:r></w:p></w:hdr>"#
+        );
+        let header2 = format!(
+            r#"<?xml version="1.0"?><w:hdr {NS}><w:p><w:r><w:t>AI加持下的家庭能源管理系统企业标准</w:t></w:r></w:p></w:hdr>"#
+        );
+        let footer1 = format!(
+            r#"<?xml version="1.0"?><w:ftr {NS}><w:p><w:r><w:t>第 1 页 · 共 1 页</w:t></w:r></w:p></w:ftr>"#
+        );
+        let body = r#"<w:p><w:r><w:t>正文</w:t></w:r></w:p>
+            <w:sectPr>
+              <w:headerReference w:type="first" r:id="rId10"/>
+              <w:headerReference w:type="default" r:id="rId8"/>
+              <w:footerReference w:type="default" r:id="rId9"/>
+              <w:pgSz w:w="11906" w:h="16838"/>
+            </w:sectPr>"#;
+        let parsed = parse(&docx_with(
+            body,
+            &[
+                ("word/_rels/document.xml.rels", &rels),
+                ("word/header1.xml", &header1),
+                ("word/header2.xml", &header2),
+                ("word/footer1.xml", &footer1),
+            ],
+        ));
+
+        // ① default 页眉页脚都解析出来了，文本正确
+        let header = parsed.header.clone().expect("应有页眉");
+        assert_eq!(paragraph_of(&header[0]).text, "AI加持下的家庭能源管理系统企业标准");
+        let footer = parsed.footer.clone().expect("应有页脚");
+        assert_eq!(paragraph_of(&footer[0]).text, "第 1 页 · 共 1 页");
+
+        // 窗口返回里也要带上（BlockPage.header/footer）
+        let doc = TempDocx::new(
+            "header",
+            &docx_with(
+                body,
+                &[
+                    ("word/_rels/document.xml.rels", &rels),
+                    ("word/header1.xml", &header1),
+                    ("word/header2.xml", &header2),
+                    ("word/footer1.xml", &footer1),
+                ],
+            ),
+        );
+        let page = document_blocks(doc.path(), 0, 10).expect("取块应成功");
+        assert_eq!(
+            page.header.as_ref().map(|blocks| paragraph_of(&blocks[0]).text.clone()),
+            Some("AI加持下的家庭能源管理系统企业标准".to_string())
+        );
+        assert_eq!(
+            page.footer.as_ref().map(|blocks| paragraph_of(&blocks[0]).text.clone()),
+            Some("第 1 页 · 共 1 页".to_string())
+        );
+        let json = serde_json::to_value(&page).expect("应能序列化");
+        assert_eq!(json["header"][0]["kind"], "paragraph");
+        assert_eq!(json["footer"][0]["text"], "第 1 页 · 共 1 页");
+    }
+
+    /// 页眉页脚的退化情形：只有 first 就取它；没有引用 / 引用缺失 / 畸形 id → `None`，不 panic
+    #[test]
+    fn header_footer_degrade_gracefully() {
+        // ② 只有 first 页眉 → 取它
+        let rels = format!(
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId10" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+            </Relationships>"#
+        );
+        let header1 = format!(
+            r#"<?xml version="1.0"?><w:hdr {NS}><w:p><w:r><w:t>只有首页页眉</w:t></w:r></w:p></w:hdr>"#
+        );
+        let parsed = parse(&docx_with(
+            r#"<w:p/><w:sectPr><w:headerReference w:type="first" r:id="rId10"/></w:sectPr>"#,
+            &[
+                ("word/_rels/document.xml.rels", &rels),
+                ("word/header1.xml", &header1),
+            ],
+        ));
+        let header = parsed.header.clone().expect("只有 first 也应取到");
+        assert_eq!(paragraph_of(&header[0]).text, "只有首页页眉");
+        assert!(parsed.footer.is_none());
+
+        // ③ 没有 sectPr / 没有引用 → None
+        let none = parse(&docx_with(r#"<w:p><w:r><w:t>无页眉</w:t></w:r></w:p>"#, &[]));
+        assert!(none.header.is_none() && none.footer.is_none());
+
+        // ④ 畸形 r:id、缺部件、rels 指向不存在的文件 → None（不 panic）
+        for (rels_xml, sect) in [
+            // r:id 指向 rels 里没有的 id
+            (rels.clone(), r#"<w:sectPr><w:headerReference w:type="default" r:id="rId404"/></w:sectPr>"#),
+            // rels 指向的部件在包里不存在
+            (rels.clone(), r#"<w:sectPr><w:headerReference w:type="default" r:id="rId10"/><w:footerReference w:type="default" r:id="rId10"/></w:sectPr>"#),
+            // 完全没有 r:id
+            (rels.clone(), r#"<w:sectPr><w:headerReference w:type="default"/></w:sectPr>"#),
+        ] {
+            let body = format!("<w:p/>{}", sect);
+            let extras: Vec<(&str, &str)> = vec![("word/_rels/document.xml.rels", &rels_xml)];
+            let parsed = parse(&docx_with(&body, &extras));
+            // 前两种：部件根本不存在 → None；第三种：没有 id → None
+            assert!(
+                parsed.header.is_none() || !parsed.header.as_ref().unwrap().is_empty(),
+                "要么 None 要么有内容"
+            );
+        }
+
+        // 页眉部件本身是垃圾 XML → 也不 panic（给空块列表或 None）
+        let parsed = parse(&docx_with(
+            r#"<w:p/><w:sectPr><w:headerReference w:type="default" r:id="rId10"/></w:sectPr>"#,
+            &[
+                ("word/_rels/document.xml.rels", &rels),
+                ("word/header1.xml", "<<<这不是 XML"),
+            ],
+        ));
+        assert!(parsed.header.map(|blocks| blocks.is_empty()).unwrap_or(true));
+
+        // ⑤ 部件存在但里面什么都没有（全是空段落）→ None，前端不用为它留白
+        let empty_footer = format!(r#"<?xml version="1.0"?><w:ftr {NS}><w:p/><w:p/><w:p/></w:ftr>"#);
+        let parsed = parse(&docx_with(
+            r#"<w:p/><w:sectPr><w:footerReference w:type="default" r:id="rId9"/></w:sectPr>"#,
+            &[
+                ("word/_rels/document.xml.rels", &rels),
+                ("word/footer1.xml", &empty_footer),
+            ],
+        ));
+        assert!(parsed.footer.is_none(), "空页脚当作没有");
+
+        // ⑥ 但"有东西"的页脚要保留（哪怕只有一张图）
+        let image_footer = format!(
+            r#"<?xml version="1.0"?><w:ftr {NS}><w:p><w:r><w:drawing><wp:inline><wp:extent cx="9525" cy="9525"/>
+              <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                <pic:pic><pic:blipFill><a:blip r:embed="rId7"/></pic:blipFill></pic:pic>
+              </a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></w:ftr>"#
+        );
+        let rels_with_image = format!(
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>
+              <Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/footer.png"/>
+            </Relationships>"#
+        );
+        let parsed = parse(&docx_with(
+            r#"<w:p/><w:sectPr><w:footerReference w:type="default" r:id="rId9"/></w:sectPr>"#,
+            &[
+                ("word/_rels/document.xml.rels", &rels_with_image),
+                ("word/footer1.xml", &image_footer),
+            ],
+        ));
+        let footer = parsed.footer.expect("只有一张图的页脚也算有内容");
+        assert!(matches!(footer[0], Block::Image(_)), "页脚里的图片：{footer:?}");
+    }
+
+    /* ------------------------------ 实时页码域 ------------------------------ */
+
+    /// **实时页码域**：`PAGE` / `NUMPAGES` 的缓存结果要打上标记，前端用实际页序替换；
+    /// 域指令（`w:instrText`）永远不当正文输出。
+    #[test]
+    fn marks_page_and_numpages_field_runs() {
+        let body = r#"
+            <w:p>
+              <w:r><w:t>第 </w:t></w:r>
+              <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+              <w:r><w:instrText xml:space="preserve">PAGE  </w:instrText></w:r>
+              <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+              <w:r><w:t>2</w:t></w:r>
+              <w:r><w:fldChar w:fldCharType="end"/></w:r>
+              <w:r><w:t> 页 共 </w:t></w:r>
+              <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+              <w:r><w:instrText>NUMPAGES \* Arabic</w:instrText></w:r>
+              <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+              <w:r><w:t>30</w:t></w:r>
+              <w:r><w:fldChar w:fldCharType="end"/></w:r>
+              <w:r><w:t> 页</w:t></w:r>
+            </w:p>
+            <w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r>
+              <w:r><w:instrText>DATE \@ "yyyy-MM-dd"</w:instrText></w:r>
+              <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+              <w:r><w:t>2026-10-21</w:t></w:r>
+              <w:r><w:fldChar w:fldCharType="end"/></w:r>
+            </w:p>
+            <w:p><w:r><w:t>普通正文</w:t></w:r></w:p>
+            <w:p><w:fldSimple w:instr=" PAGE "><w:r><w:t>7</w:t></w:r></w:fldSimple></w:p>"#;
+        let blocks = blocks_of(&docx_with(body, &[]));
+
+        // ① PAGE 域：缓存结果 run 标记为 PAGE，文本照旧是缓存值
+        let paragraph = paragraph_of(&blocks[0]);
+        assert_eq!(paragraph.text, "第 2 页 共 30 页", "域缓存文本要照常显示");
+        let summary: Vec<(String, Option<FieldKind>)> = paragraph
+            .runs
+            .iter()
+            .map(|run| (run.text.clone(), run.field))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("第 ".to_string(), None),
+                ("2".to_string(), Some(FieldKind::Page)),
+                (" 页 共 ".to_string(), None),
+                ("30".to_string(), Some(FieldKind::NumPages)),
+                (" 页".to_string(), None),
+            ],
+            "只有缓存结果的 run 带标记，begin/separate/end 本身不产出 run"
+        );
+        assert!(
+            paragraph.runs.iter().all(|run| !run.text.contains("PAGE")
+                && !run.text.contains("NUMPAGES")
+                && !run.text.contains("MERGEFORMAT")),
+            "域指令绝不能当正文输出"
+        );
+
+        // ⑤ 普通域（DATE）：行为完全不变 —— 缓存文本照旧显示，field 为 null
+        let date = paragraph_of(&blocks[1]);
+        assert_eq!(date.text, "2026-10-21");
+        assert_eq!(date.runs.len(), 1);
+        assert_eq!(date.runs[0].field, None);
+
+        // ⑥ 普通正文：全部 null
+        assert!(paragraph_of(&blocks[2]).runs.iter().all(|run| run.field.is_none()));
+
+        // 附：属性式域 `w:fldSimple`（WPS 常用）里的缓存结果也要标记
+        let simple = paragraph_of(&blocks[3]);
+        assert_eq!(simple.text, "7");
+        assert_eq!(simple.runs[0].field, Some(FieldKind::Page));
+
+        // 前端契约：字段名与取值
+        let json = serde_json::to_value(&blocks[0]).expect("应能序列化");
+        assert_eq!(json["runs"][1]["field"], "PAGE");
+        assert_eq!(json["runs"][3]["field"], "NUMPAGES");
+        assert!(json["runs"][0]["field"].is_null());
+    }
+
+    /// 嵌套域按**深度计数**处理（`IF` 里套 `PAGE`），只有 `begin` 的域不产出指令文本
+    #[test]
+    fn nested_and_unseparated_fields_are_handled() {
+        // ③ 嵌套：外层的 IF 域里套一个 PAGE 域
+        let body = r#"
+            <w:p>
+              <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+              <w:r><w:instrText>IF </w:instrText></w:r>
+              <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+              <w:r><w:instrText>PAGE</w:instrText></w:r>
+              <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+              <w:r><w:t>2</w:t></w:r>
+              <w:r><w:fldChar w:fldCharType="end"/></w:r>
+              <w:r><w:instrText> = 1 "" "x"</w:instrText></w:r>
+              <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+              <w:r><w:t>IF 的结果</w:t></w:r>
+              <w:r><w:fldChar w:fldCharType="end"/></w:r>
+            </w:p>
+            <w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r>
+              <w:r><w:instrText>PAGE</w:instrText></w:r>
+              <w:r><w:t>未算过的域</w:t></w:r>
+            </w:p>
+            <w:p><w:r><w:t>结束</w:t></w:r></w:p>"#;
+        let blocks = blocks_of(&docx_with(body, &[]));
+
+        let nested = paragraph_of(&blocks[0]);
+        let summary: Vec<(String, Option<FieldKind>)> = nested
+            .runs
+            .iter()
+            .map(|run| (run.text.clone(), run.field))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("2".to_string(), Some(FieldKind::Page)),
+                ("IF 的结果".to_string(), None),
+            ],
+            "嵌套时按最内层已算过的域判断：PAGE 的缓存结果被标记，IF 自己的结果不标记"
+        );
+
+        // ④ 只有 begin 没有 separate：不当正文输出指令，也没有任何标记
+        let open = paragraph_of(&blocks[1]);
+        assert_eq!(open.text, "未算过的域", "指令文本不能漏进正文");
+        assert!(open.runs.iter().all(|run| run.field.is_none()));
+        // 段落级状态不会漏到下一段（begin 没有 end 也不影响后面的段落）
+        assert!(paragraph_of(&blocks[2]).runs.iter().all(|run| run.field.is_none()));
+    }
+
+    /// **缓存结果为空的域**（新建 / 从未打印过的文档）：也要产出带标记的空 run，
+    /// 否则渲染器没有可替换的对象，页脚页码会是一片空白。
+    #[test]
+    fn empty_page_fields_still_produce_a_marked_run() {
+        let field = |instruction: &str| {
+            format!(
+                r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>
+                   <w:r><w:instrText>{instruction}</w:instrText></w:r>
+                   <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+                   <w:r><w:fldChar w:fldCharType="end"/></w:r>"#
+            )
+        };
+        let body = format!(
+            r#"{page}{numpages}{both_in_one}{cached}{date_empty}{simple_empty}"#,
+            // ① PAGE 域：没有缓存文本 → 一个空 run 带 PAGE 标记
+            page = format!("<w:p>{}</w:p>", field("PAGE")),
+            // ③ NUMPAGES 同理
+            numpages = format!("<w:p>{}</w:p>", field("NUMPAGES \\* Arabic")),
+            // 同一段落两个空域 → 两个空 run，按出现顺序
+            both_in_one = format!(
+                "<w:p><w:r><w:t>第 </w:t></w:r>{}<w:r><w:t> / </w:t></w:r>{}</w:p>",
+                field("PAGE"),
+                field("NUMPAGES")
+            ),
+            // ② 有缓存文本 → run 数量不变（不额外补空 run）
+            cached = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r>
+              <w:r><w:instrText>PAGE</w:instrText></w:r>
+              <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+              <w:r><w:t>7</w:t></w:r>
+              <w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#,
+            // 空结果的**其它**域（DATE）不补空 run（只认 PAGE / NUMPAGES）
+            date_empty = format!("<w:p>{}</w:p>", field("DATE \\@ \"yyyy-MM-dd\"")),
+            // 属性式域（WPS 常用）没算过时同样补一个空 run
+            simple_empty = r#"<w:p><w:fldSimple w:instr=" PAGE "/></w:p>"#,
+        );
+        let blocks = blocks_of(&docx_with(&body, &[]));
+
+        // ① 空 PAGE 域：1 个 run，文本空、带标记
+        let page = paragraph_of(&blocks[0]);
+        assert_eq!(page.runs.len(), 1, "空结果的域要产出一个空 run：{:?}", page.runs);
+        assert_eq!(page.runs[0].text, "");
+        assert_eq!(page.runs[0].field, Some(FieldKind::Page));
+        // ④ 不让纯文本凭空多出字符
+        assert_eq!(page.text, "");
+        let json = serde_json::to_value(&blocks[0]).expect("应能序列化");
+        assert_eq!(json["runs"][0]["text"], "");
+        assert_eq!(json["runs"][0]["field"], "PAGE");
+        assert_eq!(json["text"], "");
+
+        // ③ 空 NUMPAGES 同理
+        let numpages = paragraph_of(&blocks[1]);
+        assert_eq!(numpages.runs.len(), 1);
+        assert_eq!(numpages.runs[0].field, Some(FieldKind::NumPages));
+        assert_eq!(numpages.text, "");
+
+        // 两个空域在同一段：按出现顺序产出两个空 run，夹在文字之间
+        let both = paragraph_of(&blocks[2]);
+        let summary: Vec<(String, Option<FieldKind>)> = both
+            .runs
+            .iter()
+            .map(|run| (run.text.clone(), run.field))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("第 ".to_string(), None),
+                (String::new(), Some(FieldKind::Page)),
+                (" / ".to_string(), None),
+                (String::new(), Some(FieldKind::NumPages)),
+            ]
+        );
+        assert_eq!(both.text, "第  / ", "空 run 不改变段落纯文本");
+
+        // ② 有缓存文本时**不多补**空 run（还是那一个缓存 run）
+        let cached = paragraph_of(&blocks[3]);
+        assert_eq!(cached.runs.len(), 1, "有缓存文本就不该再有空 run");
+        assert_eq!((cached.runs[0].text.as_str(), cached.runs[0].field), ("7", Some(FieldKind::Page)));
+
+        // 空结果的 DATE 域：既没有缓存文本、也不补空 run（只认 PAGE / NUMPAGES）
+        let date = paragraph_of(&blocks[4]);
+        assert!(date.runs.is_empty(), "其它域不补空 run：{:?}", date.runs);
+        assert_eq!(date.text, "");
+
+        // 属性式域（`w:fldSimple`）没算过时也一样补空 run
+        let simple = paragraph_of(&blocks[5]);
+        assert_eq!(simple.runs.len(), 1);
+        assert_eq!(simple.runs[0].field, Some(FieldKind::Page));
+        assert_eq!(simple.text, "");
+    }
+
     /* ------------------------------ 真实语料库（存在才跑） ------------------------------ */
 
     /// 拿真实语料库（默认是 Z 盘上的每周汇报目录）跑一遍块模型：
@@ -5645,15 +6859,22 @@ mod tests {
             }
             out.sort();
         }
-        let dir = std::env::var("MASTEREDIT_DOCX_CORPUS")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from(r"Z:\D\mywork\05_会议汇报\每周汇报\2026"));
-        if !dir.exists() {
-            eprintln!("跳过：语料库目录不存在 {}", dir.display());
-            return;
-        }
+        // 语料库目录：默认扫两个（每周汇报 + 项目总结），可用 MASTEREDIT_DOCX_CORPUS 覆盖
+        let dirs: Vec<std::path::PathBuf> = match std::env::var("MASTEREDIT_DOCX_CORPUS") {
+            Ok(value) => vec![std::path::PathBuf::from(value)],
+            Err(_) => vec![
+                std::path::PathBuf::from(r"Z:\D\mywork\05_会议汇报\每周汇报\2026"),
+                std::path::PathBuf::from(r"Z:\D\mywork\08_项目总结\AI加持下的家庭能源管理系统"),
+            ],
+        };
         let mut files = Vec::new();
-        collect(&dir, &mut files);
+        for dir in &dirs {
+            if !dir.exists() {
+                eprintln!("跳过：语料库目录不存在 {}", dir.display());
+                continue;
+            }
+            collect(dir, &mut files);
+        }
         if files.is_empty() {
             eprintln!("跳过：目录里没有 .docx");
             return;
@@ -5668,6 +6889,11 @@ mod tests {
         let mut nested_tables = 0usize;
         let mut total_shapes = 0usize;
         let mut total_bordered = 0usize;
+        let mut total_text_boxes = 0usize;
+        let mut total_page_fields = 0usize;
+        let mut total_numpages_fields = 0usize;
+        let mut docs_with_header = 0usize;
+        let mut docs_with_footer = 0usize;
         let mut labels: HashMap<String, usize> = HashMap::new();
         let mut paper_sizes: HashMap<String, usize> = HashMap::new();
 
@@ -5721,14 +6947,28 @@ mod tests {
                 merged: usize,
                 shapes: usize,
                 bordered: usize,
+                text_boxes: usize,
+                page_fields: usize,
+                numpages_fields: usize,
             }
             fn count_blocks(blocks: &[Block], counts: &mut Counts) {
                 for block in blocks {
                     match block {
                         Block::Shape(_) => counts.shapes += 1,
+                        Block::TextBox(text_box) => {
+                            counts.text_boxes += 1;
+                            count_blocks(&text_box.blocks, counts);
+                        }
                         Block::Paragraph(paragraph) => {
                             if paragraph.borders.is_some() {
                                 counts.bordered += 1;
+                            }
+                            for run in &paragraph.runs {
+                                match run.field {
+                                    Some(FieldKind::Page) => counts.page_fields += 1,
+                                    Some(FieldKind::NumPages) => counts.numpages_fields += 1,
+                                    None => {}
+                                }
                             }
                         }
                         Block::Table(table) => {
@@ -5750,10 +6990,26 @@ mod tests {
             }
             let mut counts = Counts::default();
             count_blocks(&parsed.blocks, &mut counts);
+            // 页眉页脚是独立"故事"，域的标记也要一起数
+            if let Some(header) = &parsed.header {
+                count_blocks(header, &mut counts);
+            }
+            if let Some(footer) = &parsed.footer {
+                count_blocks(footer, &mut counts);
+            }
             let (tables, nested) = (counts.tables, counts.nested);
             merged_cells += counts.merged;
             total_shapes += counts.shapes;
             total_bordered += counts.bordered;
+            total_text_boxes += counts.text_boxes;
+            total_page_fields += counts.page_fields;
+            total_numpages_fields += counts.numpages_fields;
+            if parsed.header.is_some() {
+                docs_with_header += 1;
+            }
+            if parsed.footer.is_some() {
+                docs_with_footer += 1;
+            }
             total_tables += tables;
             total_blocks += parsed.blocks.len();
             nested_tables += nested;
@@ -5773,14 +7029,37 @@ mod tests {
                     *labels.entry(label.clone()).or_insert(0) += 1;
                 }
             }
-            if counts.shapes > 0 || counts.bordered > 0 {
+            if counts.shapes > 0 || counts.bordered > 0 || counts.text_boxes > 0 {
                 eprintln!(
-                    "         └ 形状 {} 个 · 带边框段落 {} 个",
-                    counts.shapes, counts.bordered
+                    "         └ 形状 {} 个 · 带边框段落 {} 个 · 文本框 {} 个",
+                    counts.shapes, counts.bordered, counts.text_boxes
+                );
+            }
+            if counts.page_fields > 0 || counts.numpages_fields > 0 {
+                eprintln!(
+                    "         └ 域标记：PAGE {} 个 run · NUMPAGES {} 个 run",
+                    counts.page_fields, counts.numpages_fields
+                );
+            }
+            let header_text = parsed
+                .header
+                .as_ref()
+                .map(|blocks| blocks.iter().map(block_plain_text).collect::<Vec<_>>().join(" / "))
+                .unwrap_or_default();
+            let footer_text = parsed
+                .footer
+                .as_ref()
+                .map(|blocks| blocks.iter().map(block_plain_text).collect::<Vec<_>>().join(" / "))
+                .unwrap_or_default();
+            if !header_text.trim().is_empty() || !footer_text.trim().is_empty() {
+                eprintln!(
+                    "         └ 页眉「{}」· 页脚「{}」",
+                    header_text.trim(),
+                    footer_text.trim()
                 );
             }
             eprintln!(
-                "  [OK]   {label:<30} 块 {:>4} · 段落统计 {:>4} · 表 {:>2} · 图 {:>3} · 形状 {:>3} · 边框段 {:>3}",
+                "  [OK]   {label:<30} 块 {:>4} · 段落统计 {:>4} · 表 {:>2} · 图 {:>3} · 形状 {:>3} · 边框段 {:>3} · 文本框 {:>3}",
                 parsed.blocks.len(),
                 parsed.paragraph_count,
                 tables,
@@ -5790,14 +7069,15 @@ mod tests {
                     .filter(|block| matches!(block, Block::Image(_)))
                     .count(),
                 counts.shapes,
-                counts.bordered
+                counts.bordered,
+                counts.text_boxes
             );
         }
 
         let mut sorted: Vec<(String, usize)> = labels.into_iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
         eprintln!(
-            "\n语料库块模型统计：{} 个文件；顶层块 {}、表格 {}（嵌套 {}）、图片 {}、编号段落 {}、合并单元格 {}、占位块 {}、形状 {}、带边框段落 {}",
+            "\n语料库块模型统计：{} 个文件；顶层块 {}、表格 {}（嵌套 {}）、图片 {}、编号段落 {}、合并单元格 {}、占位块 {}、形状 {}、带边框段落 {}、文本框 {}；有页眉的 {} 个、有页脚的 {} 个；域标记 PAGE {} 个 run / NUMPAGES {} 个 run",
             files.len(),
             total_blocks,
             total_tables,
@@ -5807,7 +7087,12 @@ mod tests {
             merged_cells,
             total_unsupported,
             total_shapes,
-            total_bordered
+            total_bordered,
+            total_text_boxes,
+            docs_with_header,
+            docs_with_footer,
+            total_page_fields,
+            total_numpages_fields
         );
         for (label, count) in &sorted {
             eprintln!("  占位类型 {count:>3} × {label}");
@@ -5821,6 +7106,94 @@ mod tests {
     }
 
     /* ------------------------------ 真实样本（存在才跑） ------------------------------ */
+
+    /// **真实的企业标准封面**（用户实测反馈里"封面差异太大"的那份）：整页由 4 个文本框 + 2 条线组成。
+    /// 断言封面文字真的进了文本框块、标题可被查找命中、页眉拿到标准号。文件不存在时静默跳过。
+    #[test]
+    fn parses_enterprise_standard_cover_if_present() {
+        let path = std::env::var("MASTEREDIT_DOCX_ENTERPRISE").unwrap_or_else(|_| {
+            r"Z:\D\mywork\08_项目总结\AI加持下的家庭能源管理系统\AI加持下的家庭能源管理系统企业标准.docx"
+                .to_string()
+        });
+        if !Path::new(&path).exists() {
+            eprintln!("跳过：样本不存在 {path}");
+            return;
+        }
+        let parsed = load_document(&path).expect("企业标准应能解析");
+
+        // 封面 = 4 个文本框（标准号 / 发布单位 / 发布实施日期 / 标题）+ 2 条分隔线
+        let text_boxes: Vec<&TextBoxBlock> = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::TextBox(text_box) => Some(text_box),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text_boxes.len(), 4, "封面 4 个文本框都要结构化");
+        let cover_text: String = text_boxes
+            .iter()
+            .flat_map(|text_box| text_box.blocks.iter().map(block_plain_text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "Q/NDB",
+            "AI加持下的家庭能源管理系统",
+            "江苏林洋能源股份有限公司",
+            "2026-10-21",
+        ] {
+            assert!(cover_text.contains(expected), "封面文字缺 {expected}：{cover_text}");
+        }
+        assert!(text_boxes.iter().all(|text_box| text_box.width_pt > 10.0));
+        assert!(text_boxes.iter().any(|text_box| text_box.height_pt > 300.0), "标题框很高");
+        assert_eq!(text_boxes[0].fill_color.as_deref(), Some("FFFFFF"));
+
+        let shapes: Vec<&ShapeBlock> = parsed
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Shape(shape) => Some(shape),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shapes.len(), 2, "封面两条分隔线");
+        assert!(shapes
+            .iter()
+            .all(|shape| shape.shape == "line" && shape.width_pt > 400.0));
+
+        // 页眉：标准号在**第 1 节**的 default 页眉里，最后一节没有页眉引用 —— 必须往前找到
+        // （顺带证明多节文档的页眉不会被"最后一节只有页码"吃掉）
+        let header = parsed.header.clone().expect("页眉应能通过多节回退找到");
+        let header_text = header.iter().map(block_plain_text).collect::<Vec<_>>().join(" ");
+        assert!(header_text.contains("Q/320681NDBXX—2026"), "页眉文本：{header_text}");
+        // 页脚是 PAGE 域（缓存结果是数字）—— 标记要打到缓存结果的 run 上，前端好换成实时页码
+        let footer = parsed.footer.clone().expect("页脚");
+        let footer_text = footer.iter().map(block_plain_text).collect::<Vec<_>>().join(" ");
+        assert!(!footer_text.trim().is_empty(), "页脚不该为空：{footer_text:?}");
+        let field_runs: Vec<(String, Option<FieldKind>)> = footer
+            .iter()
+            .filter_map(|block| match block {
+                Block::Paragraph(paragraph) => Some(&paragraph.runs),
+                _ => None,
+            })
+            .flatten()
+            .map(|run| (run.text.clone(), run.field))
+            .collect();
+        assert!(
+            field_runs.iter().any(|(text, field)| *field == Some(FieldKind::Page)
+                && text.trim().chars().all(|ch| ch.is_ascii_digit())),
+            "页脚的 PAGE 域缓存结果要带标记：{field_runs:?}"
+        );
+
+        // 封面文字要能被查找命中（文本框内容算正文）
+        let hits =
+            document_find(path.clone(), "家庭能源管理系统".to_string(), false).expect("查找应成功");
+        assert!(
+            hits.iter().any(|hit| hit.block < 6),
+            "封面标题应能被搜到（命中块 {:?}）",
+            hits.iter().map(|hit| hit.block).collect::<Vec<_>>()
+        );
+    }
 
     /// 真实样本：亿赛通加密的周报。断言块模型与 `document_info` 的统计对得上，
     /// 并且样式链、编号、表格、图片都真的解析出来了。样本不存在时静默跳过。

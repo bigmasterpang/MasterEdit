@@ -32,7 +32,6 @@ import {
 } from "./docxStyle";
 import { planBlocks, type BlockPlan } from "./docxGrid";
 import {
-  PAGE_FOOTER_HEIGHT,
   blockIndexAt,
   firstPageIntersecting,
   layoutContinuous,
@@ -94,10 +93,8 @@ export function fitPageGeometry(base: PageGeometry, maxWidth: number): PageGeome
     marginBottomPx,
     marginLeftPx,
     contentWidthPx: Math.max(120, round2(widthPx - marginLeftPx - marginRightPx)),
-    contentHeightPx: Math.max(
-      80,
-      round2(heightPx - marginTopPx - marginBottomPx - PAGE_FOOTER_HEIGHT),
-    ),
+    // 与 Word 一致：版心高 = 页面高 - 上下边距（页脚画在下边距里，不占版心）
+    contentHeightPx: Math.max(80, round2(heightPx - marginTopPx - marginBottomPx)),
   };
 }
 
@@ -119,7 +116,12 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
   const mountedRef = useRef(true);
 
   /* ---------- 测量值 ---------- */
-  const measuredRef = useRef(new Map<number, number>());
+  /**
+   * 实测高度。**必须记下测量时的「缩放 + 版心宽」**：否则用户 Ctrl+滚轮放大之后，
+   * 布局会拿旧尺寸下测到的高度去排新尺寸的版，块与块就会互相压住。
+   * key 不匹配一律当"没测过"（回落到估算，下一帧会重新测）。
+   */
+  const measuredRef = useRef(new Map<number, { height: number; key: string }>());
   const measurePendingRef = useRef(false);
 
   /* ---------- 估算缓存（跟随「缩放 + 内容宽 + 缓存版本」失效） ---------- */
@@ -199,14 +201,34 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
     return Math.max(160, paper - PAGE_PADDING * 2);
   }, [mode, geometry.contentWidthPx, viewport.width]);
 
+  /**
+   * **纸张可容纳块宽**：文本框这类浮动对象在 Word 里允许超出正文版心，只受纸张边界约束。
+   * 左边缘仍对齐版心左边缘，所以上限 = 纸张宽 - 左边距 - 右半页边距（留半条页边距当安全边，
+   * 超过纸张就会出横向滚动条）。它**永不小于版心宽**，普通块完全不受影响。
+   */
+  const maxBlockWidth = useMemo(() => {
+    if (mode === "paged") {
+      return Math.max(
+        contentWidth,
+        round2(geometry.widthPx - geometry.marginLeftPx - geometry.marginRightPx / 2),
+      );
+    }
+    const paper = Math.max(320, Math.min(viewport.width - 16, PAGE_WIDTH));
+    return Math.max(contentWidth, round2(paper - PAGE_PADDING - 12));
+  }, [mode, geometry, contentWidth, viewport.width]);
+
   /* ---------- 每块高度：测量值优先，其次估算（合并组按整张卡片算一次） ---------- */
   const blockAt = api.blockAt;
+  /** 实测高度的有效期：缩放或版心宽一变，旧测量值立即作废 */
+  const measurementKey = `${ctx.scale}|${contentWidth}|${maxBlockWidth}`;
   const heightOf = useCallback(
     (index: number, plan: BlockPlan): number => {
       if (plan.count[index] === 0) return 0; // 合并组内的非首块：并进首块那张卡片
       const measured = measuredRef.current.get(index);
-      if (measured !== undefined && measured > 0) return measured;
-      const key = `${ctx.scale}|${contentWidth}|${api.version}`;
+      if (measured !== undefined && measured.key === measurementKey && measured.height > 0) {
+        return measured.height;
+      }
+      const key = `${measurementKey}|${api.version}`;
       if (estimateRef.current.key !== key) estimateRef.current = { key, map: new Map() };
       const cached = estimateRef.current.map.get(index);
       if (cached !== undefined) return cached;
@@ -222,25 +244,43 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
         height = estimateUnsupportedHeight(details, contentWidth);
       } else {
         const block = blockAt(index);
-        height = block ? estimateBlockHeight(block, ctx.scale, contentWidth) : DEFAULT_BLOCK_HEIGHT;
+        height = block ? estimateBlockHeight(block, ctx.scale, contentWidth, maxBlockWidth) : DEFAULT_BLOCK_HEIGHT;
       }
       estimateRef.current.map.set(index, height);
       return height;
     },
-    [blockAt, ctx.scale, contentWidth, api.version],
+    [blockAt, ctx.scale, contentWidth, maxBlockWidth, api.version, measurementKey],
   );
 
   const total = api.total;
   /** 每块高度（合并组成员记 0）+ 分页 / 合并计划：任一变化都要重排 */
   const plan = useMemo(() => planBlocks(total, blockAt), [total, blockAt, api.version]);
-  const layout: DocxLayout = useMemo(() => {
-    const heights = new Float64Array(total);
-    for (let index = 0; index < total; index += 1) heights[index] = heightOf(index, plan);
+  const heights = useMemo(() => {
+    const values = new Float64Array(total);
+    for (let index = 0; index < total; index += 1) values[index] = heightOf(index, plan);
     // heightVersion 必须在依赖里：测量值存在 ref 里，只有它变化才知道要重排
-    return mode === "paged"
-      ? layoutPages(heights, geometry, (index) => plan.startsPage[index] === 1)
-      : layoutContinuous(heights);
-  }, [total, plan, heightOf, heightVersion, mode, geometry]);
+    return values;
+  }, [total, plan, heightOf, heightVersion]);
+  /**
+   * 分页布局：**两种模式都算**。连续模式虽然按块流式排版，但仍需要它来拿
+   * 「块 → 页」的映射 —— `PAGE` 域与纸外页码在两种模式下要显示同一个数。
+   */
+  const pagedLayout = useMemo(
+    () => layoutPages(heights, geometry, (index) => plan.startsPage[index] === 1),
+    [heights, geometry, plan],
+  );
+  const layout: DocxLayout = useMemo(
+    () => (mode === "paged" ? pagedLayout : layoutContinuous(heights)),
+    [mode, pagedLayout, heights],
+  );
+  /** 块 → 页码（1 起）：`PAGE` 域用 */
+  const blockPageNumber = useCallback(
+    (index: number): number => {
+      const pages = pagedLayout.blockPages;
+      return index >= 0 && index < pages.length ? pages[index] + 1 : 1;
+    },
+    [pagedLayout],
+  );
 
   /* ---------- 可见窗口 ---------- */
   const visibleWindow = useMemo(() => {
@@ -308,12 +348,14 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
       // jsdom 里 offsetHeight 恒为 0；真实浏览器里 0 也表示"还没布局"，都要忽略
       if (!(height > 0)) continue;
       const previous = measuredRef.current.get(blockIndex);
-      if (previous !== undefined && Math.abs(previous - height) < 0.5) continue;
-      measuredRef.current.set(blockIndex, height);
+      if (previous !== undefined && previous.key === measurementKey && Math.abs(previous.height - height) < 0.5) {
+        continue;
+      }
+      measuredRef.current.set(blockIndex, { height, key: measurementKey });
       changed = true;
     }
     if (changed) flushMeasurements();
-  }, [flushMeasurements]);
+  }, [flushMeasurements, measurementKey]);
 
   // 每次渲染后测一遍：窗口只有几十块，读 offsetHeight 的代价可忽略
   useLayoutEffect(() => {
@@ -385,7 +427,14 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
   }, [api, visibleWindow, layout, mode, total]);
 
   /** 一个块的外壳：绝对定位 + 查找高亮；合并组的非首块不渲染 */
-  const renderShell = (entry: { index: number; block: DocBlock; top: number }): ReactNode => {
+  /**
+   * 渲染一个块的外壳。`blockCtx` 携带**该块所在页的页码/总页数**（`PAGE` 域要用），
+   * 页眉页脚与正文都按所在页传入。
+   */
+  const renderShell = (
+    entry: { index: number; block: DocBlock; top: number },
+    blockCtx: DocxRenderContext,
+  ): ReactNode => {
     const count = plan.count[entry.index];
     if (count === 0) return null; // 组内非首块：并进上一张卡片
     const highlighted = ctx.highlightBlock === entry.index;
@@ -404,7 +453,9 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
         />
       );
     } else {
-      content = <DocxBlock block={entry.block} ctx={ctx} depth={0} />;
+      content = (
+        <DocxBlock block={entry.block} ctx={blockCtx} depth={0} contentWidth={contentWidth} />
+      );
     }
     return (
       <div
@@ -430,7 +481,27 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
   };
 
   const isLoadingFirst = api.loading && total === 0;
-  const pageCount = layout.pages.length;
+  const pageCount = Math.max(1, pagedLayout.pages.length);
+  /** 文档自己的页眉/页脚（每一页都画；没有就不占地方） */
+  const headerBlocks = api.header ?? [];
+  const footerBlocks = api.footer ?? [];
+  const hasHeader = headerBlocks.length > 0;
+  const hasFooter = footerBlocks.length > 0;
+  /**
+   * 某一页的渲染上下文：带上该页的页码与总页数（`PAGE`/`NUMPAGES` 域要用）。
+   * 正文块、页眉、页脚都用它，保证"同一个 run 在正文/页眉/页脚里语义一致"。
+   */
+  const contextForPage = (pageNumber: number): DocxRenderContext => ({
+    ...ctx,
+    pageNumber,
+    totalPages: pageCount,
+    maxBlockWidth,
+  });
+  /** 页眉页脚用同一套块渲染，但只渲染一层（不递归页眉页脚） */
+  const renderFlow = (blocks: DocBlock[], blockCtx: DocxRenderContext) =>
+    blocks.map((block, index) => (
+      <DocxBlock key={index} block={block} ctx={blockCtx} depth={0} contentWidth={contentWidth} />
+    ));
 
   return (
     <div
@@ -493,28 +564,78 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
                     height: `${page.height}px`,
                   }}
                 >
+                  {/**
+                   * 文档自己的页眉：画在**纸张上边距**里，每一页都画（与 Word 一致）。
+                   * 不递归页眉页脚、不再套一层，用与正文相同的块渲染。
+                   */}
+                  {hasHeader ? (
+                    <div
+                      data-docx-page-header={page.index + 1}
+                      style={{
+                        position: "absolute",
+                        left: `${geometry.marginLeftPx}px`,
+                        right: `${geometry.marginRightPx}px`,
+                        top: `${round2(Math.max(2, geometry.marginTopPx / 4))}px`,
+                        maxHeight: `${round2(Math.max(20, geometry.marginTopPx * 0.8))}px`,
+                        overflow: "hidden",
+                      }}
+                    >
+                      {renderFlow(headerBlocks, contextForPage(page.index + 1))}
+                    </div>
+                  ) : null}
+
                   {renderedBlocks
                     .filter((entry) => entry.page === page.index)
-                    .map((entry) => renderShell(entry))}
-                  <div
-                    data-docx-page-footer={page.index + 1}
-                    className="text-[11px] text-faint"
-                    style={{
-                      position: "absolute",
-                      left: 0,
-                      right: 0,
-                      bottom: `${round2(Math.max(2, geometry.marginBottomPx / 3))}px`,
-                      height: `${PAGE_FOOTER_HEIGHT}px`,
-                      lineHeight: `${PAGE_FOOTER_HEIGHT}px`,
-                      textAlign: "center",
-                    }}
-                  >
-                    第 {page.index + 1} 页 · 共 {pageCount} 页
-                    {page.oversized ? "（本页内容超出一页，未裁切）" : ""}
-                  </div>
+                    .map((entry) => renderShell(entry, contextForPage(page.index + 1)))}
+
+                  {/**
+                   * 文档自己的页脚：画在纸张下边距里，每一页都画。
+                   * 我们**自己的页码不在这里**（见下面的纸外页码）—— 纸面只放文档内容。
+                   */}
+                  {hasFooter ? (
+                    <div
+                      data-docx-page-footer-block={page.index + 1}
+                      style={{
+                        position: "absolute",
+                        left: `${geometry.marginLeftPx}px`,
+                        right: `${geometry.marginRightPx}px`,
+                        bottom: `${round2(Math.max(2, geometry.marginBottomPx / 4))}px`,
+                        maxHeight: `${round2(Math.max(20, geometry.marginBottomPx * 0.8))}px`,
+                        overflow: "hidden",
+                      }}
+                    >
+                      {renderFlow(footerBlocks, contextForPage(page.index + 1))}
+                    </div>
+                  ) : null}
                 </div>
               ))
-            : renderedBlocks.map((entry) => renderShell(entry))}
+            : /* 连续模式：仍用分页布局算出的"块 → 页"来填 PAGE 域，保证两种模式显示一致 */
+              renderedBlocks.map((entry) =>
+                renderShell(entry, contextForPage(blockPageNumber(entry.index) + 1)),
+              )}
+
+          {/**
+           * **纸外页码**：画在页与页之间的空隙里（纸张外侧、靠右），只是导航辅助，
+           * 不污染纸面 —— 纸面里只应该有文档自己的页眉页脚。
+           */}
+          {mode === "paged"
+            ? visibleWindow.pages.map((page) => (
+                <div
+                  key={`nav-${page.index}`}
+                  data-docx-page-number-outside={page.index + 1}
+                  className="text-[11px] text-faint"
+                  style={{
+                    position: "absolute",
+                    top: `${round2(page.top + BOOK_OFFSET + page.height + 2)}px`,
+                    right: "12px",
+                    lineHeight: "16px",
+                  }}
+                >
+                  {page.index + 1} / {pageCount}
+                  {page.oversized ? " ·本页内容超出一页（未裁切）" : ""}
+                </div>
+              ))
+            : null}
           {renderedBlocks.length === 0 ? (
             <div
               data-docx-block-placeholder="true"

@@ -81,10 +81,11 @@ export function resolvePageGeometry(setup: PageSetupInput | null | undefined): P
     marginLeftPx,
     // 版心至少要留一点宽度/高度，避免畸形 sectPr 把内容挤成 0
     contentWidthPx: Math.max(120, round2(widthPx - marginLeftPx - marginRightPx)),
-    contentHeightPx: Math.max(
-      80,
-      round2(heightPx - marginTopPx - marginBottomPx - PAGE_FOOTER_HEIGHT),
-    ),
+    /**
+     * 版心高 = 页面高 - 上下边距（**与 Word 一致，不再额外扣页脚**）。
+     * 文档自己的页脚画在**下边距里**，不占版心；我们自己的页码已经移到纸张外。
+     */
+    contentHeightPx: Math.max(80, round2(heightPx - marginTopPx - marginBottomPx)),
   };
 }
 
@@ -124,6 +125,8 @@ export interface DocxLayout {
   pages: DocxPage[];
   /** 块 → 顶部 y（滚动容器坐标），两种模式都填 */
   blockTops: Float64Array;
+  /** 块 → 所属页下标（0 起）：`PAGE` 域要按"run 在哪一页"取实时页码 */
+  blockPages: Int32Array;
   /** 页 → 顶部 y（连续模式为空） */
   pageTops: Float64Array;
   /** 内容总高度（滚动条长度） */
@@ -142,7 +145,13 @@ export function layoutContinuous(heights: Float64Array): DocxLayout {
     blockTops[i] = y;
     y += heights[i];
   }
-  return { pages: [], blockTops, pageTops: new Float64Array(0), totalHeight: y };
+  return {
+    pages: [],
+    blockTops,
+    blockPages: new Int32Array(total),
+    pageTops: new Float64Array(0),
+    totalHeight: y,
+  };
 }
 
 /**
@@ -158,8 +167,15 @@ export function layoutPages(
 ): DocxLayout {
   const total = heights.length;
   const blockTops = new Float64Array(total);
+  const blockPages = new Int32Array(total);
   if (total === 0) {
-    return { pages: [], blockTops, pageTops: new Float64Array(0), totalHeight: 0 };
+    return {
+      pages: [],
+      blockTops,
+      blockPages,
+      pageTops: new Float64Array(0),
+      totalHeight: 0,
+    };
   }
 
   const contentHeight = geometry.contentHeightPx;
@@ -204,6 +220,8 @@ export function layoutPages(
       }
     }
     blockTops[i] = round2(top + geometry.marginTopPx + inside);
+    // 块 → 页：`PAGE` 域要按"这个 run 落在第几页"取实时页码
+    blockPages[i] = pages.length;
     inside += height;
   }
   top = pushPage(total - 1, top);
@@ -212,7 +230,7 @@ export function layoutPages(
   pages.forEach((page, index) => {
     pageTops[index] = page.top;
   });
-  return { pages, blockTops, pageTops, totalHeight: Math.max(0, top - PAGE_GAP) };
+  return { pages, blockTops, blockPages, pageTops, totalHeight: Math.max(0, top - PAGE_GAP) };
 }
 
 /** 二分：块坐标数组里找「最后一个 top <= y」的块下标（两种模式通用，blockTops 单调不减） */

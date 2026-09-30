@@ -20,6 +20,18 @@ export interface DocxRenderContext {
   /** 当前查找高亮的块下标（null = 没有） */
   highlightBlock: number | null;
   /**
+   * 该块**所在页的页码**（1 起）与总页数：`PAGE` / `NUMPAGES` 域用它替换缓存文本。
+   * 正文由 `DocxBlocks` 逐页传入（同一页的块共用一个 ctx）；页眉页脚按所在页传。
+   */
+  pageNumber: number;
+  totalPages: number;
+  /**
+   * **纸张可容纳块宽**（px）：文本框这类浮动对象允许超出正文版心、只受纸张边界约束，
+   * 用它当夹取上限（左边缘仍对齐版心左边缘，超出部分向右溢出）。
+   * 普通块不用它（仍按版心 / 单元格内宽排版）。
+   */
+  maxBlockWidth: number;
+  /**
    * 滚动容器（虚拟滚动那个 div）的 ref。图片懒加载的 IntersectionObserver
    * **必须以它为 root**：文档区自己就是滚动容器，若用 viewport 当 root，
    * 目标会被容器的 overflow 裁掉，`rootMargin` 的预取范围完全失效

@@ -243,6 +243,11 @@ export function DocxView({ docId }: { docId: string }) {
       loadMedia,
       highlightBlock,
       scrollRootRef,
+      // 页码/总页数由 `DocxBlocks` 逐页覆盖（`PAGE`/`NUMPAGES` 域要用）；这里是缺省值
+      pageNumber: 1,
+      totalPages: 1,
+      // 纸张可容纳块宽同样由 `DocxBlocks` 按纸张几何覆盖（0 = 退回版心宽）
+      maxBlockWidth: 0,
       onTableContextMenu: (event, table) => setMenu({ x: event.clientX, y: event.clientY, table }),
     }),
     [scale, mediaCacheKey, loadMedia, highlightBlock],

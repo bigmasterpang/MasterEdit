@@ -47,6 +47,10 @@ export interface DocxBlocksApi {
    * 后端字段还没落地时是 null，渲染层按 A4 + 2.54cm 页边距兜底。
    */
   page: DocPageSetup | null;
+  /** 文档自己的页眉（每页都画）；后端没给就是空数组 */
+  header: DocBlock[];
+  /** 文档自己的页脚（每页都画） */
+  footer: DocBlock[];
 }
 
 export function useDocxBlocks(path: string | null, modifiedAt: number): DocxBlocksApi {
@@ -56,6 +60,8 @@ export function useDocxBlocks(path: string | null, modifiedAt: number): DocxBloc
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState(0);
   const [page, setPage] = useState<DocPageSetup | null>(null);
+  const [header, setHeader] = useState<DocBlock[]>([]);
+  const [footer, setFooter] = useState<DocBlock[]>([]);
 
   /** 块缓存：下标 → 块 */
   const cacheRef = useRef(new Map<number, DocBlock>());
@@ -94,6 +100,9 @@ export function useDocxBlocks(path: string | null, modifiedAt: number): DocxBloc
         setEncrypted(page.encrypted);
         // 页面设置：后端还在补这个字段，缺了就当 null（渲染层按 A4 兜底）
         if (page.page) setPage(page.page);
+        // 文档自己的页眉页脚（每页都画）；后端没给就是空数组
+        if (page.header) setHeader(page.header);
+        if (page.footer) setFooter(page.footer);
         setError(null);
         bump();
         return true;
@@ -121,6 +130,8 @@ export function useDocxBlocks(path: string | null, modifiedAt: number): DocxBloc
     setTotal(0);
     setEncrypted(false);
     setPage(null);
+    setHeader([]);
+    setFooter([]);
     setError(null);
     if (!path) {
       setLoading(false);
@@ -207,11 +218,13 @@ export function useDocxBlocks(path: string | null, modifiedAt: number): DocxBloc
       error,
       version,
       page,
+      header,
+      footer,
       blockAt: (index: number) => cacheRef.current.get(index),
       ensure,
       loadAll,
       retry,
     }),
-    [total, encrypted, loading, error, version, page, ensure, loadAll, retry],
+    [total, encrypted, loading, error, version, page, header, footer, ensure, loadAll, retry],
   );
 }

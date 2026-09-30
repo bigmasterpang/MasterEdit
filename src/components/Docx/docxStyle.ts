@@ -18,6 +18,7 @@ import type { CSSProperties } from "react";
 import type {
   DocBlock,
   DocBorderSpec,
+  DocImage,
   DocLineSpacing,
   DocParagraph,
   DocRun,
@@ -25,6 +26,7 @@ import type {
   DocTable,
   DocTableCell,
   DocTableRow,
+  DocTextBox,
 } from "../../types";
 import { buildTableGrid } from "./docxGrid";
 
@@ -107,24 +109,100 @@ function quoteFont(name: string): string {
 }
 
 /**
- * run 的 font-family 列表：**fontEastAsia 优先**（中文按它渲染）→ 回退西文字体 → 系统字体链。
- * 去重后拼成 CSS 列表；字体名里的引号会被剥掉，避免拼出语法错误的 font-family。
+ * run 的 font-family 列表：**西文字体在前、中日韩字体在后**。
+ *
+ * 这正是 Word 的取字规则：数字、字母、**空格**、西文标点按 `w:ascii`（如 Times New Roman），
+ * 汉字按 `w:eastAsia`（如 宋体）。CSS 会为每个字符选**第一个含有该字形的字体**，
+ * 所以西文字体在前时汉字自然回落到中文字体，两者各得其所。
+ *
+ * **真实文档踩过的坑**：早先把 `fontEastAsia` 放在前面，于是空格也用了宋体 ——
+ * 宋体的空格是 0.5em，Times New Roman 的只有 0.25em。企业标准封面「2026-10-21发布 +
+ * 42 个空格 + 2026-10-21实施」这一行因此多出 196px，把最后一个「施」挤到第二行。
+ * 数字同理（宋体数字是全角宽度）。
  */
+/** 连续多少个空白才算"排版用空白"（Word 里用空格把日期顶到两端的常见写法） */
+const SPACER_RUN_MIN = 3;
+/** 排版空白段里空格的宽度（em）：西文字体的空格就这么窄 */
+const SPACER_EM = 0.3;
+
+/**
+ * 把 run 文本按"连续 ≥3 个空白"切成片段：空白片段要单独用**西文字体**渲染。
+ *
+ * 原因：Word 逐字符取字体 —— 空格是 ASCII，走 `w:ascii`（Times New Roman 0.25em）；
+ * 汉字走 `w:eastAsia`（宋体）。我们的 CSS 只能按 run 选字体，若整段用宋体，
+ * 空格就是 0.5em。企业标准封面日期行「2026-10-21发布 + 39 空格 + 2026-10-21实施」
+ * 因此多出 196px，最后一个「施」被挤到第二行（Word 里是一行）。
+ */
+export function splitRunSegments(text: string): Array<{ text: string; spacer: boolean }> {
+  const out: Array<{ text: string; spacer: boolean }> = [];
+  let index = 0;
+  while (index < text.length) {
+    const spacers = /^[ \t]+/.exec(text.slice(index));
+    if (spacers && spacers[0].length >= SPACER_RUN_MIN) {
+      out.push({ text: spacers[0], spacer: true });
+      index += spacers[0].length;
+      continue;
+    }
+    // 普通片段：一直吃到"下一个 ≥3 空白段"之前
+    let end = index + 1;
+    while (end < text.length) {
+      if (text[end] === " " || text[end] === "\t") {
+        const next = /^[ \t]+/.exec(text.slice(end));
+        if (next && next[0].length >= SPACER_RUN_MIN) break;
+      }
+      end += 1;
+    }
+    out.push({ text: text.slice(index, end), spacer: false });
+    index = end;
+  }
+  return out;
+}
+
+/** 空白片段用的字体链：**西文字体在前**（空格按 0.25em 排，与 Word 的 w:ascii 一致） */
+export function spacerFontFamilies(run: DocRun): string[] {
+  return fontFamiliesOf(run.font, run.fontEastAsia);
+}
+
 export function runFontFamilies(run: DocRun): string[] {
+  return fontFamiliesOf(run.fontEastAsia, run.font);
+}
+
+/** 按给定顺序拼字体链（去重 + 系统字体兜底） */
+function fontFamiliesOf(primary: string | null, secondary: string | null): string[] {
   const out: string[] = [];
   const push = (name: string | null) => {
     const quoted = name ? quoteFont(name) : "";
     if (quoted && !out.includes(quoted)) out.push(quoted);
   };
-  push(run.fontEastAsia);
-  push(run.font);
+  push(primary);
+  push(secondary);
   for (const fallback of SYSTEM_FALLBACK_FONTS) push(fallback);
   return out;
 }
 
-/** 宽字符（中日韩、全角标点、假名、谚文、常见 emoji 区）：占 1 em */
+/**
+ * 段落容器（strut 支柱行盒）该用哪种字体：**跟段落主 run 一致**。
+ *
+ * strut 决定段落的基线位置，它的字体度量必须与真正渲染这些字形的字体一致，
+ * 否则行盒会被撑到超过设定的 line-height（实测差 2~5px）。用主 run 的字体链即可：
+ * 中文段落 → 中文字体，纯西文段落（封面日期行）→ 西文字体。
+ */
+export function paragraphStrutFamilies(paragraph: DocParagraph): string[] {
+  const reference = paragraphReferenceRun(paragraph);
+  return reference ? runFontFamilies(reference) : [];
+}
+
+/**
+ * 宽字符（占 1 em）的判定。
+ *
+ * **真实文档踩过的坑**：中文排版里的「“ ” ‘ ’ … — （） 、。」等标点在字体里是**全角**（1 em），
+ * 但它们散落在 Unicode 的「常用标点」区（U+2010–U+205E）而不是 CJK 区。早先只列了 CJK 区，
+ * 于是这些标点按 0.52 em 计 —— 一段 36 字的合同条款被算成 545px（实际 576px），刚好跨过版心宽度，
+ * 估算 1 行、实际 2 行，**下一块直接压上来 31px**（真实文档 `实验室对接方案.docx` #18 实测）。
+ * 所以这里把中文标点区一并算成宽字符；宁可估宽（多一条缝、会被测量修正），也不能估窄（重叠）。
+ */
 const WIDE_CHAR =
-  /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE10-\uFE19\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6\u{1F300}-\u{1FAFF}]/u;
+  /[\u00A5\u00B0\u00B1\u00D7\u00F7\u2010-\u205E\u2103\u2109\u2116\u2122\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE10-\uFE19\uFE30-\uFE6F\uFF00-\uFF60\uFFE0-\uFFE6\u{1F300}-\u{1FAFF}]/u;
 
 /** 西文平均字宽（em）：0.52 是常见无衬线字体的经验值 */
 const LATIN_EM = 0.52;
@@ -134,12 +212,23 @@ const TAB_EM = 1.6;
 /**
  * 估算一段文本的显示宽度（px）。逐字符累加：宽字符 1em、制表符 1.6em、其余 0.52em。
  * 只用于虚拟滚动的高度估算，不参与真实排版。
+ *
+ * 两处特例都来自真实文档实测：
+ * - **空格按 0.52em 算**（虽然西文字体里只有 0.25em）：估窄会让后面的块压上来，估宽只是多一条缝；
+ * - **但"连续 ≥3 个空白"按 0.3em 算**：那是排版用的空白段，渲染时会单独用西文字体（见
+ *   `splitRunSegments`），按 0.52em 会明显高估（企业标准封面日期行会多算一行）。
  */
 export function estimateTextWidthPx(text: string, fontPx: number): number {
   let em = 0;
+  let spacerRun = 0; // 当前连续空白计数
   for (const ch of text) {
-    if (ch === "\t") em += TAB_EM;
-    else if (WIDE_CHAR.test(ch)) em += 1;
+    if (ch === " " || ch === "\t") {
+      spacerRun += 1;
+      em += spacerRun >= SPACER_RUN_MIN ? (ch === "\t" ? TAB_EM : 0.3) : LATIN_EM;
+      continue;
+    }
+    spacerRun = 0;
+    if (WIDE_CHAR.test(ch)) em += 1;
     else em += LATIN_EM;
   }
   return em * fontPx;
@@ -174,6 +263,20 @@ export function paragraphFontPt(paragraph: DocParagraph): number {
     if (run.sizePt !== null && run.sizePt > pt) pt = run.sizePt;
   }
   return pt > 0 ? pt : DEFAULT_FONT_PT;
+}
+
+/** 段落里"最大字号"的那个 run（决定行盒的字体与字号，也就是容器的 strut 该用什么） */
+export function paragraphReferenceRun(paragraph: DocParagraph): DocRun | null {
+  let best: DocRun | null = null;
+  let bestPt = 0;
+  for (const run of paragraph.runs) {
+    const pt = run.sizePt ?? 0;
+    if (best === null || pt > bestPt) {
+      best = run;
+      bestPt = pt;
+    }
+  }
+  return best;
 }
 
 /** 单行的行高（px）：倍数行距按 系数×倍数，固定/最小值行距直接用 pt 折算 */
@@ -285,7 +388,18 @@ function borderCssValue(spec: DocBorderSpec, scale: number): string {
 export function paragraphBoxStyle(paragraph: DocParagraph, scale: number): CSSProperties {
   const lineHeight = lineHeightPx(paragraph, scale);
   const insets = paragraphBorderInsets(paragraph, scale);
+  const reference = paragraphReferenceRun(paragraph);
   const style: CSSProperties = {
+    /**
+     * **容器的字号与字体必须跟着段落主字号/主字体走**：容器自身的"strut"（支柱行盒）
+     * 用的是容器的字体度量。若容器沿用应用根字号的 13px + 界面字体，而 run 是 16~22pt 的
+     * 宋体/黑体，两者的半行距不同，行盒会被撑到超过指定的 line-height ——
+     * 真实文档实测：22pt 标题设定 93.25px、实际 98.33px（+5px）；16pt 标题 +1.8px。
+     * 字号对齐只解决一半，**字体也要对齐**（同一字号下不同字体的 ascent/descent 仍不同）。
+     * 只影响 strut 与空行高度，run 自己的字体字号照旧生效，观感不变。
+     */
+    fontSize: `${round2(ptToPx(paragraphFontPt(paragraph), scale))}px`,
+    ...(reference ? { fontFamily: paragraphStrutFamilies(paragraph).join(", ") } : {}),
     // pre-wrap：块模型里的 `\n`（软换行）与 `\t`（制表符）要原样保留
     whiteSpace: "pre-wrap",
     wordBreak: "break-word",
@@ -308,6 +422,30 @@ export function paragraphBoxStyle(paragraph: DocParagraph, scale: number): CSSPr
   const align = alignToCss(paragraph.align);
   if (align) style.textAlign = align;
   return style;
+}
+
+/**
+ * 域代码 run 的**实时文本**：`PAGE` → 当前页码，`NUMPAGES` → 总页数。
+ *
+ * 文档里带的是上次保存/打印时的缓存值（`"2"`、`"30"`），必须换掉才对得上真实分页。
+ * 缓存文本**可能为空串**（新建或从未打印过的文档）—— 这种情况同样要替换，
+ * 绝不能因为 `text === ""` 就把 run 跳过（那样页码会整段消失）。
+ */
+export function resolveRunText(run: DocRun, pageNumber: number, totalPages: number): string {
+  if (run.field === "PAGE") return String(Math.max(1, Math.round(pageNumber)));
+  if (run.field === "NUMPAGES") return String(Math.max(1, Math.round(totalPages)));
+  return run.text;
+}
+
+/**
+ * 域 run 的**稳定占位宽度**（px）：按缓存文本的宽度给一个 `min-width`，
+ * 让替换后的数字不会改变行宽 → 不会触发重新换行 → 也就不会"改分页 → 再测 → 再改"地抖动。
+ * 缓存文本为空时按一个数字的宽度兜底。
+ */
+export function fieldRunMinWidthPx(run: DocRun, scale: number): number {
+  const fontPx = ptToPx(run.sizePt ?? DEFAULT_FONT_PT, scale);
+  const source = run.text && run.text.trim() ? run.text : "0";
+  return round2(estimateTextWidthPx(source, fontPx));
 }
 
 /** 单个 run 的内联样式：字体、字号、粗斜体、下划线/删除线、颜色、高亮、上下标 */
@@ -354,9 +492,13 @@ export function breakHintText(paragraph: DocParagraph): string | null {
 
 /* ============================== 高度估算 ============================== */
 
-/** 单个字符的估算宽度（px），只看它占几个 em */
-function charWidthPx(char: string, fontPx: number): number {
+/**
+ * 单个字符的估算宽度（px），只看它占几个 em。
+ * `spacer` = 这个空格属于"连续 ≥3 个空白"的排版空白段（渲染时会单独用西文字体，只有 0.3em）。
+ */
+function charWidthPx(char: string, fontPx: number, spacer: boolean): number {
   if (char === "\t") return fontPx * TAB_EM;
+  if (spacer) return fontPx * SPACER_EM;
   return WIDE_CHAR.test(char) ? fontPx : fontPx * LATIN_EM;
 }
 
@@ -365,26 +507,35 @@ function charWidthPx(char: string, fontPx: number): number {
  *
  * 为什么逐字符扫而不是「总宽 ÷ 可用宽」一次除：段落里各 run 字号不同（标题里混小字很常见），
  * 且软换行会把段落切成语义行；一次除法在混排时误差能达到一倍，直接导致滚动定位跑偏。
+ *
+ * `firstLineIndentPx` 为正（首行缩进）时**首行可用宽度要减掉它** —— 中文合同条款几乎都是
+ * 「首行缩进 2 字符」，不减就会把刚好跨行的段落算少一行。
  */
 function countLines(
   runs: Array<{ text: string; fontPx: number }>,
   availPx: number,
   leadingWidth: number,
+  firstLineIndentPx = 0,
 ): number {
   const avail = Math.max(24, availPx);
+  const availFirst = Math.max(24, avail - Math.max(0, firstLineIndentPx));
   let lines = 1;
-  let width = Math.min(leadingWidth, avail); // 列表前缀占首行宽度
+  let width = Math.min(leadingWidth, availFirst); // 列表前缀占首行宽度
   let hasContent = false;
+  let spacerRun = 0; // 当前连续空白计数（≥3 个按 0.3em 的排版空白算）
   for (const run of runs) {
     for (const char of run.text) {
       if (char === "\n") {
         lines += 1;
         width = 0;
+        spacerRun = 0;
         continue;
       }
+      if (char === " " || char === "\t") spacerRun += 1;
+      else spacerRun = 0;
       hasContent = true;
-      const w = charWidthPx(char, run.fontPx);
-      if (width > 0 && width + w > avail) {
+      const w = charWidthPx(char, run.fontPx, spacerRun >= SPACER_RUN_MIN);
+      if (width > 0 && width + w > (lines === 1 ? availFirst : avail)) {
         lines += 1;
         width = 0;
       }
@@ -422,7 +573,12 @@ export function estimateParagraphHeight(
     ptToPx(paragraph.indentLeftPt ?? 0, scale) + listIndentPx(paragraph, scale) + insets.left;
   const paddingRight = ptToPx(paragraph.indentRightPt ?? 0, scale) + insets.right;
   const avail = contentWidth - paddingLeft - paddingRight;
-  const lines = countLines(paragraphRunSegments(paragraph, scale), avail, listPrefixWidthPx(paragraph, scale));
+  const lines = countLines(
+    paragraphRunSegments(paragraph, scale),
+    avail,
+    listPrefixWidthPx(paragraph, scale),
+    firstLineIndentPx(paragraph, scale),
+  );
   const spacing =
     ptToPx(paragraph.spaceBeforePt ?? 0, scale) +
     ptToPx(paragraph.spaceAfterPt ?? 0, scale) +
@@ -508,26 +664,108 @@ export function estimateUnsupportedHeight(details: readonly string[], contentWid
   return round2(32 + lines * 16 + UNSUPPORTED_MARGIN_Y * 2);
 }
 
+/** 图片拿不到尺寸时的兜底高度（px）：**估算与渲染必须用同一个值** */
+export const IMAGE_FALLBACK_HEIGHT = 160;
+
+/**
+ * 图片的显示盒子（px）——**估算与渲染共用这一个函数**，保证"估算高度 = 渲染高度"这条不变式。
+ *
+ * 两条修过的坑：
+ *  1. 图片比版心宽时，只压宽度不缩高度 → 盒子高度 ≠ 估算高度，且图被压扁。
+ *     这里按比例**同时缩宽缩高**（`height = height × 版心宽 / 宽`）。
+ *  2. `heightPx` 为 0 / 缺失时，估算是 160、渲染却是 `height: undefined`（图片自然高，可能几百 px）
+ *     → 下一块直接压上来。这里两边都用 `IMAGE_FALLBACK_HEIGHT` + `object-fit: contain`。
+ */
+export function resolveImageBox(
+  block: DocImage,
+  scale: number,
+  contentWidth: number,
+): { width: number; height: number } {
+  const avail = Math.max(40, contentWidth);
+  let width = block.widthPx > 0 ? block.widthPx * scale : avail;
+  let height = block.heightPx > 0 ? block.heightPx * scale : IMAGE_FALLBACK_HEIGHT;
+  if (width > avail) {
+    const factor = avail / width;
+    width = avail;
+    height *= factor;
+  }
+  return { width: round2(width), height: round2(Math.max(1, height)) };
+}
+
+/** 文本框内边距（px）：渲染与估算共用 */
+export const TEXT_BOX_PADDING = 6;
+/** 文本框边框的默认线宽（pt） */
+export const TEXT_BOX_DEFAULT_BORDER_PT = 0.75;
+
+/**
+ * 文本框的盒子（px）——**估算与渲染共用**，保证"估算高度 = 渲染高度"。
+ *
+ * **宽度口径（修过的坑）**：`maxBoxWidth` 是**纸张可容纳宽度**，不是正文版心宽。
+ * Word 里文本框是浮动对象，**允许超出正文版心**（只受纸张边界约束）。早先夹到版心
+ * （企业标准：声明 482pt = 642.67px，版心只有 623.67px，差 19px）→ 日期行
+ * 「2026-10-21实施」被从中间挤断成两行。文本框左边缘仍对齐版心左边缘，超出部分向右溢出。
+ *
+ * 高度不变式：`height = max(heightPt, 内部内容高 + 内边距×2)` —— **内容优先、绝不裁切**。
+ */
+export function resolveTextBoxBox(
+  box: DocTextBox,
+  scale: number,
+  maxBoxWidth: number,
+  innerContentHeight: number,
+): { width: number; height: number; innerContentWidth: number } {
+  const avail = Math.max(40, maxBoxWidth);
+  const declaredWidth = ptToPx(Math.max(0, box.widthPt), scale);
+  const width = Math.min(avail, declaredWidth > 0 ? declaredWidth : avail);
+  const innerContentWidth = Math.max(24, width - TEXT_BOX_PADDING * 2);
+  const declaredHeight = ptToPx(Math.max(0, box.heightPt), scale);
+  const height = Math.max(declaredHeight, innerContentHeight + TEXT_BOX_PADDING * 2);
+  return { width: round2(width), height: round2(height), innerContentWidth: round2(innerContentWidth) };
+}
+
+/** 估算文本框块的高度（px）：宽度只影响内部换行，高度由内容决定 */
+export function estimateTextBoxHeight(
+  box: DocTextBox,
+  scale: number,
+  maxBoxWidth: number,
+): number {
+  const avail = Math.max(40, maxBoxWidth);
+  const declaredWidth = ptToPx(Math.max(0, box.widthPt), scale);
+  const width = Math.min(avail, declaredWidth > 0 ? declaredWidth : avail);
+  const innerWidth = Math.max(24, width - TEXT_BOX_PADDING * 2);
+  const innerHeight = estimateBlocksHeight(box.blocks, scale, innerWidth);
+  return resolveTextBoxBox(box, scale, maxBoxWidth, innerHeight).height;
+}
+
 /**
  * 估算单块高度（px）。**虚拟滚动在块尚未渲染时只能靠它定位**，
  * 所以任何分支都必须给出一个正数（宁可偏大）。
+ *
+ * `maxBlockWidth` 只有"允许超出正文版心的浮动对象"（文本框）用得上；
+ * 其余块一律用 `contentWidth`（版心 / 单元格内宽）。
  */
-export function estimateBlockHeight(block: DocBlock, scale: number, contentWidth: number): number {
+export function estimateBlockHeight(
+  block: DocBlock,
+  scale: number,
+  contentWidth: number,
+  maxBlockWidth: number = contentWidth,
+): number {
   switch (block.kind) {
     case "paragraph":
       return estimateParagraphHeight(block, scale, contentWidth);
     case "table":
       return estimateTableHeight(block, scale, contentWidth);
     case "image": {
-      const height = block.heightPx > 0 ? block.heightPx * scale : 160;
+      const box = resolveImageBox(block, scale, contentWidth);
       // 有 alt 时还会多一行图注（真实浏览器实测约 20px）
       const caption = block.alt && block.alt.trim() ? IMAGE_CAPTION_HEIGHT : 0;
-      return round2(height + IMAGE_MARGIN_Y * 2 + caption);
+      return round2(box.height + IMAGE_MARGIN_Y * 2 + caption);
     }
     case "pageBreak":
       return PAGE_BREAK_HEIGHT;
     case "shape":
       return estimateShapeHeight(block, scale);
+    case "textBox":
+      return estimateTextBoxHeight(block, scale, Math.max(contentWidth, maxBlockWidth));
     case "unsupported":
       return estimateUnsupportedHeight([block.detail], contentWidth);
     default:

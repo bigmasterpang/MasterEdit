@@ -395,6 +395,12 @@ export interface DocRun {
   vertAlign: "superscript" | "subscript" | null;
   /** 字符样式 id */
   styleId: string | null;
+  /**
+   * 域代码标记：`PAGE` / `NUMPAGES` 的 run 在文档里带的是**上次保存时的缓存文本**
+   * （例如 `"2"`、`"30"`），渲染时要用实时值（当前页码 / 总页数）替换；
+   * 空文本也正常（新建或未打印过的文档），替换后照样显示数字。
+   */
+  field: "PAGE" | "NUMPAGES" | null;
 }
 
 /** 行距：multiple = 倍数；exact / atLeast = pt */
@@ -543,12 +549,35 @@ export interface DocImage {
   heightPx: number;
 }
 
-/** 一个文档块：JSON 里带 `kind` 判别字段 */
-export type DocBlock =
+/**
+ * 文本框块（`w:txbxContent`）：企业标准的封面整页几乎都是文本框。
+ *
+ * 坐标 `xPt / yPt` 是相对段落内容区左上角的偏移；`wrap === "none"` 表示内联
+ * （跟着文档流走），其余（square / tight / topAndBottom）是浮动。
+ */
+export interface DocTextBox {
+  /** 文本框内部的块（段落 / 表格 / 图片 / 嵌套文本框） */
+  blocks: DocBlock[];
+  xPt: number;
+  yPt: number;
+  widthPt: number;
+  heightPt: number;
+  /** 填充色（RRGGBB）；null = 透明 */
+  fillColor: string | null;
+  /** 边框色（RRGGBB）；null = 无边框 */
+  borderColor: string | null;
+  /** 边框线宽（pt）；null = 默认 */
+  borderWidthPt: number | null;
+  /** 环绕方式：`none` 内联，其余为浮动 */
+  wrap: string;
+}
+
+/** 一个文档块：JSON 里带 `kind` 判别字段 */export type DocBlock =
   | ({ kind: "paragraph" } & DocParagraph)
   | ({ kind: "table" } & DocTable)
   | ({ kind: "image" } & DocImage)
   | ({ kind: "shape" } & DocShape)
+  | ({ kind: "textBox" } & DocTextBox)
   | { kind: "pageBreak" }
   | { kind: "unsupported"; label: string; detail: string };
 
@@ -573,6 +602,10 @@ export interface DocBlockPage {
   encrypted: boolean;
   /** 页面设置（可选：后端还在补这个字段，没有就用 A4 兜底） */
   page?: DocPageSetup | null;
+  /** 文档自己的页眉（每页都画；内部块的文字也进查找索引） */
+  header?: DocBlock[] | null;
+  /** 文档自己的页脚（每页都画） */
+  footer?: DocBlock[] | null;
 }
 
 /** `document_find` 的一处命中（块级：一个块最多一条，`block` 是顶层块下标） */

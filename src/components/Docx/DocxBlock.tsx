@@ -6,20 +6,27 @@
  * 文字保持可选中复制（不加 `user-select: none`）。
  */
 import { memo, useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import type { DocBlock, DocImage, DocParagraph, DocShape } from "../../types";
+import type { DocBlock, DocImage, DocParagraph, DocShape, DocTextBox } from "../../types";
 import {
   BLOCK_MARGIN_Y,
   DEFAULT_LINE_WIDTH_PT,
   PAGE_BREAK_HEIGHT,
+  TEXT_BOX_DEFAULT_BORDER_PT,
+  TEXT_BOX_PADDING,
   borderStyleToCss,
   breakHintText,
   estimateShapeHeight,
+  fieldRunMinWidthPx,
   hexColor,
   listGapPx,
   paragraphBoxStyle,
   ptToPx,
+  resolveImageBox,
+  resolveRunText,
   round2,
   runInlineStyle,
+  spacerFontFamilies,
+  splitRunSegments,
 } from "./docxStyle";
 import { DocxTable } from "./DocxTable";
 import { mediaExtension, mediaKind, type DocxRenderContext } from "./docxRender";
@@ -37,6 +44,11 @@ export interface DocxBlockProps {
   ctx: DocxRenderContext;
   /** 嵌套深度（表格单元格里的块会 +1） */
   depth?: number;
+  /**
+   * 当前块的**可用内容宽**（px）。图片按它决定显示盒子（`resolveImageBox`），
+   * 高度估算用的是同一个值 —— 表格单元格里传的是单元格内宽，不是整页宽。
+   */
+  contentWidth: number;
 }
 
 /* ------------------------------ 分页提示线 ------------------------------ */
@@ -101,11 +113,68 @@ const DocxParagraph = memo(function DocxParagraph({
     );
   }
   paragraph.runs.forEach((run, index) => {
-    children.push(
-      <span key={`run-${index}`} data-docx-run="true" style={runInlineStyle(run, ctx.scale)}>
-        {run.text}
-      </span>,
-    );
+    /**
+     * `PAGE` / `NUMPAGES` 域：用**实时值**替换缓存文本（`resolveRunText`），
+     * 并按缓存文本宽度给一个 `min-width` + 居中 —— 数字宽度变化不会改变行宽，
+     * 也就不会"改分页 → 重新测量 → 再改分页"地来回抖。
+     *
+     * **判定必须写成"等于 PAGE 或 NUMPAGES"**：老模型里根本没有 `field` 字段
+     * （`undefined`），用 `field !== null` 判会把**所有 run** 都当成域 run，
+     * 加上 `display: inline-block` 后相邻 run 变成不可断行的原子块 ——
+     * 实测后果是整行被 justify 拉成「高速    采样    +    嵌入式开发板」并多占一行。
+     */
+    const isField = run.field === "PAGE" || run.field === "NUMPAGES";
+    const text = resolveRunText(run, ctx.pageNumber, ctx.totalPages);
+    const style: CSSProperties = runInlineStyle(run, ctx.scale);
+    if (isField) {
+      style.display = "inline-block";
+      style.minWidth = `${fieldRunMinWidthPx(run, ctx.scale)}px`;
+      style.textAlign = "center";
+      children.push(
+        <span
+          key={`run-${index}`}
+          data-docx-run="true"
+          data-docx-field={run.field ?? undefined}
+          style={style}
+        >
+          {text}
+        </span>,
+      );
+      return;
+    }
+    /**
+     * 普通 run：**把"连续 ≥3 个空白"单独拆成一段**（`splitRunSegments`），
+     * 空白段用西文字体渲染 —— Word 逐字符取字体（空格走 `w:ascii`），
+     * 宋体的空格是 0.5em、Times New Roman 只有 0.25em，不拆会把整行挤断。
+     */
+    const segments = splitRunSegments(text);
+    if (segments.length <= 1) {
+      children.push(
+        <span key={`run-${index}`} data-docx-run="true" style={style}>
+          {text}
+        </span>,
+      );
+      return;
+    }
+    const spacerStyle: CSSProperties = { fontFamily: spacerFontFamilies(run).join(", ") };
+    segments.forEach((segment, segmentIndex) => {
+      children.push(
+        segment.spacer ? (
+          <span key={`run-${index}-s${segmentIndex}`} data-docx-spacer="true" style={spacerStyle}>
+            {segment.text}
+          </span>
+        ) : (
+          <span
+            key={`run-${index}-${segmentIndex}`}
+            data-docx-run="true"
+            data-docx-run-split="true"
+            style={style}
+          >
+            {segment.text}
+          </span>
+        ),
+      );
+    });
   });
   // 空段落也要占一行：用零宽空格撑开，避免整段塌掉（`min-height` 只管盒，行盒仍需要内容）
   if (paragraph.runs.length === 0 && !paragraph.list) {
@@ -166,9 +235,11 @@ function ImagePlaceholder({ block, message }: { block: DocImage; message: string
 const DocxImageBlock = memo(function DocxImageBlock({
   block,
   ctx,
+  contentWidth,
 }: {
   block: DocImage;
   ctx: DocxRenderContext;
+  contentWidth: number;
 }) {
   const kind = mediaKind(block.media);
   const [state, setState] = useState<ImageState>({ status: "idle" });
@@ -259,33 +330,40 @@ const DocxImageBlock = memo(function DocxImageBlock({
       />
     );
   } else if (state.status === "ready") {
-    const width = block.widthPx > 0 ? `${round2(block.widthPx * ctx.scale)}px` : undefined;
-    const height = block.heightPx > 0 ? `${round2(block.heightPx * ctx.scale)}px` : undefined;
+    /**
+     * 显示盒子由 `resolveImageBox` 统一算（与高度估算**同一个函数**）：
+     * 图片比版心宽时按比例同时缩宽缩高，拿不到高度时两边都用兜底高度 ——
+     * 这样"估算高度 = 渲染高度"恒成立，下一块不会被压在图上。
+     */
+    const box = resolveImageBox(block, ctx.scale, contentWidth);
     content = (
       <img
         data-docx-img="true"
         src={state.src}
         alt={altText}
-        /**
-         * 按文档给的 widthPx/heightPx 显示（模型的尺寸就是 Word 里的显示尺寸）；
-         * `object-fit: contain` 保证文档里非等比的尺寸也不会把图拉变形（多出来的部分留白）。
-         */
-        style={{ width, height, maxWidth: "100%", objectFit: "contain", display: "block" }}
+        data-docx-img-box={`${box.width}x${box.height}`}
+        style={{
+          width: `${box.width}px`,
+          height: `${box.height}px`,
+          // 版心算错时兜底：宽度被 maxWidth 夹住也只是等比留白，不会把高度算歪
+          maxWidth: "100%",
+          objectFit: "contain",
+          display: "block",
+        }}
         draggable={false}
       />
     );
   } else if (state.status === "error") {
     content = <ImagePlaceholder block={block} message={`图片显示不了：${state.message}`} />;
   } else {
-    // 还没加载：按文档给的尺寸占位（滚动时高度不会跳变），不请求后端
-    const width = block.widthPx > 0 ? Math.min(block.widthPx, MEDIA_MAX_WIDTH) : 220;
-    const height = block.heightPx > 0 ? Math.min(block.heightPx, 200) : 56;
+    // 还没加载：按同一个盒子的尺寸占位（滚动时高度不会跳变），不请求后端
+    const box = resolveImageBox(block, ctx.scale, contentWidth);
     content = (
       <div
         data-docx-image-skeleton="true"
         style={{
-          width: `${round2(width * ctx.scale)}px`,
-          height: `${round2(height * ctx.scale)}px`,
+          width: `${Math.min(box.width, MEDIA_MAX_WIDTH)}px`,
+          height: `${Math.min(box.height, MEDIA_MAX_WIDTH / 2)}px`,
           maxWidth: "100%",
           border: PLACEHOLDER_BORDER,
           borderRadius: "6px",
@@ -402,6 +480,86 @@ const DocxShapeBlock = memo(function DocxShapeBlock({
   );
 });
 
+/* ------------------------------- 文本框 ------------------------------- */
+
+/**
+ * 文本框（`w:txbxContent`）：企业标准的封面整页几乎都是文本框。
+ *
+ * ── 渲染策略（关系到会不会重叠，重要）────────────────────────────────
+ * **默认按文档流渲染**（当作一个普通块：宽度 = `widthPt`、最小高度 = `heightPt`，
+ * 画填充/边框，内部块用同一套渲染递归）。理由：文本框在后端是**独立块**，
+ * 如果一律绝对定位，`xPt/yPt` 为 0 的那些会全部叠在页顶 —— 比占位卡片还糟。
+ * 按流式渲染能保证"内容按顺序完整可读"，而且与高度估算天然同一个口径。
+ * **只有"浮动"（`wrap !== "none"`）且 `yPt` 明显非 0（> 12pt）** 时才绝对定位 ——
+ * 那才是真的浮在文字上面的对象；其余情况宁可顺序排下去。
+ *
+ * `height = max(heightPt, 内部内容高 + 内边距×2)`：**内容绝不裁切**（宁可撑高），
+ * 与 `resolveTextBoxBox` 共用一套算法，估算高度 = 实测高度。
+ */
+const DocxTextBoxBlock = memo(function DocxTextBoxBlock({
+  box,
+  ctx,
+  depth,
+  contentWidth,
+  renderBlocks,
+}: {
+  box: DocTextBox;
+  ctx: DocxRenderContext;
+  depth: number;
+  contentWidth: number;
+  renderBlocks: (blocks: DocBlock[], depth: number, contentWidth: number) => ReactNode;
+}) {
+  const scale = ctx.scale;
+  /**
+   * 宽度上限用**纸张可容纳宽**（`ctx.maxBlockWidth`），不是正文版心 ——
+   * Word 里文本框是浮动对象，允许超出正文版心。企业标准的日期框声明 482pt，
+   * 比版心宽 19px，夹到版心会把「2026-10-21实施」从中间挤断成两行。
+   * 左边缘仍对齐版心左边缘，超出的部分向右溢出。
+   */
+  const maxBoxWidth = ctx.maxBlockWidth > 0 ? ctx.maxBlockWidth : contentWidth;
+  const declaredWidth = ptToPx(Math.max(0, box.widthPt), scale);
+  const avail = Math.max(40, maxBoxWidth);
+  const width = round2(Math.min(avail, declaredWidth > 0 ? declaredWidth : avail));
+  const innerWidth = round2(Math.max(24, width - TEXT_BOX_PADDING * 2));
+  const declaredHeight = ptToPx(Math.max(0, box.heightPt), scale);
+  const fill = hexColor(box.fillColor);
+  const borderColor = hexColor(box.borderColor);
+  const borderWidth = Math.max(
+    0.5,
+    round2(ptToPx(box.borderWidthPt !== null && box.borderWidthPt > 0 ? box.borderWidthPt : TEXT_BOX_DEFAULT_BORDER_PT, scale)),
+  );
+  /** 只有浮动 + 有明显 y 偏移时才脱离文档流 */
+  const floating = box.wrap !== "none" && ptToPx(Math.max(0, box.yPt), scale) > 12;
+
+  return (
+    <div
+      data-docx-textbox="true"
+      data-docx-textbox-wrap={box.wrap}
+      data-docx-textbox-floating={floating ? "true" : undefined}
+      style={{
+        position: floating ? "absolute" : "relative",
+        left: floating ? `${round2(ptToPx(Math.max(0, box.xPt), scale))}px` : undefined,
+        top: floating ? `${round2(ptToPx(Math.max(0, box.yPt), scale))}px` : undefined,
+        width: `${width}px`,
+        /**
+         * **不能再用 `maxWidth: 100%`**：外层块的宽度就是正文版心，`maxWidth: 100%`
+         * 会把"允许超出正文版心"的文本框又夹回版心（企业标准的日期框 642.67px 被夹成 622px
+         * → 日期行照样断行）。宽度上限已经用 `ctx.maxBlockWidth`（纸张可容纳宽）夹过了。
+         */
+        maxWidth: "none",
+        minHeight: `${round2(declaredHeight)}px`,
+        padding: `${TEXT_BOX_PADDING}px`,
+        boxSizing: "border-box",
+        backgroundColor: fill ?? undefined,
+        border: borderColor ? `${borderWidth}px solid ${borderColor}` : undefined,
+        borderRadius: floating ? `${round2(3 * scale)}px` : undefined,
+      }}
+    >
+      {renderBlocks(box.blocks, depth, innerWidth)}
+    </div>
+  );
+});
+
 /* ------------------------------ 不支持的对象 ------------------------------ */
 
 /**
@@ -468,14 +626,24 @@ export function UnsupportedCard({
 
 /* -------------------------------- 分派 -------------------------------- */
 
-function renderBlocksInFlow(blocks: DocBlock[], ctx: DocxRenderContext, depth: number): ReactNode {
+function renderBlocksInFlow(
+  blocks: DocBlock[],
+  ctx: DocxRenderContext,
+  depth: number,
+  contentWidth: number,
+): ReactNode {
   if (blocks.length === 0) return null;
   return blocks.map((block, index) => (
-    <DocxBlock key={index} block={block} ctx={ctx} depth={depth} />
+    <DocxBlock key={index} block={block} ctx={ctx} depth={depth} contentWidth={contentWidth} />
   ));
 }
 
-export const DocxBlock = memo(function DocxBlock({ block, ctx, depth = 0 }: DocxBlockProps) {
+export const DocxBlock = memo(function DocxBlock({
+  block,
+  ctx,
+  depth = 0,
+  contentWidth,
+}: DocxBlockProps) {
   switch (block.kind) {
     case "paragraph":
       return <DocxParagraph paragraph={block} ctx={ctx} />;
@@ -485,13 +653,28 @@ export const DocxBlock = memo(function DocxBlock({ block, ctx, depth = 0 }: Docx
           table={block}
           ctx={ctx}
           depth={depth}
-          renderBlocks={(blocks, nextDepth) => renderBlocksInFlow(blocks, ctx, nextDepth)}
+          contentWidth={contentWidth}
+          renderBlocks={(blocks, nextDepth, cellWidth) =>
+            renderBlocksInFlow(blocks, ctx, nextDepth, cellWidth)
+          }
         />
       );
     case "image":
-      return <DocxImageBlock block={block} ctx={ctx} />;
+      return <DocxImageBlock block={block} ctx={ctx} contentWidth={contentWidth} />;
     case "shape":
       return <DocxShapeBlock shape={block} ctx={ctx} />;
+    case "textBox":
+      return (
+        <DocxTextBoxBlock
+          box={block}
+          ctx={ctx}
+          depth={depth + 1}
+          contentWidth={contentWidth}
+          renderBlocks={(blocks, nextDepth, innerWidth) =>
+            renderBlocksInFlow(blocks, ctx, nextDepth, innerWidth)
+          }
+        />
+      );
     case "pageBreak":
       return <PageBreakLine label="分页符" />;
     case "unsupported":
