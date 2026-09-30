@@ -98,6 +98,32 @@ export function fitPageGeometry(base: PageGeometry, maxWidth: number): PageGeome
   };
 }
 
+/**
+ * 按缩放比例整体缩放页面与页边距（Ctrl+滚轮 / 缩放按钮）。
+ * 页面尺寸与块内字号、缩进、图片、表格按同一倍率 `scale` 缩放，
+ * 因此 `contentWidthPx / fontPx` 与 `contentHeightPx / lineHeight` 保持不变 ——
+ * 缩放只放大/缩小整页纸面，**不会改变换行与分页排版**。
+ */
+export function scalePageGeometry(base: PageGeometry, scale: number): PageGeometry {
+  if (!(scale > 0) || Math.abs(scale - 1) < 1e-6) return base;
+  const widthPx = round2(base.widthPx * scale);
+  const heightPx = round2(base.heightPx * scale);
+  const marginTopPx = round2(base.marginTopPx * scale);
+  const marginRightPx = round2(base.marginRightPx * scale);
+  const marginBottomPx = round2(base.marginBottomPx * scale);
+  const marginLeftPx = round2(base.marginLeftPx * scale);
+  return {
+    widthPx,
+    heightPx,
+    marginTopPx,
+    marginRightPx,
+    marginBottomPx,
+    marginLeftPx,
+    contentWidthPx: Math.max(120, round2(widthPx - marginLeftPx - marginRightPx)),
+    contentHeightPx: Math.max(80, round2(heightPx - marginTopPx - marginBottomPx)),
+  };
+}
+
 export interface DocxBlocksProps {
   api: DocxBlocksApi;
   ctx: DocxRenderContext;
@@ -123,6 +149,7 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
    */
   const measuredRef = useRef(new Map<number, { height: number; key: string }>());
   const measurePendingRef = useRef(false);
+  const blockObserverRef = useRef<ResizeObserver | null>(null);
 
   /* ---------- 估算缓存（跟随「缩放 + 内容宽 + 缓存版本」失效） ---------- */
   const estimateRef = useRef<{ key: string; map: Map<number, number> }>({ key: "", map: new Map() });
@@ -188,18 +215,26 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
     [],
   );
 
-  /* ---------- 页面几何：后端 sectPr → 兜底 A4 → 窗口太窄时等比缩小 ---------- */
+  /* ---------- 页面几何：后端 sectPr → 兜底 A4 → 窗口太窄时等比缩小 → 按缩放倍率整体缩放 ---------- */
   const geometry = useMemo(
-    () => fitPageGeometry(resolvePageGeometry(api.page), Math.max(240, viewport.width - 24)),
-    [api.page, viewport.width],
+    () =>
+      scalePageGeometry(
+        fitPageGeometry(resolvePageGeometry(api.page), Math.max(240, viewport.width - 24)),
+        ctx.scale,
+      ),
+    [api.page, viewport.width, ctx.scale],
   );
 
   /* ---------- 可用内容宽：两种模式各自的版心（估算与渲染必须用同一个值） ---------- */
+  const continuousPaper = useMemo(
+    () => round2(Math.max(320, Math.min(viewport.width - 16, PAGE_WIDTH)) * ctx.scale),
+    [viewport.width, ctx.scale],
+  );
+  const continuousPadding = useMemo(() => round2(PAGE_PADDING * ctx.scale), [ctx.scale]);
   const contentWidth = useMemo(() => {
     if (mode === "paged") return geometry.contentWidthPx;
-    const paper = Math.max(320, Math.min(viewport.width - 16, PAGE_WIDTH));
-    return Math.max(160, paper - PAGE_PADDING * 2);
-  }, [mode, geometry.contentWidthPx, viewport.width]);
+    return Math.max(160, round2(continuousPaper - continuousPadding * 2));
+  }, [mode, geometry.contentWidthPx, continuousPaper, continuousPadding]);
 
   /**
    * **纸张可容纳块宽**：文本框这类浮动对象在 Word 里允许超出正文版心，只受纸张边界约束。
@@ -213,9 +248,8 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
         round2(geometry.widthPx - geometry.marginLeftPx - geometry.marginRightPx / 2),
       );
     }
-    const paper = Math.max(320, Math.min(viewport.width - 16, PAGE_WIDTH));
-    return Math.max(contentWidth, round2(paper - PAGE_PADDING - 12));
-  }, [mode, geometry, contentWidth, viewport.width]);
+    return Math.max(contentWidth, round2(continuousPaper - continuousPadding - 12 * ctx.scale));
+  }, [mode, geometry, contentWidth, continuousPaper, continuousPadding, ctx.scale]);
 
   /* ---------- 每块高度：测量值优先，其次估算（合并组按整张卡片算一次） ---------- */
   const blockAt = api.blockAt;
@@ -338,12 +372,16 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
   const measurePass = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    const observer = blockObserverRef.current;
     let changed = false;
     for (const element of Array.from(canvas.querySelectorAll<HTMLElement>("[data-docx-block-index]"))) {
+      observer?.observe(element);
       const raw = element.getAttribute("data-docx-block-index");
       if (raw === null) continue;
       const blockIndex = Number(raw);
       if (!Number.isFinite(blockIndex)) continue;
+      // 图片还在骨架占位态时不把骨架高度写入 measuredRef，等图片就绪或失败落地后再记
+      if (element.querySelector("[data-docx-image-skeleton]")) continue;
       const height = element.offsetHeight;
       // jsdom 里 offsetHeight 恒为 0；真实浏览器里 0 也表示"还没布局"，都要忽略
       if (!(height > 0)) continue;
@@ -363,12 +401,20 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
   });
 
   // 图片异步加载、字体替换会改变块高：用 ResizeObserver 兜住这两类「渲染后还会变」的情况
+  // （注意 canvas 自身是固定 inline height + 绝对定位子块，子块变高不会触发 canvas resize，必须同时 observe 每个块）
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => measurePass());
+    blockObserverRef.current = observer;
     observer.observe(canvas);
-    return () => observer.disconnect();
+    for (const element of Array.from(canvas.querySelectorAll<HTMLElement>("[data-docx-block-index]"))) {
+      observer.observe(element);
+    }
+    return () => {
+      blockObserverRef.current = null;
+      observer.disconnect();
+    };
   }, [measurePass]);
 
   /* ---------- 高度变化后的滚动锚点补偿 ---------- */
@@ -376,9 +422,10 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     const previous = anchorRef.current;
-    if (el && previous && previous.tops !== layout.blockTops) {
-      // 以「视口顶部那一块」为锚：它的顶部 y 平移了多少，scrollTop 就补多少
-      const anchorIndex = blockIndexAt(previous.tops, previous.scrollTop);
+    if (el && previous && previous.tops !== layout.blockTops && el.scrollTop > BOOK_OFFSET) {
+      // 以「当前视口顶部那一块」为锚：它的顶部 y 平移了多少，scrollTop 就补多少
+      const contentTop = Math.max(0, el.scrollTop - BOOK_OFFSET);
+      const anchorIndex = blockIndexAt(previous.tops, contentTop);
       const nextTops = layout.blockTops;
       const shared = Math.min(anchorIndex, nextTops.length - 1, previous.tops.length - 1);
       if (shared >= 0) {
@@ -469,8 +516,8 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
           position: "absolute",
           top: `${round2(entry.top + (mode === "continuous" ? BOOK_OFFSET : 0))}px`,
           // 绝对定位把块限制在版心内，与估算用的 contentWidth 完全一致
-          left: mode === "paged" ? `${geometry.marginLeftPx}px` : `${PAGE_PADDING}px`,
-          right: mode === "paged" ? `${geometry.marginRightPx}px` : `${PAGE_PADDING}px`,
+          left: mode === "paged" ? `${geometry.marginLeftPx}px` : `${continuousPadding}px`,
+          right: mode === "paged" ? `${geometry.marginRightPx}px` : `${continuousPadding}px`,
           backgroundColor: highlighted ? "rgba(255, 214, 102, 0.28)" : undefined,
           borderRadius: highlighted ? "3px" : undefined,
         }}
@@ -544,12 +591,12 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
             width:
               mode === "paged"
                 ? "100%"
-                : `${Math.max(320, Math.min(viewport.width - 16, PAGE_WIDTH))}px`,
+                : `${continuousPaper}px`,
             // 画布高度 = 内容高 + 上下留白；留白用坐标偏移实现，不用 padding（见 BOOK_OFFSET 注释）
             height: `${round2(layout.totalHeight + BOOK_OFFSET * 2)}px`,
             margin: "0 auto",
-            paddingLeft: mode === "paged" ? undefined : `${PAGE_PADDING}px`,
-            paddingRight: mode === "paged" ? undefined : `${PAGE_PADDING}px`,
+            paddingLeft: mode === "paged" ? undefined : `${continuousPadding}px`,
+            paddingRight: mode === "paged" ? undefined : `${continuousPadding}px`,
             boxSizing: "border-box",
           }}
         >
@@ -656,8 +703,8 @@ export function DocxBlocks({ api, ctx, mode, scrollRequest }: DocxBlocksProps) {
               style={{
                 position: "absolute",
                 top: BOOK_OFFSET,
-                left: mode === "paged" ? geometry.marginLeftPx : PAGE_PADDING,
-                right: mode === "paged" ? geometry.marginRightPx : PAGE_PADDING,
+                left: mode === "paged" ? geometry.marginLeftPx : continuousPadding,
+                right: mode === "paged" ? geometry.marginRightPx : continuousPadding,
               }}
               className="pt-2 text-center text-[11px] text-faint"
             >

@@ -1,7 +1,7 @@
 {
   "name": "masteredit",
   "private": true,
-  "version": "0.21.4",
+  "version": "0.21.5",
   "type": "module",
   "packageManager": "pnpm@9.15.9",
   "scripts": {

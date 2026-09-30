@@ -95,15 +95,17 @@ export function DocxView({ docId }: { docId: string }) {
   /* ------------------ 图片：按 (路径|media) 缓存 + 请求去重 ------------------ */
   const mediaCacheRef = useRef(new Map<string, string>());
   const mediaPendingRef = useRef(new Map<string, Promise<string>>());
+  const lastMediaPathRef = useRef(filePath);
+  if (lastMediaPathRef.current !== filePath) {
+    // 换文档就清空上一个文档的图片缓存；原地 clear 保持 Map 引用不变，避免 renderContext 拿到旧 Map
+    lastMediaPathRef.current = filePath;
+    mediaCacheRef.current.clear();
+    mediaPendingRef.current.clear();
+  }
   const mediaCacheKey = useCallback(
     (media: string) => `${filePath ?? ""}|${media}`,
     [filePath],
   );
-  useEffect(() => {
-    // 换文档就丢掉上一个文档的图片缓存（加密文档重解析也不便宜）
-    mediaCacheRef.current = new Map();
-    mediaPendingRef.current = new Map();
-  }, [filePath]);
   const loadMedia = useCallback(
     (media: string): Promise<string> => {
       const key = `${filePath ?? ""}|${media}`;

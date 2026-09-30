@@ -273,7 +273,14 @@ const DocxImageBlock = memo(function DocxImageBlock({
   contentWidth: number;
 }) {
   const kind = mediaKind(block.media);
-  const [state, setState] = useState<ImageState>({ status: "idle" });
+  const cacheKey = ctx.mediaCacheKey(block.media);
+  const [state, setState] = useState<ImageState>(() => {
+    if (kind === "raster") {
+      const cached = ctx.mediaCache.get(cacheKey);
+      if (cached) return { status: "ready", src: cached };
+    }
+    return { status: "idle" };
+  });
   const hostRef = useRef<HTMLDivElement | null>(null);
   /** 同一个图片块只请求一次（重复渲染 / 视口反复进出都不会重发）；失败/超时会清掉以便重试 */
   const requestedRef = useRef(false);
@@ -281,7 +288,6 @@ const DocxImageBlock = memo(function DocxImageBlock({
   const lastAttemptRef = useRef(0);
   /** 当前这次加载效果的"发起请求"函数：失败卡片上的「重试」直接调它，不依赖观测器回调 */
   const requestRef = useRef<(() => void) | null>(null);
-  const cacheKey = ctx.mediaCacheKey(block.media);
   /**
    * ctx 每次渲染都是新对象（逐页带页码），**不能进依赖数组**——
    * 否则每渲染一次就重建一个 IntersectionObserver。用 ref 取最新值即可。
@@ -450,14 +456,16 @@ const DocxImageBlock = memo(function DocxImageBlock({
       />
     );
   } else {
-    // 还没加载：按同一个盒子的尺寸占位（滚动时高度不会跳变），不请求后端
+    // 还没加载：严格按 resolveImageBox 的同一尺寸占位（不夹 MEDIA_MAX_WIDTH/2），
+    // 保证占位态与就绪态 offsetHeight 完全一致，首屏测量不会把图片高度记成 272px 导致压字或跨页震荡
     const box = resolveImageBox(block, ctx.scale, contentWidth);
     content = (
       <div
         data-docx-image-skeleton="true"
         style={{
-          width: `${Math.min(box.width, MEDIA_MAX_WIDTH)}px`,
-          height: `${Math.min(box.height, MEDIA_MAX_WIDTH / 2)}px`,
+          width: `${box.width}px`,
+          height: `${box.height}px`,
+          boxSizing: "border-box",
           maxWidth: "100%",
           border: PLACEHOLDER_BORDER,
           borderRadius: "6px",
