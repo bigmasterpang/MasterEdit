@@ -39,7 +39,7 @@ interface UiState {
 const STORE_FILE = "masteredit-store.json";
 let file: LazyStore | null = null;
 let uiCache: UiState = {
-  viewMode: "split",
+  viewMode: "preview",
   outlineVisible: true,
   windowWidth: 0,
   windowHeight: 0,

@@ -23,6 +23,7 @@ import { readMigratedItem, writeItem } from "../../utils/storage";
 import { DocxBlocks, type DocxViewMode } from "./DocxBlocks";
 import { DocxFindBar, useDocxFind } from "./DocxFind";
 import { DocxOutline } from "./DocxOutline";
+import { clearDocxOutline, setDocxOutline } from "./docxService";
 import { useDocxBlocks } from "./useDocxBlocks";
 import {
   DEFAULT_PAGE_BG,
@@ -59,6 +60,7 @@ export function DocxView({ docId }: { docId: string }) {
   const filePath = useAppStore((s) => s.docs.find((d) => d.id === docId)?.filePath ?? null);
   const modifiedAt = useAppStore((s) => s.docs.find((d) => d.id === docId)?.modifiedAt ?? 0);
   const active = useAppStore((s) => s.activeId === docId);
+  const outlineVisible = useAppStore((s) => s.outlineVisible);
   const fileName = filePath ? (filePath.split(/[\\/]/).pop() ?? filePath) : "（未保存的文档）";
 
   const [info, setInfo] = useState<DocumentInfo | null>(null);
@@ -209,21 +211,42 @@ export function DocxView({ docId }: { docId: string }) {
     if (!findOpen) setHighlightBlock(null);
   }, [findOpen]);
 
-  /* ------------------ 大纲：打开时把整篇块补齐再收集 ------------------ */
-  const outlineLoading = api.loading || (outlineOpen && outline === null);
+  /* ------------------ 大纲：把整篇块补齐并同步到全局大纲服务 ------------------ */
+  const outlineLoading = api.loading || outline === null;
   useEffect(() => {
-    if (!outlineOpen) return;
     let cancelled = false;
+    setDocxOutline(docId, {
+      items: outline?.items ?? [],
+      loading: outlineLoading,
+      partial: outline?.partial ?? false,
+    });
     void (async () => {
       const { blocks, complete } = await api.loadAll();
       if (cancelled) return;
-      setOutline({ items: collectOutline(blocks), partial: !complete });
+      const items = collectOutline(blocks);
+      setOutline({ items, partial: !complete });
+      setDocxOutline(docId, { items, loading: false, partial: !complete });
     })();
     return () => {
       cancelled = true;
+      clearDocxOutline(docId);
     };
     // api.version：后台预取到新块后大纲要跟着长出来
-  }, [outlineOpen, api, api.version]);
+  }, [docId, api, api.version]);
+
+  /* 监听全局侧栏或外部派发的大纲块跳转事件 */
+  useEffect(() => {
+    const handleJump = (event: Event) => {
+      const ce = event as CustomEvent<{ docId: string; blockIndex: number }>;
+      if (ce.detail && ce.detail.docId === docId && typeof ce.detail.blockIndex === "number") {
+        jumpToBlock(ce.detail.blockIndex);
+      }
+    };
+    window.addEventListener("docx-jump-to-block", handleJump);
+    return () => {
+      window.removeEventListener("docx-jump-to-block", handleJump);
+    };
+  }, [docId, jumpToBlock]);
 
   /* ------------------ Ctrl+滚轮缩放 ------------------ */
   /**
@@ -426,11 +449,14 @@ export function DocxView({ docId }: { docId: string }) {
           <button
             type="button"
             data-docx-outline-toggle="true"
-            onClick={() => setOutlineOpen((value) => !value)}
+            onClick={() => {
+              useAppStore.getState().toggleOutline();
+              setOutlineOpen((value) => !value);
+            }}
             className={`flex items-center gap-1 rounded border px-2 py-1 text-[12px] hover:bg-hover ${
-              outlineOpen ? "border-accent text-accent" : "border-line text-fg"
+              outlineOpen || outlineVisible ? "border-accent text-accent" : "border-line text-fg"
             }`}
-            title="按大纲级别（标题）生成目录"
+            title="侧栏显示文档大纲"
           >
             <Icon name="list" size={13} />
             大纲

@@ -29,6 +29,7 @@ import {
 } from "./filePath";
 import { formatBytes } from "./timing";
 import { clearSheetHistory } from "./sheetHistory";
+import { clearIgnoredReload } from "../hooks/useFileWatcher";
 
 /** 展示用名称 */
 export function displayName(doc: { filePath: string | null }): string {
@@ -143,6 +144,7 @@ export async function openPath(path: string, targetPane?: 0 | 1): Promise<boolea
         size: info.parts.reduce((total, part) => total + part.size, 0),
       });
       useAppStore.getState().addDoc(doc);
+      clearIgnoredReload(doc.id);
       void addRecentFile(path);
       // 用户很可能用「打开方式」交给 Word 改完再回来：监听外部改动，自动重新解析
       void watchFile(path);
@@ -168,6 +170,7 @@ export async function openPath(path: string, targetPane?: 0 | 1): Promise<boolea
         size: info.size,
       });
       useAppStore.getState().addDoc(doc);
+      clearIgnoredReload(doc.id);
       void addRecentFile(info.path);
       void watchFile(info.path);
       return true;
@@ -194,6 +197,7 @@ export async function openPath(path: string, targetPane?: 0 | 1): Promise<boolea
         readOnly: false,
       });
       useAppStore.getState().addDoc(doc);
+      clearIgnoredReload(doc.id);
       void addRecentFile(payload.path);
       void watchFile(payload.path);
       return true;
@@ -212,10 +216,14 @@ export async function openPath(path: string, targetPane?: 0 | 1): Promise<boolea
     }
     const doc = docFromPayload(payload, effectivePane);
     useAppStore.getState().addDoc(doc);
+    clearIgnoredReload(doc.id);
     if (isDelimitedPath(payload.path)) {
       // CSV / TSV：默认直接给表格视图（更符合打开表格文件的预期），Ctrl+E 可切源码
       useAppStore.getState().setViewMode("preview");
-    } else if (!isMarkdownPath(payload.path)) {
+    } else if (isMarkdownPath(payload.path)) {
+      // 新打开的 md 文档，默认使用预览模式
+      useAppStore.getState().setViewMode("preview");
+    } else {
       // 其它非 Markdown 文件（代码/纯文本）固定以源码模式打开
       useAppStore.getState().setViewMode("source");
     }
@@ -373,6 +381,7 @@ export async function saveDoc(id: string): Promise<boolean> {
         modifiedAt,
         size: newSize,
       });
+      clearIgnoredReload(id);
       void addRecentFile(doc.filePath);
       return true;
     }
@@ -396,6 +405,7 @@ export async function saveDoc(id: string): Promise<boolean> {
       // 加密文档落盘后会多出 4096 字节文件头
       size: (doc.encrypted ? 4096 : 0) + utf8Size(doc.content),
     });
+    clearIgnoredReload(id);
     void addRecentFile(doc.filePath);
     return true;
   } catch (error) {
@@ -486,6 +496,7 @@ export async function saveSpreadsheetDoc(id: string): Promise<boolean> {
       modifiedAt: result.modifiedAt,
       size: result.size,
     });
+    clearIgnoredReload(id);
     void addRecentFile(result.path);
     return true;
   } catch (error) {
@@ -538,6 +549,7 @@ export async function saveDocAs(id: string): Promise<boolean> {
       }
       void watchFile(result.path);
       void addRecentFile(result.path);
+      clearIgnoredReload(id);
       return true;
     } catch (error) {
       await showMessage("另存为失败", String(error));
@@ -608,6 +620,7 @@ export async function saveDocAs(id: string): Promise<boolean> {
     if (oldPath && !samePath(oldPath, target)) void unwatchFile(oldPath);
     void addRecentFile(target);
     void watchFile(target);
+    clearIgnoredReload(id);
     return true;
   } catch (error) {
     await showMessage("保存失败", String(error));
@@ -764,6 +777,7 @@ export async function reloadDocFromDisk(id: string): Promise<boolean> {
       modifiedAt: payload.modifiedAt,
       size: payload.size,
     });
+    clearIgnoredReload(id);
     return true;
   } catch (error) {
     console.error("重新加载失败", error);

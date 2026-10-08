@@ -284,6 +284,8 @@ export interface DocState {
   pdfPaperTheme?: string;
   /** PDF 便签附注标注列表 */
   pdfNotes?: PdfNote[];
+  /** 用户选择忽略外部实时更新（不再重复弹窗提示） */
+  ignoreExternalReload?: boolean;
 }
 
 /** PDF 便签附注图钉数据 */

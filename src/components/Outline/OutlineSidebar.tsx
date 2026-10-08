@@ -3,9 +3,10 @@ import { Icon, type IconName } from "../common/Icon";
 import { useAppStore } from "../../stores/appStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { scrollToLine } from "../../utils/editorCommands";
-import { isMarkdownDoc, isPdfDoc } from "../../utils/filePath";
+import { isDocumentDoc, isMarkdownDoc, isPdfDoc } from "../../utils/filePath";
 import { analyzeSymbols, navSupported, type NavItem, type NavKind } from "../../utils/outline";
 import type { HeadingItem } from "../../types";
+import { jumpToDocxBlock, useDocxOutline } from "../Docx/docxService";
 import {
   batchDeletePdfAnnotations,
   deletePdfNote,
@@ -51,6 +52,11 @@ export function OutlineSidebar({ previewRef, standalone = false }: Props) {
   // 如果当前是 PDF 文档，渲染专用的 PDF 大纲书签与页面缩略图侧栏
   if (doc && isPdfDoc(doc)) {
     return <PdfOutlineSection doc={doc} standalone={standalone} />;
+  }
+
+  // 如果当前是 Word 文档，渲染专用的 Word 结构大纲侧栏
+  if (doc && isDocumentDoc(doc)) {
+    return <DocxOutlineSection doc={doc} standalone={standalone} />;
   }
 
   return <MarkdownOutlineSection doc={doc} previewRef={previewRef} standalone={standalone} />;
@@ -1134,3 +1140,159 @@ function MarkdownOutlineSection({
     </div>
   );
 }
+
+/** Word (.docx) 专用文档大纲组件 */
+function DocxOutlineSection({
+  doc,
+  standalone,
+}: {
+  doc: NonNullable<ReturnType<typeof useAppStore.getState>["docs"][0]>;
+  standalone?: boolean;
+}) {
+  const { items, loading, partial } = useDocxOutline(doc.id);
+  const [filterText, setFilterText] = useState("");
+  const [maxLevel, setMaxLevel] = useState<number>(6);
+  const [activeBlockIndex, setActiveBlockIndex] = useState<number | null>(null);
+
+  const filteredItems = useMemo(() => {
+    const q = filterText.trim().toLowerCase();
+    return items.filter((item) => {
+      if (item.level + 1 > maxLevel) return false;
+      if (!q) return true;
+      return item.text.toLowerCase().includes(q);
+    });
+  }, [items, filterText, maxLevel]);
+
+  const containerClass = standalone
+    ? "print-hide flex w-[260px] shrink-0 flex-col border-r border-line bg-sidebar"
+    : "flex h-full min-h-0 flex-col overflow-hidden bg-sidebar";
+
+  return (
+    <div className={containerClass}>
+      {/* 顶部工具栏 */}
+      <div className="flex h-8 shrink-0 items-center justify-between border-b border-line px-2 text-[11px] font-medium text-faint">
+        <div className="flex items-center gap-1.5">
+          <span className="font-medium uppercase tracking-wide text-fg/80">
+            Word 大纲
+          </span>
+          <span className="rounded bg-hover px-1 py-0.5 text-[10px] text-faint">
+            {filteredItems.length}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-1">
+          <select
+            value={maxLevel}
+            title="筛选标题等级"
+            onChange={(e) => setMaxLevel(Number(e.target.value))}
+            className="h-5 rounded border border-line bg-input px-1 text-[10px] text-fg outline-none"
+          >
+            <option value={6}>全部</option>
+            <option value={1}>H1</option>
+            <option value={2}>≤ H2</option>
+            <option value={3}>≤ H3</option>
+            <option value={4}>≤ H4</option>
+          </select>
+
+          {standalone ? (
+            <button
+              type="button"
+              title="隐藏侧栏"
+              onClick={() => useAppStore.getState().setOutlineVisible(false)}
+              className="rounded p-0.5 hover:bg-hover hover:text-fg"
+            >
+              <Icon name="x" size={12} />
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      {/* 搜索/过滤输入框 */}
+      <div className="border-b border-line/60 px-2 py-1">
+        <div className="flex items-center gap-1 rounded border border-line/80 bg-input px-1.5 py-0.5 text-[11px]">
+          <Icon name="search" size={11} className="text-faint" />
+          <input
+            type="text"
+            value={filterText}
+            onChange={(e) => setFilterText(e.target.value)}
+            placeholder="过滤 Word 标题大纲…"
+            className="min-w-0 flex-1 bg-transparent text-fg outline-none placeholder:text-faint"
+          />
+          {filterText ? (
+            <button
+              type="button"
+              onClick={() => setFilterText("")}
+              className="text-faint hover:text-fg"
+            >
+              <Icon name="x" size={10} />
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      {/* 大纲列表 */}
+      <div className="min-h-0 flex-1 overflow-auto p-1 font-sans">
+        {filteredItems.length === 0 ? (
+          <div className="px-3 py-6 text-center text-[12px] text-faint">
+            {loading
+              ? "正在解析 Word 文档大纲…"
+              : filterText
+                ? "没有匹配的大纲标题。"
+                : "当前 Word 文档未包含大纲标题。"}
+          </div>
+        ) : (
+          <div className="flex flex-col gap-0.5">
+            {filteredItems.map((item) => {
+              const active = activeBlockIndex === item.index;
+              return (
+                <button
+                  key={`${item.index}-${item.level}`}
+                  type="button"
+                  data-docx-outline-item="true"
+                  data-docx-outline-index={item.index}
+                  data-docx-outline-level={item.level}
+                  title={`${item.text}\n（第 ${item.index + 1} 块，级别 H${item.level + 1}）`}
+                  onClick={() => {
+                    setActiveBlockIndex(item.index);
+                    jumpToDocxBlock(doc.id, item.index);
+                  }}
+                  style={{ paddingLeft: `${4 + Math.min(6, item.level) * 12}px` }}
+                  className={`group flex w-full cursor-pointer items-center justify-between gap-1 rounded py-1 pr-1.5 text-left text-[12px] transition-colors ${
+                    active
+                      ? "bg-accent-soft-strong font-medium text-accent"
+                      : "text-muted hover:bg-hover hover:text-fg"
+                  }`}
+                >
+                  <div className="flex min-w-0 items-center gap-1">
+                    <span
+                      className={`text-[9.5px] font-mono shrink-0 ${
+                        active ? "text-accent" : "text-faint"
+                      }`}
+                    >
+                      H{item.level + 1}
+                    </span>
+                    <span
+                      className={`truncate ${item.level === 0 ? "font-medium text-fg" : ""}`}
+                    >
+                      {item.text || "（未命名标题）"}
+                    </span>
+                  </div>
+                  <span className="shrink-0 font-mono text-[9.5px] text-faint opacity-60 group-hover:opacity-100">
+                    #{item.index + 1}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {partial ? (
+        <div className="border-t border-line/60 bg-sidebar/60 px-2 py-1 text-[10.5px] text-faint">
+          文档较大，大纲仅覆盖已读取部分。
+        </div>
+      ) : null}
+    </div>
+  );
+}
+

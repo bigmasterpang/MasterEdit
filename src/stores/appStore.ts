@@ -139,7 +139,7 @@ const VIEW_CYCLE: ViewMode[] = ["preview", "source", "split"];
 export const useAppStore = create<AppStore>((set, get) => ({
   docs: [],
   activeId: null,
-  viewMode: "split",
+  viewMode: "preview",
   outlineVisible: true,
   searchVisible: false,
   searchQuery: "",
